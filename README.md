@@ -4,19 +4,7 @@ Author: Kunru Song, Ph. D.
 
 ***
 
-This repository contains the analysis code for a baseline and ecological momentary assessment (EMA) study of problematic social media use (PSMU), behavioral engagement, and psychological distress. The study followed 209 participants for 30 days, with three scheduled EMA assessments per day.
-
-The analyses examine whether PSMU manifestations separate into peripheral manifestations (P1: salience; P2: tolerance) and core manifestations (P3: mood modification; P4: relapse; P5: withdrawal; P6: conflict). These correspond to `PMU1`–`PMU6` in the analysis data. Interactive, active, and passive engagement are kept separate throughout. Lagged associations are observational and should not be interpreted as causal effects.
-
-## Manuscript and reporting status
-
-The submission manuscript is titled **At the Core of Problematic Social Media Use: Core–Peripheral Differences in Dynamic Associations with Media Engagement and Psychological Distress**, prepared for *Computers in Human Behavior*. The author finalized the submission-ready manuscript and supplement on September 14, 2026; this does not indicate acceptance or publication.
-
-The paper tests H1, the Core-Peripheral measurement distinction at both levels; H2, stronger prospective Core-to-Distress associations than Peripheral; and H3, preferential positive Engagement-to-Peripheral associations. H1 and H2 are supported, while the primary paths and direct contrasts do not support H3. Exploratory networks highlight salience's contemporaneous engagement connections and withdrawal/conflict's outgoing temporal distress bridges. These are observational findings.
-
-The main paper contains three tables and three figures. The supplement contains six tables, five figures and a demographic section: baseline CFA/SEM, full primary DSEM results, daily/frequency sensitivities, network matrices and network uncertainty. Existing indirect parameters are retained for reproducibility but are not reported as a manuscript mediation hypothesis.
-
-## License
+This repository contains the analysis code for the manuscript entitled, *At the Core of Problematic Social Media Use: Core–Peripheral Differences in Dynamic Associations with Media Engagement and Psychological Distress* .&#x20;
 
 This repository's original content is licensed under the [Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License (CC BY-NC-ND 4.0)](LICENSE).
 
@@ -28,13 +16,13 @@ Additional analyses marked with an asterisk (`*`) are retained for transparency 
 
 Step 1 organizes the source data, constructs the common analysis-entry dataset, and describes measurement reliability, the sample and missingness.
 
-| Substep and code                                                                                | Purpose                                                                                                                                                                                                        |
-| ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [S1.1 Organize](Step_1_Descriptive_and_Reliability/S1_1_Organize.Rmd)                           | Import and harmonize baseline, daily-diary and EMA data; handle missing-value codes and documented corrections; retain separate participant-, day- and prompt-level datasets.                                  |
-| [S1.2 Item description](Step_1_Descriptive_and_Reliability/S1_2_ItemDescription.Rmd)            | Select focal variables, inspect item distributions and missingness, and merge baseline variables onto the scheduled EMA rows to create `dat_focal_analysis.rda`.                                               |
+| Substep and code                                                                                | Purpose                                                                                                                                                                                                                                                  |
+| ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [S1.1 Organize](Step_1_Descriptive_and_Reliability/S1_1_Organize.Rmd)                           | Import and harmonize baseline, daily-diary and EMA data; handle missing-value codes and documented corrections; retain separate participant-, day- and prompt-level datasets.                                                                            |
+| [S1.2 Item description](Step_1_Descriptive_and_Reliability/S1_2_ItemDescription.Rmd)            | Select focal variables, inspect item distributions and missingness, and merge baseline variables onto the scheduled EMA rows to create `dat_focal_analysis.rda`.                                                                                         |
 | [S1.3 Reliability](Step_1_Descriptive_and_Reliability/S1_3_Reliability.Rmd)                     | Estimate baseline Cronbach's alpha and omega, plus within- and between-person omega for total EMA PSMU, Core and Peripheral manifestations, overall psychological distress, and the depressive-symptom, anxiety-symptom and perceived-stress subdomains. |
-| [S1.4 Descriptive analysis](Step_1_Descriptive_and_Reliability/S1_4_DescriptiveAnalysis.Rmd)    | Describe the sample and baseline scores; summarize engagement duration/frequency; estimate EMA descriptive statistics, intraclass correlations, and separate within- and between-person correlations.          |
-| [S1.5 Missing-value analysis](Step_1_Descriptive_and_Reliability/S1_5_MissingValueAnalysis.Rmd) | Describe baseline and EMA missingness, scheduled-prompt compliance, and exploratory associations of participant-level missingness with EMA means and baseline characteristics.                                 |
+| [S1.4 Descriptive analysis](Step_1_Descriptive_and_Reliability/S1_4_DescriptiveAnalysis.Rmd)    | Describe the sample and baseline scores; summarize engagement duration/frequency; estimate EMA descriptive statistics, intraclass correlations, and separate within- and between-person correlations.                                                    |
+| [S1.5 Missing-value analysis](Step_1_Descriptive_and_Reliability/S1_5_MissingValueAnalysis.Rmd) | Describe baseline and EMA missingness, scheduled-prompt compliance, and exploratory associations of participant-level missingness with EMA means and baseline characteristics.                                                                           |
 
 Readers starting with the supplied prepared entry begin at S1.3. S1.1–S1.2 document the preceding preparation and require private source inputs.
 
@@ -92,13 +80,13 @@ This entire stage is available for transparency but is not reported in the manus
 
 Step 4 uses six-variable Bayesian two-level DSEM to examine prompt-to-prompt relations among the three engagement modes, core manifestations, peripheral manifestations and overall distress. Models include random intercepts, fixed autoregressive/cross-lagged slopes, and prespecified two-lag engagement paths. The primary prompt index retains both within-day and overnight transitions.
 
-| Substep and code                                                                                                | Purpose                                                                                                                                                                                                          |
-| --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [S4.0 DSEM helpers](Step_4_Dynamic_Structural_Equation_Modeling/S4_0_DSEMHelpers.R)                             | Shared Mplus execution, result extraction, convergence checks and workbook-export utilities; not a separate analysis.                                                                                            |
-| [S4.1 Prepare DSEM data](Step_4_Dynamic_Structural_Equation_Modeling/S4_1_PrepareDSEMData.Rmd)                  | Create prompt-level duration/frequency inputs and strict-complete daily aggregates, preserving the scheduled time grids and defining model covariates.                                                           |
+| Substep and code                                                                                                | Purpose                                                                                                                                                                                                                  |
+| --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [S4.0 DSEM helpers](Step_4_Dynamic_Structural_Equation_Modeling/S4_0_DSEMHelpers.R)                             | Shared Mplus execution, result extraction, convergence checks and workbook-export utilities; not a separate analysis.                                                                                                    |
+| [S4.1 Prepare DSEM data](Step_4_Dynamic_Structural_Equation_Modeling/S4_1_PrepareDSEMData.Rmd)                  | Create prompt-level duration/frequency inputs and strict-complete daily aggregates, preserving the scheduled time grids and defining model covariates.                                                                   |
 | [S4.2 Primary prompt-level DSEM](Step_4_Dynamic_Structural_Equation_Modeling/S4_2_PrimaryPromptDSEM.Rmd)        | Fit the six-variable duration model with linear day and assessment-occasion controls; test H2/H3 with component paths and direct Core-Peripheral contrasts; retain the original indirect parameters for reproducibility. |
-| [S4.3 Daily-aggregation sensitivity](Step_4_Dynamic_Structural_Equation_Modeling/S4_3_DailyAggregationDSEM.Rmd) | Examine the corresponding day-to-day model using complete-day duration sums and construct means; assess sensitivity to the temporal aggregation scale.                                                           |
-| [S4.4 Frequency sensitivity](Step_4_Dynamic_Structural_Equation_Modeling/S4_4_FrequencySensitivityDSEM.Rmd)     | Replace the three duration measures with engagement-frequency measures in the prompt-level DSEM. Duration and frequency are not entered together.                                                                |
+| [S4.3 Daily-aggregation sensitivity](Step_4_Dynamic_Structural_Equation_Modeling/S4_3_DailyAggregationDSEM.Rmd) | Examine the corresponding day-to-day model using complete-day duration sums and construct means; assess sensitivity to the temporal aggregation scale.                                                                   |
+| [S4.4 Frequency sensitivity](Step_4_Dynamic_Structural_Equation_Modeling/S4_4_FrequencySensitivityDSEM.Rmd)     | Replace the three duration measures with engagement-frequency measures in the prompt-level DSEM. Duration and frequency are not entered together.                                                                        |
 
 Each DSEM uses two Bayesian chains and 80,000 iterations. The September 14, 2026 S4.2-S4.4 update added three derived lag-1 Engagement-to-Peripheral minus Engagement-to-Core contrasts and used Mplus 9.0, preserving the original model bodies and data. Workbooks keep 14 focal native STDYX paths and 13 raw defined parameters (six indirect effects, three indirect contrasts, the Core-to-Distress minus Peripheral-to-Distress contrast, and three H3 contrasts) in separate sheets. The two scales must not be conflated.
 
@@ -138,14 +126,12 @@ Step 6 connects the node-level networks to the core–peripheral research questi
 
 ## Reproduction
 
-Retained Step 2 and future Step 3 source require Mplus 8.7; current S4.2-S4.4 require Mplus 9.0. Use the owning stage's engine requirement when configuring `MPLUS_COMMAND`. The earlier full-runner verification predates the Step 4 update and does not certify a fresh mixed-version end-to-end run.
-
-&#x20;Obtain the prepared analysis-entry file from **the corresponding author** under the applicable data-sharing agreement and place it at:
+Retained Step 2 and future Step 3 source require Mplus 8.3 and above. Use the owning stage's engine requirement when configuring `MPLUS_COMMAND`.  Readers who are interested in reproducing these analyses, please kindly obtain the prepared analysis-entry file from **the corresponding author** under the applicable data-sharing agreement and place it at:
 
 ```
 Res_2_Data_for_Analysis/dat_focal_analysis.rda
 ```
 
-The file must contain the single data-frame object `dat_focal_analysis` with the documented 72 fields and 18,810 scheduled observations from 209 participants. Do not substitute raw survey exports. This prepared-data route starts at S1.3; S1.1 and S1.2 document the preceding source-data preparation and are not run again on the supplied entry file. Pseudonymized participant data remain sensitive and must not be added to a public repository.
+The file must contain the single data-frame object `dat_focal_analysis` with the documented 18,810 scheduled observations from 209 participants. This prepared-data route starts at S1.3; S1.1 and S1.2 document the preceding source-data preparation and are not run again on the supplied entry file. Pseudonymized participant data remain sensitive and must not be added to a public repository.
 
 For definitions only, set `options(psmu.reproduce.mode = "load")` before sourcing. The runner executes 33 stages in separate R processes. It includes the minimal S5.6 checkpoint producers needed by Step 6, then the final case-dropping and nonparametric-bootstrap workflows. Full computation can take a long time and requires substantial memory. Results are generated under `Res_2_Data_for_Analysis` and `Res_3_Results`, HTML reports beside their Rmd sources, and Mplus files in the owning stage's `mplus` directory.&#x20;
