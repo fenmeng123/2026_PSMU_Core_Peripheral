@@ -1,0 +1,26 @@
+TITLE:
+! Author: Kunru Song
+! Missing values are declared as . and handled by default MLR FIML.
+S2.5 Model 1 before P2 residual constraint;
+DATA:
+FILE = "G:/2026_[8]_PSMU_Daily_CorePeripheral/Step_2_Measurement_Models/
+mplus/s2_5/s2_5_m1_1w1b.dat"; 
+VARIABLE:
+NAMES = cluster p1 p2 p3 p4 p5 p6; 
+ MISSING=.;
+ CLUSTER = cluster;
+ANALYSIS:
+TYPE = TWOLEVEL;
+ESTIMATOR = MLR;
+MODEL:
+%WITHIN%
+fw BY p1-p6;
+%BETWEEN%
+fb BY p1-p6;
+OUTPUT:
+SAMPSTAT;
+STANDARDIZED(STDYX);
+CINTERVAL;
+RESIDUAL;
+TECH1;
+TECH4;

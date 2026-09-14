@@ -1,0 +1,23 @@
+TITLE:
+! Author: Kunru Song
+S2.2.2 MLR B1 one-factor baseline Trait PSMU CFA;
+DATA:
+FILE = "G:/2026_[8]_PSMU_Daily_CorePeripheral/Step_2_Measurement_Models/
+mplus/s2_2_2/s2_2_2_b1_one_factor.dat"; 
+VARIABLE:
+NAMES = bs1 bs2 bs3 bs4 bs5 bs6 bs7 bs8 bs9 bs10 bs11 bs12 bs13 bs14 bs15 bs16 bs17
+     bs18; 
+ MISSING=.;
+ 
+ANALYSIS:
+ESTIMATOR = MLR;
+MODEL:
+trait BY bs1-bs18;
+OUTPUT:
+SAMPSTAT;
+STANDARDIZED(STDYX);
+CINTERVAL;
+RESIDUAL;
+MODINDICES(10);
+TECH1;
+TECH4;

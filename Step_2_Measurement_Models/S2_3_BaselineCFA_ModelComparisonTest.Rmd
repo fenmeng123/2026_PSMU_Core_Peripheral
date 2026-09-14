@@ -1,0 +1,516 @@
+---
+title: "S2.3 DIFFTEST for baseline Trait PSMU CFA"
+author: "Kunru Song"
+date: "2026-07-18 18:22:56 +08:00"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+<!-- Author: Kunru Song -->
+
+Existing RDA object identifiers are retained for compatibility. Mplus folders,
+run-file prefixes, reports, tables and figures use the current analysis numbering.
+
+# Purpose
+
+This report uses the Mplus 8.7 `DIFFTEST` function to compare the two nested
+baseline Trait PSMU CFA models from S2.2.1: the more restrictive one-factor B1
+model and the less restrictive correlated Core--Peripheral B2 model. The 18
+indicators are treated as ordered categorical with WLSMV and Delta
+parameterization, exactly as in S2.2.1. The DIFFTEST result is parsed through R
+`MplusAutomation` and embedded directly in this HTML report; no Excel or CSV
+result file is created.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA
+)
+
+required_packages <- c(
+  "dplyr",
+  "knitr",
+  "MplusAutomation",
+  "rmarkdown",
+  "tibble"
+)
+package_available <- vapply(
+  required_packages,
+  requireNamespace,
+  logical(1),
+  quietly = TRUE
+)
+if (!all(package_available)) {
+  stop(
+    "Missing required R packages: ",
+    paste(names(package_available)[!package_available], collapse = ", ")
+  )
+}
+
+locate_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(current)) current <- dirname(current)
+  repeat {
+    if (all(dir.exists(file.path(current, c(
+      "Step_1_Descriptive_and_Reliability", "Step_2_Measurement_Models"
+    ))))) return(current)
+    parent <- dirname(current)
+    if (identical(parent, current)) break
+    current <- parent
+  }
+  stop("Could not locate the project from its public Step directories")
+}
+
+load_single_object <- function(path, expected_name) {
+  environment <- new.env(parent = emptyenv())
+  loaded <- load(path, envir = environment)
+  if (!identical(loaded, expected_name)) {
+    stop(
+      "Expected ", expected_name, " in ", path,
+      "; found: ", paste(loaded, collapse = ", ")
+    )
+  }
+  environment[[expected_name]]
+}
+
+input_path <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(if (is.null(input_path)) getwd() else input_path)
+knitr::opts_knit$set(root.dir = project_root)
+
+measurement_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "dat_step2_measurement.rda"
+)
+s2_2_1_result_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "fit_s2_2_1_baseline_cfa_wlsmv.rda"
+)
+mplus_directory <- file.path(
+  project_root,
+  "Step_2_Measurement_Models",
+  "mplus",
+  "s2_3"
+)
+mplus_command <- Sys.getenv("MPLUS_COMMAND", unset = "D:/Program Files/Mplus/Mplus.exe")
+
+stopifnot(
+  file.exists(measurement_file),
+  file.exists(s2_2_1_result_file),
+  file.exists(mplus_command)
+)
+dir.create(mplus_directory, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load and validate the baseline item data
+
+```{r load-and-validate-inputs}
+dat_step2_measurement <- load_single_object(
+  measurement_file,
+  "dat_step2_measurement"
+)
+fit_s2_2_1_baseline_cfa_wlsmv <- load_single_object(
+  s2_2_1_result_file,
+  "fit_s2_2_1_baseline_cfa_wlsmv"
+)
+
+baseline_items <- paste0("V_BSMAS_", 1:18)
+required_columns <- c("Name_ID", baseline_items)
+dat_baseline_cfa <- dat_step2_measurement$baseline |>
+  dplyr::select(dplyr::all_of(required_columns)) |>
+  as.data.frame()
+
+stopifnot(
+  identical(
+    names(dat_step2_measurement),
+    c("baseline", "ema", "item_map", "audit")
+  ),
+  nrow(dat_step2_measurement$baseline) == 209L,
+  ncol(dat_step2_measurement$baseline) == 43L,
+  nrow(dat_step2_measurement$item_map) == 48L,
+  identical(names(dat_baseline_cfa), required_columns),
+  nrow(dat_baseline_cfa) == 209L,
+  dplyr::n_distinct(dat_baseline_cfa$Name_ID) == 209L,
+  !anyNA(dat_baseline_cfa),
+  all(vapply(
+    dat_baseline_cfa[baseline_items],
+    function(x) all(x %in% 1:5),
+    logical(1)
+  )),
+  identical(
+    fit_s2_2_1_baseline_cfa_wlsmv$metadata$input_md5,
+    unname(tools::md5sum(measurement_file))
+  ),
+  identical(
+    fit_s2_2_1_baseline_cfa_wlsmv$metadata$mplus_version,
+    "8.7"
+  ),
+  identical(
+    fit_s2_2_1_baseline_cfa_wlsmv$metadata$estimator,
+    "WLSMV"
+  ),
+  all(fit_s2_2_1_baseline_cfa_wlsmv$diagnostics$normal_termination)
+)
+
+category_audit <- dplyr::bind_rows(lapply(baseline_items, function(item) {
+  counts <- table(factor(dat_baseline_cfa[[item]], levels = 1:5))
+  data.frame(
+    item = item,
+    categories_observed = sum(counts > 0L),
+    smallest_category_n = min(counts),
+    largest_category_n = max(counts),
+    stringsAsFactors = FALSE
+  )
+}))
+stopifnot(
+  all(category_audit$categories_observed == 5L),
+  all(category_audit$smallest_category_n > 0L)
+)
+
+input_audit <- data.frame(
+  participants = nrow(dat_baseline_cfa),
+  items = length(baseline_items),
+  missing_item_cells = sum(is.na(dat_baseline_cfa[baseline_items])),
+  minimum_response = min(as.matrix(dat_baseline_cfa[baseline_items])),
+  maximum_response = max(as.matrix(dat_baseline_cfa[baseline_items])),
+  measurement_rda_md5 = unname(tools::md5sum(measurement_file)),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(input_audit)
+knitr::kable(category_audit)
+```
+
+# Generate the nested model pair
+
+The less restrictive B2 model is run first and writes the derivative
+information file. The more restrictive B1 model is then run with that file in
+the `ANALYSIS: DIFFTEST = ...;` option. Both models use identical data, variable
+order, categorical declarations, estimator, and parameterization.
+
+```{r define-models}
+mplus_item_names <- paste0("bs", 1:18)
+mplus_data <- dat_baseline_cfa[baseline_items]
+names(mplus_data) <- mplus_item_names
+mplus_data <- as.data.frame(mplus_data)
+
+model_syntax <- list(
+  B1_OneFactor = "trait BY bs1-bs18;",
+  B2_CorePeripheral = paste(
+    "periph BY bs1-bs6;",
+    "core BY bs7-bs18;",
+    "periph WITH core;",
+    sep = "\n"
+  )
+)
+
+diff_file_name <- "s2_3_b1_vs_b2.dif"
+model_specs <- list(
+  H1 = list(
+    model_id = "B2_CorePeripheral",
+    stem = "s2_3_b1_vs_b2_h1_b2_core_peripheral",
+    role = "Less restrictive H1",
+    savadata = TRUE
+  ),
+  H0 = list(
+    model_id = "B1_OneFactor",
+    stem = "s2_3_b1_vs_b2_h0_b1_one_factor",
+    role = "More restrictive H0",
+    savadata = FALSE
+  )
+)
+
+model_plan <- dplyr::bind_rows(lapply(names(model_specs), function(role) {
+  specification <- model_specs[[role]]
+  data.frame(
+    role = role,
+    model_id = specification$model_id,
+    nesting_role = specification$role,
+    estimator = "WLSMV",
+    parameterization = "DELTA",
+    categorical_items = 18L,
+    input_file = paste0(specification$stem, ".inp"),
+    stringsAsFactors = FALSE
+  )
+}))
+
+knitr::kable(model_plan)
+```
+
+```{r run-mplus-difftest}
+run_baseline_model <- function(role, specification) {
+  data_path <- file.path(mplus_directory, paste0(specification$stem, ".dat"))
+  input_path <- file.path(mplus_directory, paste0(specification$stem, ".inp"))
+  output_path <- file.path(mplus_directory, paste0(specification$stem, ".out"))
+
+  analysis_syntax <- paste(
+    "ESTIMATOR = WLSMV;",
+    "PARAMETERIZATION = DELTA;",
+    if (role == "H0") paste0("DIFFTEST = ", diff_file_name, ";") else "",
+    sep = "\n"
+  )
+  object_arguments <- list(
+    TITLE = paste(
+      "! Author: Kunru Song",
+      paste0("S2.3 ", role, " ", specification$model_id, " baseline CFA DIFFTEST;"),
+      sep = "\n"
+    ),
+    VARIABLE = "CATEGORICAL = bs1-bs18;",
+    ANALYSIS = analysis_syntax,
+    MODEL = model_syntax[[specification$model_id]],
+    OUTPUT = paste(
+      "STANDARDIZED(STDYX);",
+      "CINTERVAL;",
+      "TECH1;",
+      "TECH4;",
+      sep = "\n"
+    ),
+    usevariables = mplus_item_names,
+    rdata = mplus_data,
+    autov = FALSE,
+    quiet = TRUE
+  )
+  if (role == "H1") {
+    object_arguments$SAVEDATA <- paste0("DIFFTEST = ", diff_file_name, ";")
+  }
+
+  mplus_object <- do.call(MplusAutomation::mplusObject, object_arguments)
+  MplusAutomation::mplusModeler(
+    object = mplus_object,
+    dataout = data_path,
+    modelout = input_path,
+    run = 1L,
+    check = FALSE,
+    varwarnings = TRUE,
+    Mplus_command = mplus_command,
+    writeData = "always",
+    hashfilename = FALSE,
+    killOnFail = TRUE,
+    quiet = TRUE
+  )
+
+  stopifnot(file.exists(data_path), file.exists(input_path), file.exists(output_path))
+  input_lines <- readLines(input_path, warn = FALSE)
+  output_lines <- readLines(output_path, warn = FALSE)
+  parsed <- MplusAutomation::readModels(output_path, what = "all", quiet = TRUE)
+
+  checks <- list(
+    author_present = any(trimws(input_lines) == "! Author: Kunru Song"),
+    categorical_declared = any(grepl(
+      "CATEGORICAL\\s*=\\s*bs1-bs18;",
+      input_lines,
+      ignore.case = TRUE,
+      perl = TRUE
+    )),
+    wlsmv_declared = any(grepl(
+      "ESTIMATOR\\s*=\\s*WLSMV;",
+      input_lines,
+      ignore.case = TRUE,
+      perl = TRUE
+    )),
+    delta_declared = any(grepl(
+      "PARAMETERIZATION\\s*=\\s*DELTA;",
+      input_lines,
+      ignore.case = TRUE,
+      perl = TRUE
+    )),
+    difftest_requested = any(grepl("DIFFTEST", input_lines, fixed = TRUE)),
+    normal_termination = any(grepl(
+      "THE MODEL ESTIMATION TERMINATED NORMALLY",
+      output_lines,
+      fixed = TRUE
+    )),
+    no_fatal_error = !any(grepl("*** ERROR", output_lines, fixed = TRUE)),
+    local_unavailable_warning_absent = !any(grepl(
+      "not available",
+      output_lines,
+      ignore.case = TRUE
+    ))
+  )
+
+  stopifnot(
+    all(unlist(checks)),
+    identical(as.character(parsed$summaries$Mplus.version), "8.7"),
+    is.list(parsed)
+  )
+
+  list(
+    role = role,
+    model_id = specification$model_id,
+    paths = c(data = data_path, input = input_path, output = output_path),
+    input_lines = input_lines,
+    output_lines = output_lines,
+    parsed = parsed,
+    checks = checks
+  )
+}
+
+# The derivative file belongs to the less restrictive H1 model and is replaced
+# reproducibly on every run.
+diff_file_path <- file.path(mplus_directory, diff_file_name)
+if (file.exists(diff_file_path)) {
+  unlink(diff_file_path, force = TRUE)
+}
+
+h1_result <- run_baseline_model("H1", model_specs$H1)
+stopifnot(file.exists(diff_file_path), file.info(diff_file_path)$size > 0)
+h0_result <- run_baseline_model("H0", model_specs$H0)
+stopifnot(file.exists(diff_file_path), file.info(diff_file_path)$size > 0)
+```
+
+# Extract the Mplus DIFFTEST result
+
+```{r extract-difftest-result}
+extract_section_number <- function(lines, header_index, label) {
+  block <- lines[header_index:min(length(lines), header_index + 15L)]
+  matching <- grep(
+    paste0("^\\s*", label, "\\s+[-+0-9.Ee]+\\*?\\s*$"),
+    block,
+    value = TRUE,
+    perl = TRUE
+  )
+  if (length(matching) != 1L) {
+    stop("Could not uniquely parse ", label, " from DIFFTEST output section.")
+  }
+  as.numeric(sub(
+    paste0("^\\s*", label, "\\s+([-+0-9.Ee]+).*$"),
+    "\\1",
+    matching,
+    perl = TRUE
+  ))
+}
+
+header_index <- grep(
+  "Chi-Square Test for Difference Testing",
+  h0_result$output_lines,
+  fixed = TRUE
+)
+if (length(header_index) != 1L) {
+  stop("Mplus output must contain one Chi-Square Test for Difference Testing section.")
+}
+
+difftest_value <- extract_section_number(
+  h0_result$output_lines,
+  header_index,
+  "Value"
+)
+difftest_df <- extract_section_number(
+  h0_result$output_lines,
+  header_index,
+  "Degrees of Freedom"
+)
+difftest_p <- extract_section_number(
+  h0_result$output_lines,
+  header_index,
+  "P-Value"
+)
+
+difftest_result <- data.frame(
+  comparison = "B1 one factor vs B2 correlated Core-Peripheral",
+  more_restrictive_h0 = "B1_OneFactor",
+  less_restrictive_h1 = "B2_CorePeripheral",
+  estimator = "WLSMV",
+  parameterization = "DELTA",
+  participants = 209L,
+  difference_chi_square = difftest_value,
+  difference_df = as.integer(difftest_df),
+  p_value = difftest_p,
+  conclusion = ifelse(
+    difftest_p < .05,
+    "B2 fits significantly better than B1",
+    "No significant nested-model improvement"
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  nrow(difftest_result) == 1L,
+  is.finite(difftest_result$difference_chi_square),
+  difftest_result$difference_chi_square >= 0,
+  difftest_result$difference_df == 1L,
+  difftest_result$p_value >= 0,
+  difftest_result$p_value <= 1,
+  difftest_result$p_value < .05
+)
+
+difftest_display <- difftest_result |>
+  dplyr::mutate(
+    difference_chi_square = round(difference_chi_square, 3),
+    p_value = format.pval(p_value, digits = 4, eps = .0001)
+  )
+
+knitr::kable(difftest_display)
+```
+
+The Mplus-adjusted WLSMV DIFFTEST rejects the more restrictive one-factor model
+in favor of the correlated Core--Peripheral model. This improvement in relative fit does not resolve the poor absolute fit documented for B2 in S2.2.1.
+
+```{r validation-checks, include=FALSE}
+model_audit <- dplyr::bind_rows(lapply(
+  list(H1 = h1_result, H0 = h0_result),
+  function(result) {
+    data.frame(
+      role = result$role,
+      model_id = result$model_id,
+      author_present = result$checks$author_present,
+      categorical_declared = result$checks$categorical_declared,
+      wlsmv_declared = result$checks$wlsmv_declared,
+      delta_declared = result$checks$delta_declared,
+      difftest_requested = result$checks$difftest_requested,
+      normal_termination = result$checks$normal_termination,
+      no_fatal_error = result$checks$no_fatal_error,
+      output_file = basename(result$paths[["output"]]),
+      stringsAsFactors = FALSE
+    )
+  }
+))
+
+generated_model_files <- c(h1_result$paths, h0_result$paths)
+validation_checks <- data.frame(
+  check = c(
+    "S2.1 and S2.2.1 input hashes match",
+    "H1 derivative-information file exists",
+    "Both Mplus inputs contain the exact author text",
+    "Both inputs use categorical WLSMV with Delta parameterization",
+    "Both Mplus models terminated normally without fatal errors",
+    "H0 output contains one DIFFTEST section",
+    "The extracted DIFFTEST has one degree of freedom",
+    "All generated Mplus audit files exist"
+  ),
+  passed = c(
+    identical(
+      fit_s2_2_1_baseline_cfa_wlsmv$metadata$input_md5,
+      unname(tools::md5sum(measurement_file))
+    ),
+    file.exists(diff_file_path) && file.info(diff_file_path)$size > 0,
+    all(model_audit$author_present),
+    all(
+      model_audit$categorical_declared &
+        model_audit$wlsmv_declared &
+        model_audit$delta_declared
+    ),
+    all(model_audit$normal_termination & model_audit$no_fatal_error),
+    length(header_index) == 1L,
+    difftest_result$difference_df == 1L,
+    all(file.exists(generated_model_files))
+  ),
+  stringsAsFactors = FALSE
+)
+
+if (!all(validation_checks$passed)) {
+  stop(
+    "S2.3 validation failed: ",
+    paste(validation_checks$check[!validation_checks$passed], collapse = "; ")
+  )
+}
+
+
+```

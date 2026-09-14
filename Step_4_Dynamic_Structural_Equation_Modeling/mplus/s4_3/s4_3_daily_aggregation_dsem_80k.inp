@@ -1,0 +1,91 @@
+TITLE:
+! Author: Kunru Song
+! Six-variable strict daily-aggregation sensitivity DSEM.
+80k
+DATA:
+FILE = "F:/2026_[8]_PSMU_Daily_CorePeripheral/
+Step_4_Dynamic_Structural_Equation_Modeling/mplus/s4_3/
+s4_3_daily_aggregation_dsem_80k.dat"; 
+VARIABLE:
+NAMES = id tday dayc li la lp core peri dist; 
+ MISSING=.;
+ CLUSTER = id;
+WITHIN = dayc;
+LAGGED = li(2) la(2) lp(2) core(1) peri(1) dist(1);
+TINTERVAL = tday(1);
+ANALYSIS:
+TYPE = TWOLEVEL;
+ESTIMATOR = BAYES;
+CHAINS = 2;
+FBITERATIONS = 80000;
+BSEED = 58321;
+PROCESSORS = 2;
+MODEL:
+%WITHIN%
+li ON li&1 (arli);
+li ON la&1 lp&1 core&1 peri&1 dist&1;
+li ON dayc;
+la ON li&1;
+la ON la&1 (arla);
+la ON lp&1 core&1 peri&1 dist&1;
+la ON dayc;
+lp ON li&1 la&1;
+lp ON lp&1 (arlp);
+lp ON core&1 peri&1 dist&1;
+lp ON dayc;
+core ON li&1 (aic);
+core ON la&1 (aac);
+core ON lp&1 (apc);
+core ON core&1 (arco);
+core ON peri&1 dist&1;
+core ON dayc;
+peri ON li&1 (aip);
+peri ON la&1 (aap);
+peri ON lp&1 (app);
+peri ON core&1;
+peri ON peri&1 (arpe);
+peri ON dist&1;
+peri ON dayc;
+dist ON li&1 (d1i);
+dist ON la&1 (d1a);
+dist ON lp&1 (d1p);
+dist ON core&1 (bc);
+dist ON peri&1 (bp);
+dist ON dist&1 (ardi);
+dist ON li&2 (cdi);
+dist ON la&2 (cda);
+dist ON lp&2 (cdp);
+dist ON dayc;
+li WITH la lp core peri dist;
+la WITH lp core peri dist;
+lp WITH core peri dist;
+core WITH peri dist;
+peri WITH dist;
+%BETWEEN%
+li WITH la lp core peri dist;
+la WITH lp core peri dist;
+lp WITH core peri dist;
+core WITH peri dist;
+peri WITH dist;
+MODEL CONSTRAINT:
+NEW(iic iip iac iap ipc ipp dic dia dip bdiff h3i h3a h3p);
+iic = aic * bc;
+iip = aip * bp;
+iac = aac * bc;
+iap = aap * bp;
+ipc = apc * bc;
+ipp = app * bp;
+dic = iic - iip;
+dia = iac - iap;
+dip = ipc - ipp;
+bdiff = bc - bp;
+h3i = aip - aic;
+h3a = aap - aac;
+h3p = app - apc;
+OUTPUT:
+TECH1;
+TECH8;
+STANDARDIZED(STDYX);
+CINTERVAL(HPD);
+PLOT:
+TYPE = PLOT2;

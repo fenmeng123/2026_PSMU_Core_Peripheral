@@ -1,0 +1,26 @@
+TITLE:
+! Author: Kunru Song
+S2.3 H1 B2_CorePeripheral baseline CFA DIFFTEST;
+DATA:
+FILE = "G:/2026_[8]_PSMU_Daily_CorePeripheral/Step_2_Measurement_Models/
+mplus/s2_3/s2_3_b1_vs_b2_h1_b2_core_peripheral.dat"; 
+VARIABLE:
+NAMES = bs1 bs2 bs3 bs4 bs5 bs6 bs7 bs8 bs9 bs10 bs11 bs12 bs13 bs14 bs15 bs16 bs17
+     bs18; 
+ MISSING=.;
+ CATEGORICAL = bs1-bs18;
+ANALYSIS:
+ESTIMATOR = WLSMV;
+PARAMETERIZATION = DELTA;
+
+MODEL:
+periph BY bs1-bs6;
+core BY bs7-bs18;
+periph WITH core;
+OUTPUT:
+STANDARDIZED(STDYX);
+CINTERVAL;
+TECH1;
+TECH4;
+SAVEDATA:
+DIFFTEST = s2_3_b1_vs_b2.dif;

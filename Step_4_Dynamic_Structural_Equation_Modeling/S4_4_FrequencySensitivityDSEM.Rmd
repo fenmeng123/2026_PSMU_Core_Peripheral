@@ -1,0 +1,481 @@
+---
+title: "S4.4 Engagement-frequency sensitivity DSEM"
+author: "Kunru Song"
+date: "2026-07-21 00:47:54 +08:00"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+<!-- Fixed date: earliest retained HTML CreationTime, not a verified analysis-start log. -->
+
+This planned prompt-level sensitivity analysis replaces the three duration
+variables with their corresponding frequency variables. Duration and frequency
+never enter the same model. Frequency is coded 0--3 after the verified 1--4 to
+0--3 recode. All temporal, covariance, mediation, Bayesian iteration, and
+reporting decisions otherwise match the primary prompt-level DSEM.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE, error = FALSE,
+  collapse = FALSE, comment = NA, dev = "svglite"
+)
+required_packages <- c(
+  "bruceR", "dplyr", "ggplot2", "knitr", "MplusAutomation",
+  "openxlsx", "readxl", "rmarkdown", "svglite", "tibble", "tidyr"
+)
+available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(available)) {
+  stop("Missing required R packages: ", paste(names(available)[!available], collapse = ", "))
+}
+locate_step4_helper <- function(start) {
+  candidate <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(candidate)) candidate <- dirname(candidate)
+  repeat {
+    helper <- file.path(candidate, "Step_4_Dynamic_Structural_Equation_Modeling",
+                        "S4_0_DSEMHelpers.R")
+    if (dir.exists(file.path(candidate, "Step_1_Descriptive_and_Reliability")) &&
+        file.exists(helper)) return(helper)
+    parent <- dirname(candidate)
+    if (identical(parent, candidate)) break
+    candidate <- parent
+  }
+  stop("Could not locate S4_0_DSEMHelpers.R in the public project")
+}
+input_context <- knitr::current_input(dir = TRUE)
+project_start <- if (length(input_context) == 1L && !is.na(input_context) &&
+                     nzchar(input_context)) input_context else getwd()
+helper_file <- locate_step4_helper(project_start)
+source(helper_file, local = TRUE, encoding = "UTF-8")
+
+project_root <- locate_project_root(project_start)
+knitr::opts_knit$set(root.dir = project_root)
+input_file <- file.path(project_root, "Res_2_Data_for_Analysis", "dat_step4_dsem.rda")
+primary_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "fit_s4_2_primary_prompt_dsem.rda"
+)
+result_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "fit_s4_4_frequency_sensitivity_dsem.rda"
+)
+table_file <- file.path(
+  project_root, "Res_3_Results", "Table_S4_4_FrequencySensitivityDSEM.xlsx"
+)
+figure_file <- file.path(
+  project_root, "Res_3_Results", "Figure_S4_4_FrequencySensitivityDSEM.svg"
+)
+mplus_directory <- file.path(
+  project_root, "Step_4_Dynamic_Structural_Equation_Modeling", "mplus", "s4_4"
+)
+mplus_command <- Sys.getenv("MPLUS_COMMAND", unset = unname(Sys.which("Mplus.exe")))
+expected_mplus_version <- "9"
+stopifnot(
+  file.exists(input_file), file.exists(primary_file),
+  file.exists(mplus_command), file.exists(helper_file)
+)
+dir.create(dirname(result_file), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(table_file), recursive = TRUE, showWarnings = FALSE)
+dir.create(mplus_directory, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load and validate prompt-level frequency data
+
+```{r load-data}
+dat_step4_dsem <- load_single_object(input_file, "dat_step4_dsem")
+primary_fit <- load_single_object(primary_file, "fit_s4_2_primary_prompt_dsem")
+prompt <- dat_step4_dsem$prompt |>
+  dplyr::arrange(Name_ID, tprompt) |>
+  as.data.frame()
+model_data <- prompt |>
+  dplyr::transmute(
+    id = as.integer(factor(Name_ID, levels = sort(unique(Name_ID)))),
+    tprompt = as.integer(tprompt),
+    dayc = as.numeric(dayc), tm2 = as.numeric(tm2), tm3 = as.numeric(tm3),
+    fi = as.numeric(InteractiveFrequency),
+    fa = as.numeric(ActiveFrequency),
+    fp = as.numeric(PassiveFrequency),
+    core = as.numeric(Core), peri = as.numeric(Peripheral), dist = as.numeric(Distress)
+  ) |>
+  as.data.frame()
+
+frequency_values <- unlist(model_data[c("fi", "fa", "fp")], use.names = FALSE)
+frequency_values <- frequency_values[!is.na(frequency_values)]
+stopifnot(
+  nrow(model_data) == 18810L,
+  dplyr::n_distinct(model_data$id) == 209L,
+  !anyNA(model_data[c("id", "tprompt", "dayc", "tm2", "tm3")]),
+  !anyDuplicated(model_data[c("id", "tprompt")]),
+  all(tapply(model_data$tprompt, model_data$id, function(x) identical(x, 1:90))),
+  all(frequency_values %in% 0:3),
+  identical(sort(unique(frequency_values)), as.numeric(0:3))
+)
+input_audit <- data.frame(
+  rows = nrow(model_data), clusters = dplyr::n_distinct(model_data$id),
+  scheduled_prompts_per_cluster = min(table(model_data$id)),
+  observed_interactive_frequency = sum(!is.na(model_data$fi)),
+  observed_active_frequency = sum(!is.na(model_data$fa)),
+  observed_passive_frequency = sum(!is.na(model_data$fp)),
+  minimum_frequency = min(frequency_values), maximum_frequency = max(frequency_values),
+  fully_missing_six_outcomes = sum(
+    rowSums(!is.na(model_data[c("fi", "fa", "fp", "core", "peri", "dist")])) == 0L
+  ),
+  stringsAsFactors = FALSE
+)
+knitr::kable(input_audit)
+```
+
+# Mplus model specification with frequency replacement
+
+```{r model-specification}
+variable_block <- paste(
+  "CLUSTER = id;",
+  "WITHIN = dayc tm2 tm3;",
+  "LAGGED = fi(2) fa(2) fp(2) core(1) peri(1) dist(1);",
+  "TINTERVAL = tprompt(1);",
+  sep = "\n"
+)
+model_block <- six_variable_model_block(
+  engagement = c("fi", "fa", "fp"), controls = c("dayc", "tm2", "tm3")
+)
+assert_free_engagement_lag_paths(
+  model_block, engagement = c("fi", "fa", "fp")
+)
+constraint_block <- six_variable_constraint_block()
+focal_dictionary <- six_variable_focal_dictionary(
+  engagement = c("fi", "fa", "fp"),
+  predictor_names = c(
+    "InteractiveFrequency", "ActiveFrequency", "PassiveFrequency"
+  )
+)
+stopifnot(
+  nrow(focal_dictionary) == 27L,
+  !anyDuplicated(focal_dictionary$key),
+  all(nchar(focal_dictionary$key) <= 8L),
+  !grepl("li|la|lp", variable_block),
+  grepl("LAGGED = fi(2)", variable_block, fixed = TRUE)
+)
+knitr::kable(focal_dictionary)
+```
+
+# Fixed 80,000-iteration two-chain canonical run
+
+The estimates were generated on 2026-09-14 with Mplus 9.0
+(output header: `Mplus VERSION 9`), using the original seed, two chains and
+80,000 fixed iterations. The header retains the historical report date.
+
+```{r run-80k}
+run_80k <- run_bayes_dsem(
+  data = model_data,
+  variable_block = variable_block,
+  model_block = model_block,
+  constraint_block = constraint_block,
+  usevariables = names(model_data),
+  mplus_directory = mplus_directory,
+  stem = "s4_4_frequency_sensitivity_dsem",
+  title = "! Six-variable prompt-level frequency-replacement sensitivity DSEM.",
+  iterations = 80000L, seed = 69427L, expected_clusters = 209L,
+  mplus_command = mplus_command,
+  expected_mplus_version = expected_mplus_version,
+  parameter_scale = "stdyx"
+)
+stopifnot(run_80k$convergence$passed)
+knitr::kable(data.frame(
+  run = "80k", final_psr = run_80k$convergence$final_psr,
+  max_second_half_psr = run_80k$convergence$max_second_half_psr,
+  passed = run_80k$convergence$passed
+))
+```
+
+# Organize and compare canonical posterior results
+
+```{r organize-results}
+focal_dictionary_stdyx <- focal_dictionary |>
+  dplyr::filter(type == "path")
+focal_stdyx_80k <- extract_focal_parameters(
+  run_80k$parameters_stdyx, focal_dictionary_stdyx
+)
+focal_unstandardized_audit <- extract_focal_parameters(
+  run_80k$parameters_unstandardized, focal_dictionary
+)
+constraint_keys <- focal_dictionary |>
+  dplyr::filter(type == "constraint") |>
+  dplyr::pull(key)
+model_constraint_raw_80k <- focal_unstandardized_audit |>
+  dplyr::filter(key %in% constraint_keys) |>
+  dplyr::mutate(
+    estimate_scale = "Unstandardized/raw",
+    source_section = "Mplus MODEL CONSTRAINT"
+  ) |>
+  dplyr::select(
+    key, role, mode, outcome, predictor, lag, estimate_scale, source_section,
+    estimate, posterior_sd, posterior_p_one_tailed, lower_hpd, upper_hpd,
+    excludes_zero
+  )
+stopifnot(
+  nrow(focal_stdyx_80k) == 14L,
+  nrow(focal_unstandardized_audit) == 27L,
+  nrow(model_constraint_raw_80k) == 13L,
+  identical(model_constraint_raw_80k$key, constraint_keys),
+  identical(run_80k$reporting_scale, "Mplus STDYX standardization")
+)
+convergence <- convergence_table(run_80k)
+stopifnot(nrow(convergence) == 1L, convergence$canonical[[1L]])
+all_parameters_stdyx <- run_80k$parameters_stdyx |>
+  dplyr::rename(
+    estimate = est, posterior_p_one_tailed = pval,
+    lower_hpd = lower_2.5ci, upper_hpd = upper_2.5ci
+  )
+psr_history <- run_80k$convergence$psr_history |>
+  dplyr::mutate(run = "80k")
+primary_comparison <- compare_sensitivity_with_primary(
+  focal_stdyx_80k, primary_fit$results$focal_stdyx_80k,
+  "Prompt-level frequency replacement"
+)
+stopifnot(nrow(primary_comparison) == 14L)
+knitr::kable(focal_stdyx_80k, digits = 5)
+```
+
+# H3: Engagement to Peripheral versus Core
+
+The three within-person contrasts compare the lag-1 Engagement-to-Peripheral
+path with the corresponding Engagement-to-Core path: `h3i = aip - aic`,
+`h3a = aap - aac`, and `h3p = app - apc`. These are signed differences of the
+existing free coefficients. Adding these derived parameters does not constrain
+or otherwise change the model body. Positive values indicate a stronger
+positive association with subsequent Peripheral symptoms. A 95% HPD interval
+entirely above zero supports the hypothesized direction; an interval entirely
+below zero supports the opposite direction; an interval including zero leaves
+the directional comparison uncertain.
+
+The contrasts use **unstandardized** coefficients for the two symptom means
+on their common 1--5 response scale. They are not differences of STDYX
+coefficients. This sensitivity test uses frequency (0--3) in place of duration and one scheduled prompt as the lag unit; it evaluates the corresponding frequency contrast.
+All 13 defined parameters (six indirect effects, three indirect contrasts,
+`bdiff`, and the three H3 contrasts) are exported in the separate
+`MODEL_CONSTRAINT_Raw_80k` sheet. The 14 focal STDYX paths remain in their own sheet.
+
+```{r h3-contrasts}
+h3_contrasts_80k <- model_constraint_raw_80k |>
+  dplyr::filter(key %in% c("h3i", "h3a", "h3p")) |>
+  dplyr::mutate(
+    directional_conclusion = dplyr::case_when(
+      lower_hpd > 0 ~ "Peripheral > Core: supported",
+      upper_hpd < 0 ~ "Core > Peripheral: opposite direction",
+      TRUE ~ "95% HPD includes zero: uncertain"
+    )
+  )
+stopifnot(identical(h3_contrasts_80k$key, c("h3i", "h3a", "h3p")))
+knitr::kable(
+  h3_contrasts_80k |>
+    dplyr::select(mode, estimate, posterior_sd, lower_hpd, upper_hpd,
+                  directional_conclusion),
+  digits = 5,
+  col.names = c("Engagement mode", "Posterior median", "Posterior SD",
+                "95% HPD lower", "95% HPD upper", "Directional conclusion"),
+  caption = "H3 lag-1 contrasts: Peripheral minus Core (unstandardized)."
+)
+```
+
+# Interpretation of STDYX path coefficients
+
+The following statements use Mplus STDYX coefficients. Each coefficient is the
+estimated standard-deviation change in the outcome associated with a one-standard-
+deviation increase in the predictor, conditional on the remaining lagged
+variables and the Day/Time nuisance controls.
+
+```{r generated-interpretations, results='asis'}
+interpret_rows <- focal_stdyx_80k |>
+  dplyr::filter(role %in% c(
+    "Engagement to mediator", "Mediator to Distress",
+    "Lag-1 Engagement to Distress adjustment", "Lag-2 direct effect"
+  ))
+make_frequency_interpretation <- function(row) {
+  predictor_label <- if (is.na(row$mode)) row$predictor else paste0(row$mode, " frequency")
+  direction <- if (row$estimate >= 0) "higher" else "lower"
+  uncertainty <- if (row$lower_hpd <= 0 && row$upper_hpd >= 0) {
+    " The 95% HPD interval included zero."
+  } else {
+    " The 95% HPD interval excluded zero."
+  }
+  temporal <- switch(
+    row$role,
+    "Engagement to mediator" = paste0("subsequent ", row$outcome),
+    "Mediator to Distress" = "subsequent Distress",
+    "Lag-1 Engagement to Distress adjustment" = "subsequent Distress",
+    "Lag-2 direct effect" = "Distress two scheduled prompts later"
+  )
+  paste0(
+    "- When a participant's ", predictor_label,
+    " was one standard deviation higher, ", temporal,
+    " was estimated to be ", sprintf("%.3f", abs(row$estimate)),
+    " standard deviations ", direction,
+    " (STDYX posterior median; 95% HPD [", sprintf("%.3f", row$lower_hpd), ", ",
+    sprintf("%.3f", row$upper_hpd), "]).", uncertainty, "\n"
+  )
+}
+cat(paste(vapply(seq_len(nrow(interpret_rows)), function(i) {
+  make_frequency_interpretation(interpret_rows[i, , drop = FALSE])
+}, character(1)), collapse = ""))
+```
+
+# Figure and reproducible exports
+
+```{r export-results}
+plot_data <- focal_stdyx_80k |>
+  dplyr::filter(role %in% c(
+    "Engagement to mediator", "Mediator to Distress",
+    "Lag-1 Engagement to Distress adjustment", "Lag-2 direct effect"
+  )) |>
+  dplyr::mutate(
+    display = dplyr::case_when(
+      role == "Engagement to mediator" ~ paste(mode, "to", outcome),
+      role == "Lag-2 direct effect" ~ paste(mode, "direct to Distress"),
+      role == "Mediator to Distress" ~ paste(predictor, "to Distress"),
+      role == "Lag-1 Engagement to Distress adjustment" ~ paste(mode, "lag-1 to Distress"),
+      TRUE ~ paste(mode, "lag-2 to Distress")
+    ),
+    display = factor(display, levels = rev(unique(display)))
+  )
+coefficient_plot <- ggplot2::ggplot(
+  plot_data, ggplot2::aes(x = estimate, y = display, colour = role)
+) +
+  ggplot2::geom_vline(xintercept = 0, colour = "grey55", linewidth = 0.5) +
+  ggplot2::geom_errorbarh(
+    ggplot2::aes(xmin = lower_hpd, xmax = upper_hpd),
+    height = 0.18, linewidth = 0.65
+  ) +
+  ggplot2::geom_point(size = 2.2) +
+  ggplot2::labs(
+    title = "Frequency-replacement DSEM focal STDYX paths",
+    subtitle = "Mplus STDYX posterior medians and 95% HPD intervals",
+    x = "STDYX standardized coefficient", y = NULL, colour = "Effect"
+  ) +
+  ggplot2::theme_minimal(base_size = 10) +
+  ggplot2::theme(
+    legend.position = "bottom", panel.grid.minor = ggplot2::element_blank(),
+    plot.title.position = "plot"
+  )
+ggplot2::ggsave(
+  filename = figure_file, plot = coefficient_plot,
+  device = svglite::svglite, width = 11, height = 8.2, bg = "white"
+)
+
+workbook_sheets <- list(
+  Focal_STDYX_80k = round_numeric_columns(focal_stdyx_80k),
+  MODEL_CONSTRAINT_Raw_80k = round_numeric_columns(model_constraint_raw_80k),
+  Convergence = round_numeric_columns(convergence),
+  Primary_Comparison = round_numeric_columns(primary_comparison),
+  Frequency_Audit = input_audit,
+  All_STDYX_Parameters_80k = round_numeric_columns(all_parameters_stdyx),
+  PSR_History = round_numeric_columns(psr_history)
+)
+bruceR::export(workbook_sheets, file = table_file, overwrite = TRUE)
+style_and_sanitize_workbook(table_file, workbook_sheets)
+stopifnot(
+  validate_workbook(table_file, names(workbook_sheets), workbook_sheets),
+  file.exists(figure_file), file.info(figure_file)$size > 0
+)
+
+fit_s4_4_frequency_sensitivity_dsem <- list(
+  metadata = list(
+    generated_by = paste0(
+      "Step_4_Dynamic_Structural_Equation_Modeling/",
+      "S4_4_FrequencySensitivityDSEM.Rmd"
+    ),
+    generated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %z"),
+    model = "Six-variable prompt-level DSEM with frequency replacing duration",
+    estimator = "Mplus 9.0 BAYES", chains = 2L,
+    canonical_iterations = 80000L,
+    h3_contrast_definition = "Lag-1 Engagement to Peripheral minus Core; unstandardized",
+    point_summary = "Posterior median", interval = "95% HPD",
+    standardized_output_requested = TRUE,
+    reporting_scale = "Mplus STDYX standardization",
+    defined_parameters_in_reporting_table = TRUE,
+    defined_parameters_in_focal_stdyx_table = FALSE,
+    defined_parameters_in_separate_raw_sheet = TRUE,
+    defined_parameter_note = paste(
+      "Mplus does not place MODEL CONSTRAINT quantities in the STDYX",
+      "standardization table; they are exported only in the separate",
+      "MODEL_CONSTRAINT_Raw_80k sheet as an explicitly unstandardized exception."
+    ),
+    engagement_metric = "Frequency recoded from 1--4 to 0--3"
+  ),
+  input_audit = input_audit,
+  syntax = list(variable = variable_block, model = model_block, constraint = constraint_block),
+  focal_dictionary = focal_dictionary,
+  run = run_80k,
+  results = list(
+    focal_80k = focal_stdyx_80k,
+    focal_stdyx_80k = focal_stdyx_80k,
+    model_constraint_raw_80k = model_constraint_raw_80k,
+    h3_contrasts_80k = h3_contrasts_80k,
+    focal_unstandardized_audit = focal_unstandardized_audit,
+    all_parameters_stdyx_80k = all_parameters_stdyx,
+    convergence = convergence, primary_comparison = primary_comparison
+  ),
+  artifacts = list(
+    workbook = "Res_3_Results/Table_S4_4_FrequencySensitivityDSEM.xlsx",
+    figure = "Res_3_Results/Figure_S4_4_FrequencySensitivityDSEM.svg"
+  ),
+  source = list(
+    data = "Res_2_Data_for_Analysis/dat_step4_dsem.rda",
+    data_md5 = unname(tools::md5sum(input_file)),
+    primary_fit_md5 = unname(tools::md5sum(primary_file))
+  )
+)
+save(
+  fit_s4_4_frequency_sensitivity_dsem, file = result_file,
+  compress = "xz", version = 3
+)
+verified <- load_single_object(result_file, "fit_s4_4_frequency_sensitivity_dsem")
+stopifnot(
+  verified$metadata$chains == 2L,
+  verified$metadata$canonical_iterations == 80000L,
+  verified$run$convergence$passed,
+  verified$metadata$standardized_output_requested,
+  identical(verified$metadata$reporting_scale, "Mplus STDYX standardization"),
+  nrow(verified$results$focal_stdyx_80k) == 14L,
+  nrow(verified$results$model_constraint_raw_80k) == 13L,
+  nrow(verified$results$focal_unstandardized_audit) == 27L
+)
+```
+
+```{r final-acceptance, include=FALSE}
+acceptance <- data.frame(
+  gate = c(
+    "Complete 90-prompt scaffold retained",
+    "Frequency 0--3 replaces rather than supplements duration",
+    "Primary temporal and covariance specification retained",
+    "80k two-chain fixed-iteration convergence",
+    "Mplus STDYX output requested and parsed",
+    "STDYX paths plus separate raw MODEL CONSTRAINT sheet exported",
+    "Primary direction and interval comparison exported",
+    "Workbook, SVG, and canonical RDA validated"
+  ),
+  passed = c(
+    nrow(model_data) == 18810L && min(table(model_data$id)) == 90L,
+    all(frequency_values %in% 0:3) && !grepl("li|la|lp", variable_block),
+    grepl("TINTERVAL = tprompt(1)", variable_block, fixed = TRUE) &&
+      grepl("dist ON fi&2", model_block, fixed = TRUE),
+    run_80k$convergence$passed,
+    run_80k$convergence$checks$stdyx_declared &&
+      run_80k$convergence$checks$stdyx_output_present,
+    nrow(focal_stdyx_80k) == 14L &&
+      all(focal_dictionary_stdyx$key %in% focal_stdyx_80k$key) &&
+      nrow(model_constraint_raw_80k) == 13L &&
+      all(model_constraint_raw_80k$estimate_scale == "Unstandardized/raw"),
+    nrow(primary_comparison) == 14L,
+    file.exists(table_file) && file.exists(figure_file) && file.exists(result_file)
+  ),
+  stringsAsFactors = FALSE
+)
+stopifnot(all(acceptance$passed))
+knitr::kable(acceptance)
+```
+
+This sensitivity changes the Engagement measurement metric, not the temporal
+ordering. Comparisons with the duration model therefore emphasize posterior
+direction and 95% HPD zero-exclusion patterns rather than raw coefficient
+magnitudes.

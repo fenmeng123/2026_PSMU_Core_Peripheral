@@ -1,0 +1,485 @@
+---
+title: "S5.1 Prepare 12-node mlVAR data"
+author: "Kunru Song"
+date: "2026-07-21"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+
+This report creates the sole stage-specific data entry for Step 5. It preserves
+the complete 90-occasion prompt scaffold, creates the prespecified 12 nodes in three
+communities, fixes the common theory-based network layout, and audits the exact
+rows and lag-1 transitions available to the primary mlVAR. It estimates no
+network model.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  collapse = FALSE, comment = NA
+)
+
+required_packages <- c("dplyr", "knitr", "rmarkdown", "tibble", "tidyr")
+available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(available)) {
+  stop("Missing required R packages: ", paste(names(available)[!available], collapse = ", "))
+}
+
+locate_project_root <- function(start = getwd()) {
+  # Public code folders remain available even when private data/docs are absent.
+  markers <- c("Step_1_Descriptive_and_Reliability", "Step_5_mlVAR_Network_Analysis")
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (length(current) != 1L) stop("Supply one project location")
+  if (!dir.exists(current)) current <- dirname(current)
+  repeat {
+    if (all(dir.exists(file.path(current, markers)))) return(current)
+    parent <- dirname(current)
+    if (identical(parent, current)) break
+    current <- parent
+  }
+  stop("Could not locate the public analysis project from: ", start)
+}
+
+load_single_object <- function(path, expected_name) {
+  environment <- new.env(parent = emptyenv())
+  loaded <- load(path, envir = environment)
+  if (!identical(loaded, expected_name)) {
+    stop("Expected only ", expected_name, "; found: ", paste(loaded, collapse = ", "))
+  }
+  environment[[expected_name]]
+}
+
+strict_complete_mean <- function(data, variables) {
+  values <- as.data.frame(lapply(data[variables], as.numeric))
+  complete <- rowSums(!is.na(values)) == length(variables)
+  score <- rep(NA_real_, nrow(values))
+  score[complete] <- rowMeans(values[complete, , drop = FALSE])
+  score
+}
+
+safe_mean <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+
+zero_within_person <- function(x, id) {
+  by_person <- split(x, id)
+  sum(vapply(by_person, function(values) {
+    values <- values[is.finite(values)]
+    length(values) > 1L && stats::sd(values) == 0
+  }, logical(1)))
+}
+
+report_file <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(
+  if (length(report_file) == 1L && file.exists(report_file)) report_file else getwd()
+)
+knitr::opts_knit$set(root.dir = project_root)
+
+input_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "dat_focal_analysis.rda"
+)
+output_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "dat_step5_mlvar.rda"
+)
+
+stopifnot(file.exists(input_file))
+dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+```
+
+# Nodes, communities, and initial layout
+
+The primary network contains exactly three Engagement Time nodes, six PSMU
+manifestation nodes, and three Distress-domain nodes. Peripheral and Core are
+subgroups inside the one PSMU community, not additional communities. The
+coordinate matrix below is fixed before model results are viewed and is reused
+unchanged for all three networks.
+
+```{r node-map}
+node_map <- data.frame(
+  order = 1:12,
+  node = c(
+    "InteractiveLog", "ActiveLog", "PassiveLog",
+    paste0("PMU", 1:6),
+    "DepressiveAffect", "Anxiety", "Stress"
+  ),
+  label = c(
+    "Interactive Time", "Active Time", "Passive Time",
+    "Salience", "Tolerance", "Mood Modification",
+    "Relapse", "Withdrawal", "Conflict",
+    "Depressive Affect", "Anxiety", "Stress"
+  ),
+  short_label = c(
+    "Interactive", "Active", "Passive",
+    "Salience", "Tolerance", "Mood mod.",
+    "Relapse", "Withdrawal", "Conflict",
+    "Depressive", "Anxiety", "Stress"
+  ),
+  community = c(
+    rep("Engagement Time", 3), rep("PSMU", 6), rep("Distress", 3)
+  ),
+  subgroup = c(
+    rep(NA_character_, 3), rep("Peripheral", 2), rep("Core", 4),
+    rep(NA_character_, 3)
+  ),
+  source = c(
+    "log1p(mu_time1)", "log1p(mu_time2)", "log1p(mu_time3)",
+    paste0("PMU", 1:6),
+    "mean(DASS5,DASS6)", "mean(DASS3,DASS4)", "mean(DASS1,DASS2)"
+  ),
+  scoring = c(
+    rep("log1p raw duration minutes", 3),
+    rep("Observed 1-5 EMA manifestation item", 6),
+    rep("Strict-complete mean of two 1-5 EMA items", 3)
+  ),
+  node_fill = c(rep("#F3C677", 3), rep("#9E77ED", 6), rep("#6BCB77", 3)),
+  node_border = c(
+    rep("#A66A00", 3), rep("#F39C12", 2), rep("#5B2C6F", 4),
+    rep("#237A32", 3)
+  ),
+  stringsAsFactors = FALSE
+)
+
+network_layout <- data.frame(
+  node = node_map$node,
+  x = c(-1.80, -1.80, -1.80, -0.55, 0.35, 0.80, 0.75, 0.05, -0.70, 1.80, 1.80, 1.80),
+  y = c(0.95, 0.00, -0.95, 1.20, 1.20, 0.45, -0.40, -1.15, -0.45, 0.95, 0.00, -0.95),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  nrow(node_map) == 12L,
+  !anyDuplicated(node_map$node),
+  identical(unique(node_map$community), c("Engagement Time", "PSMU", "Distress")),
+  identical(network_layout$node, node_map$node),
+  !anyNA(network_layout[c("x", "y")])
+)
+
+knitr::kable(node_map[c("order", "node", "label", "community", "subgroup", "source")])
+```
+
+# Load and validate the canonical prompt scaffold
+
+```{r load-source}
+dat_focal_analysis <- load_single_object(input_file, "dat_focal_analysis")
+
+id_variables <- c("Data_ID", "Name_ID", "Day", "Time")
+duration_variables <- paste0("mu_time", 1:3)
+pmu_variables <- paste0("PMU", 1:6)
+dass_variables <- paste0("DASS", 1:6)
+required_variables <- c(
+  id_variables, duration_variables, pmu_variables, dass_variables
+)
+
+missing_variables <- setdiff(required_variables, names(dat_focal_analysis))
+if (length(missing_variables)) {
+  stop("Missing required variables: ", paste(missing_variables, collapse = ", "))
+}
+
+prompt_counts <- table(dat_focal_analysis$Name_ID)
+day_counts <- tapply(
+  dat_focal_analysis$Day, dat_focal_analysis$Name_ID, dplyr::n_distinct
+)
+
+stopifnot(
+  nrow(dat_focal_analysis) == 18810L,
+  dplyr::n_distinct(dat_focal_analysis$Name_ID) == 209L,
+  !anyNA(dat_focal_analysis[id_variables]),
+  !anyDuplicated(dat_focal_analysis[c("Name_ID", "Day", "Time")]),
+  !anyDuplicated(dat_focal_analysis$Data_ID),
+  identical(sort(unique(dat_focal_analysis$Day)), 1:30),
+  identical(sort(unique(dat_focal_analysis$Time)), 1:3),
+  all(prompt_counts == 90L),
+  all(day_counts == 30L),
+  all(vapply(dat_focal_analysis[duration_variables], function(x) {
+    all(is.na(x) | (x >= 0 & x <= 300))
+  }, logical(1))),
+  all(vapply(dat_focal_analysis[c(pmu_variables, dass_variables)], function(x) {
+    all(is.na(x) | x %in% 1:5)
+  }, logical(1)))
+)
+
+source_audit <- data.frame(
+  check = c(
+    "Scheduled rows", "Participants", "Prompts per participant",
+    "Days per participant", "Duplicate prompt keys", "Duplicate Data_ID"
+  ),
+  observed = c(
+    nrow(dat_focal_analysis), dplyr::n_distinct(dat_focal_analysis$Name_ID),
+    paste(range(prompt_counts), collapse = "-"),
+    paste(range(day_counts), collapse = "-"),
+    sum(duplicated(dat_focal_analysis[c("Name_ID", "Day", "Time")])),
+    sum(duplicated(dat_focal_analysis$Data_ID))
+  ),
+  expected = c("18810", "209", "90", "30", "0", "0"),
+  passed = TRUE,
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(source_audit)
+```
+
+# Construct the 12-node prompt data
+
+```{r construct-prompt}
+prompt <- dat_focal_analysis |>
+  dplyr::arrange(Name_ID, Day, Time) |>
+  dplyr::transmute(
+    Data_ID = as.numeric(Data_ID),
+    Name_ID = as.numeric(Name_ID),
+    Day = as.integer(Day),
+    Time = as.integer(Time),
+    occasion = as.integer(3L * (Day - 1L) + Time),
+    InteractiveMinutes = as.numeric(mu_time1),
+    ActiveMinutes = as.numeric(mu_time2),
+    PassiveMinutes = as.numeric(mu_time3),
+    InteractiveLog = log1p(InteractiveMinutes),
+    ActiveLog = log1p(ActiveMinutes),
+    PassiveLog = log1p(PassiveMinutes),
+    PMU1 = as.numeric(PMU1), PMU2 = as.numeric(PMU2),
+    PMU3 = as.numeric(PMU3), PMU4 = as.numeric(PMU4),
+    PMU5 = as.numeric(PMU5), PMU6 = as.numeric(PMU6),
+    DepressiveAffect = strict_complete_mean(
+      dplyr::pick(DASS5, DASS6), c("DASS5", "DASS6")
+    ),
+    Anxiety = strict_complete_mean(
+      dplyr::pick(DASS3, DASS4), c("DASS3", "DASS4")
+    ),
+    Stress = strict_complete_mean(
+      dplyr::pick(DASS1, DASS2), c("DASS1", "DASS2")
+    )
+  ) |>
+  as.data.frame()
+
+node_names <- node_map$node
+prompt$node_complete <- stats::complete.cases(prompt[node_names])
+prompt$prior_node_complete <- ave(
+  prompt$node_complete, prompt$Name_ID,
+  FUN = function(x) c(FALSE, head(x, -1L))
+)
+prompt$prior_occasion <- ave(
+  prompt$occasion, prompt$Name_ID,
+  FUN = function(x) c(NA_integer_, head(x, -1L))
+)
+prompt$prior_day <- ave(
+  prompt$Day, prompt$Name_ID,
+  FUN = function(x) c(NA_integer_, head(x, -1L))
+)
+prompt$consecutive <- !is.na(prompt$prior_occasion) &
+  prompt$occasion - prompt$prior_occasion == 1L
+prompt$lag1_complete <- prompt$node_complete & prompt$prior_node_complete &
+  prompt$consecutive
+prompt$transition_type <- ifelse(
+  !prompt$consecutive, NA_character_,
+  ifelse(prompt$Day == prompt$prior_day, "Within-day", "Overnight")
+)
+
+sequence_audit <- prompt |>
+  dplyr::group_by(Name_ID) |>
+  dplyr::summarise(
+    rows = dplyr::n(), min_occasion = min(occasion), max_occasion = max(occasion),
+    exact_sequence = identical(occasion, 1:90), .groups = "drop"
+  )
+
+stopifnot(
+  nrow(prompt) == 18810L,
+  nrow(sequence_audit) == 209L,
+  all(sequence_audit$rows == 90L),
+  all(sequence_audit$min_occasion == 1L),
+  all(sequence_audit$max_occasion == 90L),
+  all(sequence_audit$exact_sequence),
+  sum(prompt$node_complete) == 17755L,
+  sum(prompt$lag1_complete) == 16598L,
+  sum(prompt$lag1_complete & prompt$transition_type == "Within-day") == 11125L,
+  sum(prompt$lag1_complete & prompt$transition_type == "Overnight") == 5473L
+)
+
+knitr::kable(data.frame(
+  scheduled_rows = nrow(prompt),
+  complete_12_node_occasions = sum(prompt$node_complete),
+  possible_primary_transitions = sum(prompt$consecutive),
+  usable_primary_transitions = sum(prompt$lag1_complete),
+  usable_within_day_transitions = sum(
+    prompt$lag1_complete & prompt$transition_type == "Within-day"
+  ),
+  usable_overnight_transitions = sum(
+    prompt$lag1_complete & prompt$transition_type == "Overnight"
+  )
+))
+```
+
+# Scaling, variance, and correlation diagnostics
+
+```{r diagnostics}
+scaling <- dplyr::bind_rows(lapply(node_names, function(variable) {
+  values <- prompt[[variable]]
+  person_mean <- ave(values, prompt$Name_ID, FUN = safe_mean)
+  within <- values - person_mean
+  person_values <- tapply(values, prompt$Name_ID, safe_mean)
+  data.frame(
+    node = variable,
+    observed = as.integer(sum(!is.na(values))),
+    missing = as.integer(sum(is.na(values))),
+    mean = mean(values, na.rm = TRUE),
+    total_sd = stats::sd(values, na.rm = TRUE),
+    pooled_within_sd = stats::sd(within, na.rm = TRUE),
+    between_sd_person_means = stats::sd(person_values, na.rm = TRUE),
+    zero_within_persons = as.integer(zero_within_person(values, prompt$Name_ID)),
+    minimum = min(values, na.rm = TRUE),
+    maximum = max(values, na.rm = TRUE),
+    stringsAsFactors = FALSE
+  )
+}))
+
+distress_nodes <- c("DepressiveAffect", "Anxiety", "Stress")
+distress_within <- as.data.frame(lapply(distress_nodes, function(variable) {
+  prompt[[variable]] - ave(prompt[[variable]], prompt$Name_ID, FUN = safe_mean)
+}))
+names(distress_within) <- distress_nodes
+distress_person <- aggregate(
+  prompt[distress_nodes], list(Name_ID = prompt$Name_ID), safe_mean
+)
+
+distress_within_correlation <- stats::cor(
+  distress_within, use = "pairwise.complete.obs"
+)
+distress_between_correlation <- stats::cor(
+  distress_person[distress_nodes], use = "pairwise.complete.obs"
+)
+
+upper_values <- function(matrix) as.numeric(matrix[upper.tri(matrix)])
+
+stopifnot(
+  all(is.finite(scaling$total_sd)),
+  all(scaling$total_sd > 0),
+  range(upper_values(distress_within_correlation))[[1L]] > 0.45,
+  range(upper_values(distress_within_correlation))[[2L]] < 0.67,
+  range(upper_values(distress_between_correlation))[[1L]] > 0.80,
+  range(upper_values(distress_between_correlation))[[2L]] < 0.93
+)
+
+knitr::kable(scaling, digits = 4)
+knitr::kable(round(distress_within_correlation, 3), caption = "Within-person Distress-domain correlations")
+knitr::kable(round(distress_between_correlation, 3), caption = "Between-person Distress-domain correlations")
+```
+
+# Save and disk-reload the canonical Step 5 entry
+
+```{r save-and-validate}
+sample_audit <- data.frame(
+  sample = c(
+    "Scheduled scaffold", "Complete 12-node occasions",
+    "Possible lag-1 transitions", "Usable lag-1 transitions",
+    "Usable within-day transitions", "Usable overnight transitions"
+  ),
+  rows_or_transitions = as.integer(c(
+    nrow(prompt), sum(prompt$node_complete), sum(prompt$consecutive),
+    sum(prompt$lag1_complete),
+    sum(prompt$lag1_complete & prompt$transition_type == "Within-day"),
+    sum(prompt$lag1_complete & prompt$transition_type == "Overnight")
+  )),
+  participants = c(
+    209L, dplyr::n_distinct(prompt$Name_ID[prompt$node_complete]),
+    209L, dplyr::n_distinct(prompt$Name_ID[prompt$lag1_complete]),
+    dplyr::n_distinct(prompt$Name_ID[
+      prompt$lag1_complete & prompt$transition_type == "Within-day"
+    ]),
+    dplyr::n_distinct(prompt$Name_ID[
+      prompt$lag1_complete & prompt$transition_type == "Overnight"
+    ])
+  ),
+  stringsAsFactors = FALSE
+)
+
+provenance <- list(
+  source_file = "Res_2_Data_for_Analysis/dat_focal_analysis.rda",
+  source_md5 = unname(tools::md5sum(input_file)),
+  generating_script = "Step_5_mlVAR_Network_Analysis/S5_1_PreparemlVARData.Rmd",
+  created = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"),
+  r_version = R.version.string,
+  primary_model = paste(
+    "12-node mlVAR; lmer; lag 1; orthogonal temporal and contemporaneous",
+    "random effects; scale=TRUE; scaleWithin=FALSE; global occasion beep",
+    sep = "; "
+  ),
+  missing_rule = paste(
+    "Preserve 90 scheduled rows; mlVAR na.rm=TRUE uses complete augmented",
+    "current-plus-lag rows and never bridges a missing prompt"
+  ),
+  overnight_rule = "Primary model retains overnight transitions; no exclusion sensitivity planned",
+  final_export_rule = "No CSV; downstream Excel via bruceR::export and SVG via ggplot2::ggsave"
+)
+
+dat_step5_mlvar <- list(
+  prompt = prompt,
+  node_map = node_map,
+  layout = network_layout,
+  scaling = scaling,
+  sample_audit = sample_audit,
+  diagnostics = list(
+    source = source_audit,
+    sequence = sequence_audit,
+    distress_within_correlation = distress_within_correlation,
+    distress_between_correlation = distress_between_correlation
+  ),
+  provenance = provenance
+)
+
+save(dat_step5_mlvar, file = output_file, version = 2)
+rm(dat_step5_mlvar)
+dat_step5_mlvar <- load_single_object(output_file, "dat_step5_mlvar")
+
+stopifnot(
+  identical(
+    names(dat_step5_mlvar),
+    c("prompt", "node_map", "layout", "scaling", "sample_audit", "diagnostics", "provenance")
+  ),
+  nrow(dat_step5_mlvar$prompt) == 18810L,
+  nrow(dat_step5_mlvar$node_map) == 12L,
+  identical(dat_step5_mlvar$node_map$node, node_names),
+  sum(dat_step5_mlvar$prompt$lag1_complete) == 16598L,
+  identical(
+    dat_step5_mlvar$provenance$overnight_rule,
+    "Primary model retains overnight transitions; no exclusion sensitivity planned"
+  )
+)
+
+output_audit <- data.frame(
+  output = "Res_2_Data_for_Analysis/dat_step5_mlvar.rda",
+  object = "dat_step5_mlvar",
+  bytes = file.info(output_file)$size,
+  md5 = unname(tools::md5sum(output_file)),
+  reload_passed = TRUE,
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(sample_audit)
+knitr::kable(output_audit)
+```
+
+```{r validate-entry, include=FALSE}
+s5_1_acceptance <- data.frame(
+  criterion = c(
+    "Canonical source dimensions and keys",
+    "Exact 90-occasion sequence for 209 participants",
+    "Locked 12 nodes in exactly three communities",
+    "Complete 12-node occasion count",
+    "Usable primary lag-1 transition count",
+    "Fixed common layout present for all nodes",
+    "Sole-object RDA disk reload"
+  ),
+  passed = c(
+    nrow(prompt) == 18810L && dplyr::n_distinct(prompt$Name_ID) == 209L,
+    all(sequence_audit$exact_sequence),
+    nrow(node_map) == 12L && dplyr::n_distinct(node_map$community) == 3L,
+    sum(prompt$node_complete) == 17755L,
+    sum(prompt$lag1_complete) == 16598L,
+    identical(network_layout$node, node_map$node),
+    identical(names(dat_step5_mlvar)[[1L]], "prompt") && file.exists(output_file)
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(all(s5_1_acceptance$passed))
+```

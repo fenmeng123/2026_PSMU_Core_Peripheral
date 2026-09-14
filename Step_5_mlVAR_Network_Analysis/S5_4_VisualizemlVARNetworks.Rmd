@@ -1,0 +1,1672 @@
+---
+title: "S5.4 Visualize primary mlVAR networks"
+author: "Kunru Song"
+date: "2026-07-23"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+
+This report draws the accepted S5.3 raw-p sparse temporal,
+contemporaneous, and between-person networks. All graph geometry, edges,
+arrows, and nodes are rendered natively by `qgraph`; `ggplot2` is not used to
+reconstruct the network. Edge-weight text is deliberately omitted from every
+network figure and is moved to a three-sheet adjacency-matrix workbook. The
+primary Temporal figure omits autoregressive self-loops to distinguish cross-lagged associations;
+a companion Temporal figure retains all supported autoregressive effects.
+The primary
+Temporal, contemporaneous, and between-person figures use the same fixed node coordinates, node order, and styling. Positive edges are orange-red and
+negative edges are sky blue. Every displayed edge has the same moderate line
+width. Absolute edge-weight magnitude is encoded only by transparency within
+each visible network: the strongest edge is fully opaque and the weakest edge
+has transparency 0.75, with linear interpolation between those endpoints.
+All nodes are circles. Their outer qgraph rings display temporal nodewise R2
+for the Temporal variants and maximum-scaled full-network strength for the
+contemporaneous and between-person networks.
+Full unthresholded results remain in S5.3.
+Because no multiplicity correction is applied, these `p < .05` display
+networks are exploratory summaries of the unregularized mlVAR.
+
+The adjacency workbook reports every full-precision-derived edge weight to
+three decimals and appends `*` for `.01 <= p < .05`, `**` for
+`.001 <= p < .01`, and `***` for `p < .001`. Three companion heatmaps use
+within-network color intensity for supported edge magnitude: red for positive,
+blue for negative, and pure white for nonsignificant cells. Heatmap cells have
+no text. Their row and column order is `E1`-`E3`, `P1`-`P6`, and `D1`-`D3`.
+
+All three distinct qgraph 1.9.8 built-in layouts (`circle`, `groups`, and
+`spring`) are rendered for the no-autoregression Temporal network. Visual
+inspection retains `spring`, and those Temporal-derived coordinates are frozen
+and reused unchanged for every final network figure.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  collapse = FALSE, comment = NA, dev = "svglite"
+)
+
+required_packages <- c(
+  "bruceR", "dplyr", "ggplot2", "knitr", "openxlsx", "qgraph",
+  "readxl", "rmarkdown", "svglite", "tibble", "tidyr"
+)
+available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(available)) {
+  stop("Missing required R packages: ", paste(names(available)[!available], collapse = ", "))
+}
+
+report_file <- knitr::current_input(dir = TRUE)
+report_directory <- if (length(report_file) == 1L && file.exists(report_file)) {
+  dirname(normalizePath(report_file, winslash = "/", mustWork = TRUE))
+} else getwd()
+helper_candidates <- c(
+  file.path(report_directory, "S5_0_mlVARHelpers.R"),
+  file.path(getwd(), "S5_0_mlVARHelpers.R"),
+  file.path(getwd(), "Step_5_mlVAR_Network_Analysis", "S5_0_mlVARHelpers.R"),
+  file.path(dirname(getwd()), "Step_5_mlVAR_Network_Analysis", "S5_0_mlVARHelpers.R")
+)
+helper_file <- helper_candidates[file.exists(helper_candidates)][1L]
+if (is.na(helper_file)) stop("Could not locate S5_0_mlVARHelpers.R")
+source(helper_file, encoding = "UTF-8")
+
+project_root <- locate_project_root(dirname(helper_file))
+knitr::opts_knit$set(root.dir = project_root)
+
+data_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "dat_step5_mlvar.rda"
+)
+fit_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "fit_s5_2_primary_mlvar.rda"
+)
+result_input_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "results_s5_3_mlvar_networks.rda"
+)
+result_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "results_s5_4_mlvar_figures.rda"
+)
+figure_directory <- file.path(project_root, "Res_3_Results")
+table_file <- file.path(
+  figure_directory, "Table_S5_4_mlVAR_AdjacencyMatrices.xlsx"
+)
+layout_candidate_directory <- file.path(
+  project_root, "Step_5_mlVAR_Network_Analysis", "layout_audit"
+)
+figure_files <- c(
+  Temporal = file.path(figure_directory, "Figure_S5_4_mlVAR_Temporal.svg"),
+  TemporalWithAR = file.path(
+    figure_directory, "Figure_S5_4_mlVAR_Temporal_WithAutoregression.svg"
+  ),
+  Contemporaneous = file.path(figure_directory, "Figure_S5_4_mlVAR_Contemporaneous.svg"),
+  Between = file.path(figure_directory, "Figure_S5_4_mlVAR_BetweenPerson.svg"),
+  Combined = file.path(figure_directory, "Figure_S5_4_mlVAR_ThreeNetworks.svg")
+)
+heatmap_files <- c(
+  Temporal = file.path(figure_directory, "Figure_S5_4_mlVAR_Temporal_Heatmap.svg"),
+  Contemporaneous = file.path(
+    figure_directory, "Figure_S5_4_mlVAR_Contemporaneous_Heatmap.svg"
+  ),
+  Between = file.path(
+    figure_directory, "Figure_S5_4_mlVAR_BetweenPerson_Heatmap.svg"
+  )
+)
+layout_candidate_files <- stats::setNames(
+  file.path(
+    layout_candidate_directory,
+    paste0("S5_4_TemporalLayout_", c("Circle", "Groups", "Spring"), ".svg")
+  ),
+  c("circle", "groups", "spring")
+)
+
+stopifnot(
+  file.exists(data_file), file.exists(fit_file),
+  file.exists(result_input_file), file.exists(helper_file)
+)
+dir.create(figure_directory, recursive = TRUE, showWarnings = FALSE)
+dir.create(layout_candidate_directory, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load accepted nodes, layout, and raw-p sparse networks
+
+```{r load-upstream}
+dat_step5_mlvar <- load_single_object(data_file, "dat_step5_mlvar")
+fit_s5_2_primary_mlvar <- load_single_object(
+  fit_file, "fit_s5_2_primary_mlvar"
+)
+results_s5_3_mlvar_networks <- load_single_object(
+  result_input_file, "results_s5_3_mlvar_networks"
+)
+
+node_map <- dat_step5_mlvar$node_map
+node_names <- node_map$node
+layout_data <- dat_step5_mlvar$layout |>
+  dplyr::left_join(node_map, by = "node") |>
+  dplyr::arrange(order) |>
+  dplyr::mutate(
+    original_x = x,
+    original_y = y,
+    visual_label = c(
+      paste0("E", 1:3), paste0("P", 1:6), paste0("D", 1:3)
+    ),
+    display_group = dplyr::case_when(
+      community == "Engagement Time" ~ "Engagement Time",
+      subgroup == "Peripheral" ~ "Peripheral PSMU",
+      subgroup == "Core" ~ "Core PSMU",
+      community == "Distress" ~ "Distress"
+    )
+  )
+
+sparse_matrices <- results_s5_3_mlvar_networks$sparse_matrices
+full_matrices <- results_s5_3_mlvar_networks$full_matrices[c(
+  "temporal", "contemporaneous", "between"
+)]
+edge_tables <- results_s5_3_mlvar_networks$edge_tables
+
+temporal_no_ar <- sparse_matrices$temporal
+diag(temporal_no_ar) <- 0
+
+model_data <- fit_s5_2_primary_mlvar$model$data
+model_residuals <- fit_s5_2_primary_mlvar$model$step1_residuals
+stopifnot(
+  nrow(model_data) == nrow(model_residuals),
+  all(node_names %in% names(model_data)),
+  all(node_names %in% names(model_residuals)),
+  "Name_ID" %in% names(model_data)
+)
+
+temporal_r2 <- vapply(node_names, function(node) {
+  outcome <- model_data[[node]]
+  residual <- model_residuals[[node]]
+  person_mean <- ave(
+    outcome, model_data$Name_ID,
+    FUN = function(x) mean(x, na.rm = TRUE)
+  )
+  centered_outcome <- outcome - person_mean
+  1 - sum(residual^2, na.rm = TRUE) /
+    sum(centered_outcome^2, na.rm = TRUE)
+}, numeric(1))
+
+full_strength <- function(matrix) {
+  matrix <- matrix[node_names, node_names, drop = FALSE]
+  diag(matrix) <- 0
+  rowSums(abs(matrix))
+}
+
+contemporaneous_strength <- full_strength(full_matrices$contemporaneous)
+between_strength <- full_strength(full_matrices$between)
+
+node_indicator_values <- dplyr::bind_rows(
+  data.frame(
+    network = "Temporal", node = node_names,
+    metric = "Temporal nodewise R2",
+    raw_value = temporal_r2,
+    display_fraction = temporal_r2,
+    scaling = "Raw 0-1 R2",
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    network = "Contemporaneous", node = node_names,
+    metric = "Full-network strength",
+    raw_value = contemporaneous_strength,
+    display_fraction = contemporaneous_strength /
+      max(contemporaneous_strength),
+    scaling = "Strength divided by within-network maximum",
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    network = "Between", node = node_names,
+    metric = "Full-network strength",
+    raw_value = between_strength,
+    display_fraction = between_strength / max(between_strength),
+    scaling = "Strength divided by within-network maximum",
+    stringsAsFactors = FALSE
+  )
+)
+
+make_p_matrix <- function(network) {
+  p_matrix <- matrix(
+    NA_real_, nrow = length(node_names), ncol = length(node_names),
+    dimnames = list(node_names, node_names)
+  )
+  if (network == "temporal") {
+    edges <- edge_tables$temporal
+    p_matrix[cbind(match(edges$from, node_names), match(edges$to, node_names))] <-
+      edges$p
+  } else {
+    edges <- edge_tables[[network]]
+    positions_12 <- cbind(
+      match(edges$node1, node_names), match(edges$node2, node_names)
+    )
+    positions_21 <- positions_12[, 2:1, drop = FALSE]
+    p_matrix[positions_12] <- edges$p_and
+    p_matrix[positions_21] <- edges$p_and
+  }
+  p_matrix
+}
+
+p_matrices <- stats::setNames(
+  lapply(c("temporal", "contemporaneous", "between"), make_p_matrix),
+  c("temporal", "contemporaneous", "between")
+)
+
+stopifnot(
+  identical(layout_data$node, node_names),
+  all(vapply(sparse_matrices, function(matrix) {
+    identical(rownames(matrix), node_names) && identical(colnames(matrix), node_names)
+  }, logical(1))),
+  all(edge_tables$temporal$supported_p05 ==
+    (is.finite(edge_tables$temporal$p) & edge_tables$temporal$p < .05)),
+  all(edge_tables$contemporaneous$supported_p05 ==
+    (is.finite(edge_tables$contemporaneous$p_and) &
+      edge_tables$contemporaneous$p_and < .05)),
+  all(edge_tables$between$supported_p05 ==
+    (is.finite(edge_tables$between$p_and) & edge_tables$between$p_and < .05)),
+  all(vapply(full_matrices, function(matrix) {
+    identical(rownames(matrix), node_names) && identical(colnames(matrix), node_names)
+  }, logical(1))),
+  all(is.finite(p_matrices$temporal)),
+  all(is.finite(p_matrices$contemporaneous[upper.tri(p_matrices$contemporaneous)])),
+  all(is.finite(p_matrices$between[upper.tri(p_matrices$between)])),
+  all(diag(temporal_no_ar) == 0),
+  nrow(node_indicator_values) == 36L,
+  all(is.finite(node_indicator_values$raw_value)),
+  all(node_indicator_values$display_fraction >= 0 &
+    node_indicator_values$display_fraction <= 1),
+  identical(
+    node_indicator_values$node[node_indicator_values$network == "Temporal"],
+    node_names
+  )
+)
+
+knitr::kable(layout_data[c(
+  "order", "node", "visual_label", "short_label", "community", "subgroup"
+)])
+knitr::kable(node_indicator_values, digits = 3)
+```
+
+# qgraph-native rendering specification
+
+The node fill encodes the three network communities. Within the single PSMU
+community, Peripheral and Core manifestations retain distinct border colors;
+this does not redefine them as separate communities. Nodes are equal-diameter
+circles. Their qgraph pie borders form outer indicator rings: raw temporal R2
+for both Temporal variants and full-network strength divided by the respective
+network maximum for the two undirected networks. Every edge uses the same
+moderate line width. Within each visible network, absolute weight is mapped
+linearly to transparency from 0 for the strongest edge to 0.75 for the weakest
+edge; line width does not encode weight.
+
+```{r qgraph-specification}
+positive_color <- "#E64B35"
+negative_color <- "#4DBBD5"
+constant_edge_width <- 1.4
+maximum_edge_transparency <- 0.75
+individual_canvas <- c(width = 11.5, height = 9.5)
+combined_canvas <- c(width = 15.6, height = 6.0)
+heatmap_canvas <- c(width = 9.0, height = 7.8)
+individual_node_size <- 5.2
+combined_node_size <- 5.2
+individual_temporal_arrow_size <- 2.0
+combined_temporal_arrow_size <- 3.0
+temporal_edge_curve <- 0.35
+temporal_curve_all <- TRUE
+node_ring_fill <- "#3D3D3D"
+node_ring_remainder <- "#E6E6E6"
+node_ring_border_fraction <- 0.20
+
+render_profile_audit <- data.frame(
+  profile = c("Individual network", "Three-network combined"),
+  canvas_width_inches = c(
+    individual_canvas[["width"]], combined_canvas[["width"]]
+  ),
+  canvas_height_inches = c(
+    individual_canvas[["height"]], combined_canvas[["height"]]
+  ),
+  node_size = c(individual_node_size, combined_node_size),
+  node_label_cex = c(0.80, 0.82),
+  temporal_arrow_size = c(
+    individual_temporal_arrow_size, combined_temporal_arrow_size
+  ),
+  temporal_edge_curve = temporal_edge_curve,
+  curve_all_temporal_edges = temporal_curve_all,
+  title_cex = c(1.15, 1.05),
+  subtitle_cex = c(0.74, 0.68),
+  stringsAsFactors = FALSE
+)
+node_fill <- unname(c(
+  "Engagement Time" = "#F3C677", "PSMU" = "#B69AE8", "Distress" = "#82D992"
+)[layout_data$community])
+node_border <- dplyr::case_when(
+  layout_data$community == "Engagement Time" ~ "#8C6714",
+  layout_data$subgroup == "Peripheral" ~ "#8A4DB3",
+  layout_data$subgroup == "Core" ~ "#4B1973",
+  layout_data$community == "Distress" ~ "#216E3A"
+)
+groups <- list(
+  "Engagement Time" = which(layout_data$community == "Engagement Time"),
+  "PSMU" = which(layout_data$community == "PSMU"),
+  "Distress" = which(layout_data$community == "Distress")
+)
+
+edge_transparency_matrix <- function(matrix) {
+  transparency <- matrix(
+    NA_real_, nrow(matrix), ncol(matrix), dimnames = dimnames(matrix)
+  )
+  displayed <- is.finite(matrix) & matrix != 0
+  if (!any(displayed)) return(transparency)
+
+  magnitudes <- abs(matrix[displayed])
+  magnitude_range <- range(magnitudes)
+  if (diff(magnitude_range) <= sqrt(.Machine$double.eps)) {
+    transparency[displayed] <- 0
+  } else {
+    transparency[displayed] <- maximum_edge_transparency *
+      (magnitude_range[2L] - magnitudes) / diff(magnitude_range)
+  }
+  transparency
+}
+
+edge_color_matrix <- function(matrix) {
+  transparency <- edge_transparency_matrix(matrix)
+  colors <- matrix(
+    NA_character_, nrow(matrix), ncol(matrix), dimnames = dimnames(matrix)
+  )
+  displayed <- is.finite(matrix) & matrix != 0
+  base_colors <- ifelse(matrix[displayed] > 0, positive_color, negative_color)
+  rgb_values <- grDevices::col2rgb(base_colors) / 255
+  colors[displayed] <- grDevices::rgb(
+    rgb_values[1L, ], rgb_values[2L, ], rgb_values[3L, ],
+    alpha = 1 - transparency[displayed]
+  )
+  colors
+}
+
+node_indicator_fraction <- function(network) {
+  values <- node_indicator_values |>
+    dplyr::filter(.data$network == .env$network) |>
+    dplyr::arrange(match(.data$node, node_names)) |>
+    dplyr::pull(.data$display_fraction)
+  stopifnot(length(values) == length(node_names), all(is.finite(values)))
+  values
+}
+
+network_specifications <- list(
+  Temporal = list(
+    matrix = temporal_no_ar,
+    directed = TRUE,
+    diag = FALSE,
+    autoregression_visible = FALSE,
+    node_indicator_network = "Temporal",
+    node_indicator = node_indicator_fraction("Temporal"),
+    node_indicator_label = "outer ring = temporal R2",
+    title = "Temporal network (autoregression omitted)",
+    subtitle = paste(
+      "Curved directed cross-lagged coefficients; unadjusted p < .05;",
+      "opacity encodes |weight|; outer ring = temporal R2"
+    )
+  ),
+  TemporalWithAR = list(
+    matrix = sparse_matrices$temporal,
+    directed = TRUE,
+    diag = TRUE,
+    autoregression_visible = TRUE,
+    node_indicator_network = "Temporal",
+    node_indicator = node_indicator_fraction("Temporal"),
+    node_indicator_label = "outer ring = temporal R2",
+    title = "Temporal network (autoregression shown)",
+    subtitle = paste(
+      "Curved directed lag-1 coefficients and self-loops; unadjusted p < .05;",
+      "opacity encodes |weight|; outer ring = temporal R2"
+    )
+  ),
+  Contemporaneous = list(
+    matrix = sparse_matrices$contemporaneous,
+    directed = FALSE,
+    diag = FALSE,
+    autoregression_visible = NA,
+    node_indicator_network = "Contemporaneous",
+    node_indicator = node_indicator_fraction("Contemporaneous"),
+    node_indicator_label = "outer ring = full strength / maximum",
+    title = "Contemporaneous network",
+    subtitle = paste(
+      "Residual partial correlations; AND rule; unadjusted p < .05;",
+      "opacity encodes |weight|; outer ring = full strength / maximum"
+    )
+  ),
+  Between = list(
+    matrix = sparse_matrices$between,
+    directed = FALSE,
+    diag = FALSE,
+    autoregression_visible = NA,
+    node_indicator_network = "Between",
+    node_indicator = node_indicator_fraction("Between"),
+    node_indicator_label = "outer ring = full strength / maximum",
+    title = "Between-person network",
+    subtitle = paste(
+      "Person-level partial correlations; AND rule; unadjusted p < .05;",
+      "opacity encodes |weight|; outer ring = full strength / maximum"
+    )
+  )
+)
+
+qgraph_builtin_layouts <- c("circle", "groups", "spring")
+layout_seeds <- stats::setNames(526400L + seq_along(qgraph_builtin_layouts), qgraph_builtin_layouts)
+
+derive_builtin_layout <- function(layout_name) {
+  set.seed(layout_seeds[[layout_name]])
+  graph <- qgraph::qgraph(
+    network_specifications$Temporal$matrix,
+    layout = layout_name,
+    groups = groups,
+    labels = layout_data$visual_label,
+    directed = TRUE,
+    diag = FALSE,
+    DoNotPlot = TRUE,
+    minimum = 0,
+    cut = 0,
+    fade = FALSE,
+    layoutRound = TRUE
+  )
+  coordinates <- graph$layout
+  rownames(coordinates) <- node_names
+  coordinates
+}
+
+candidate_layouts <- stats::setNames(
+  lapply(qgraph_builtin_layouts, derive_builtin_layout),
+  qgraph_builtin_layouts
+)
+
+# Retain the previously selected layout; the candidate SVGs document that choice.
+selected_layout_algorithm <- "spring"
+layout_matrix <- candidate_layouts[[selected_layout_algorithm]]
+rownames(layout_matrix) <- node_names
+layout_data$x <- layout_matrix[, 1L]
+layout_data$y <- layout_matrix[, 2L]
+
+qgraph_call <- function(
+  specification, layout_override = layout_matrix,
+  do_not_plot = FALSE, compact = FALSE
+) {
+  maximum <- max(abs(specification$matrix))
+  if (!is.finite(maximum) || maximum <= 0) maximum <- 1
+  node_size <- if (compact) combined_node_size else individual_node_size
+  qgraph::qgraph(
+    specification$matrix,
+    layout = layout_override,
+    groups = groups,
+    labels = layout_data$visual_label,
+    directed = specification$directed,
+    diag = specification$diag,
+    weighted = FALSE,
+    DoNotPlot = do_not_plot,
+    color = node_fill,
+    border.color = node_border,
+    border.width = 2.2,
+    shape = "circle",
+    vsize = node_size,
+    vsize2 = node_size,
+    pie = specification$node_indicator,
+    pieBorder = node_ring_border_fraction,
+    pieColor = node_ring_fill,
+    pieColor2 = node_ring_remainder,
+    pieStart = 0.25,
+    label.cex = if (compact) 0.82 else 0.80,
+    label.color = "#202020",
+    label.scale = TRUE,
+    edge.color = edge_color_matrix(specification$matrix),
+    edge.labels = FALSE,
+    edge.width = 1,
+    esize = constant_edge_width,
+    asize = if (specification$directed) {
+      if (compact) combined_temporal_arrow_size else
+        individual_temporal_arrow_size
+    } else {
+      0
+    },
+    loop = if (isTRUE(specification$autoregression_visible)) 0.55 else 1,
+    maximum = maximum,
+    minimum = 0,
+    cut = 0,
+    fade = FALSE,
+    trans = FALSE,
+    negDashed = FALSE,
+    curve = if (specification$directed) temporal_edge_curve else 0,
+    curveAll = specification$directed && temporal_curve_all,
+    legend = FALSE,
+    rescale = TRUE,
+    layoutScale = if (compact) c(0.88, 0.80) else c(0.84, 0.78),
+    mar = if (compact) c(3.2, 1.2, 4.0, 1.2) else c(4.2, 2.5, 5.0, 2.5),
+    title = specification$title,
+    title.cex = if (compact) 1.05 else 1.15,
+    title.color = "#202020"
+  )
+}
+
+qgraph_objects <- lapply(
+  network_specifications, qgraph_call,
+  layout_override = layout_matrix, do_not_plot = TRUE
+)
+
+extract_qgraph_transparency <- function(graph) {
+  1 - grDevices::col2rgb(
+    graph$graphAttributes$Edges$color, alpha = TRUE
+  )[4L, ] / 255
+}
+
+edge_encoding_audit <- lapply(names(qgraph_objects), function(network) {
+  graph <- qgraph_objects[[network]]
+  widths <- graph$graphAttributes$Edges$width
+  transparency <- extract_qgraph_transparency(graph)
+  magnitudes <- abs(graph$Edgelist$weight)
+  magnitude_order <- order(magnitudes)
+  data.frame(
+    network = network,
+    displayed_edges = length(widths),
+    minimum_edge_width = min(widths),
+    maximum_edge_width = max(widths),
+    minimum_transparency = min(transparency),
+    maximum_transparency = max(transparency),
+    strongest_edge_transparency = max(transparency[
+      magnitudes == max(magnitudes)
+    ]),
+    weakest_edge_transparency = min(transparency[
+      magnitudes == min(magnitudes)
+    ]),
+    transparency_monotonic = all(
+      diff(transparency[magnitude_order]) <= 1 / 255 + 1e-10
+    ),
+    stringsAsFactors = FALSE
+  )
+}) |>
+  dplyr::bind_rows()
+
+node_indicator_audit <- lapply(names(qgraph_objects), function(network) {
+  graph <- qgraph_objects[[network]]
+  specification <- network_specifications[[network]]
+  node_attributes <- graph$graphAttributes$Nodes
+  metric_rows <- node_indicator_values |>
+    dplyr::filter(
+      .data$network == specification$node_indicator_network
+    )
+  data.frame(
+    network = network,
+    node_shape = paste(unique(node_attributes$shape), collapse = ", "),
+    equal_width_height = all(abs(
+      node_attributes$width - node_attributes$height
+    ) < 1e-10),
+    node_width = unique(node_attributes$width)[1L],
+    node_height = unique(node_attributes$height)[1L],
+    ring_metric = unique(metric_rows$metric),
+    ring_scaling = unique(metric_rows$scaling),
+    raw_minimum = min(metric_rows$raw_value),
+    raw_maximum = max(metric_rows$raw_value),
+    display_fraction_minimum = min(node_attributes$pie),
+    display_fraction_maximum = max(node_attributes$pie),
+    qgraph_pie_matches_specification = isTRUE(all.equal(
+      node_attributes$pie, specification$node_indicator,
+      tolerance = 1e-12
+    )),
+    ring_border_fraction = unique(node_attributes$pieBorder)[1L],
+    ring_fill = paste(unique(node_attributes$pieColor), collapse = ", "),
+    ring_remainder = paste(unique(node_attributes$pieColor2), collapse = ", "),
+    stringsAsFactors = FALSE
+  )
+}) |>
+  dplyr::bind_rows()
+
+qgraph_audit <- data.frame(
+  network = names(qgraph_objects),
+  object_class = vapply(qgraph_objects, function(x) class(x)[[1L]], character(1)),
+  graph_engine = "qgraph native base graphics",
+  layout_algorithm = selected_layout_algorithm,
+  identical_layout = TRUE,
+  autoregression_visible = vapply(
+    network_specifications,
+    function(x) if (is.na(x$autoregression_visible)) NA else x$autoregression_visible,
+    logical(1)
+  ),
+  arrow_size = vapply(
+    network_specifications,
+    function(x) if (x$directed) individual_temporal_arrow_size else NA_real_,
+    numeric(1)
+  ),
+  combined_temporal_arrow_size = vapply(
+    network_specifications,
+    function(x) if (x$directed) combined_temporal_arrow_size else NA_real_,
+    numeric(1)
+  ),
+  requested_edge_curve = vapply(
+    network_specifications,
+    function(x) if (x$directed) temporal_edge_curve else 0,
+    numeric(1)
+  ),
+  curve_all_edges = vapply(
+    network_specifications,
+    function(x) x$directed && temporal_curve_all,
+    logical(1)
+  ),
+  actual_minimum_abs_curve = vapply(
+    qgraph_objects,
+    function(x) min(abs(x$graphAttributes$Edges$curve)),
+    numeric(1)
+  ),
+  actual_maximum_abs_curve = vapply(
+    qgraph_objects,
+    function(x) max(abs(x$graphAttributes$Edges$curve)),
+    numeric(1)
+  ),
+  edge_width_rule = "constant",
+  requested_edge_width = constant_edge_width,
+  weight_encoding = "within-network linear transparency",
+  strongest_edge_target_transparency = 0,
+  weakest_edge_target_transparency = maximum_edge_transparency,
+  qgraph_weighted_width_scaling = FALSE,
+  node_shape = "circle",
+  node_width_equals_height = TRUE,
+  outer_ring_visible = TRUE,
+  outer_ring_metric = vapply(
+    network_specifications, `[[`, character(1), "node_indicator_label"
+  ),
+  edge_weight_labels = FALSE,
+  ggplot_network_geometry = FALSE,
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  all(vapply(qgraph_objects, inherits, logical(1), what = "qgraph")),
+  identical(rownames(layout_matrix), node_names),
+  all(!qgraph_audit$edge_weight_labels),
+  all(node_indicator_audit$node_shape == "circle"),
+  all(node_indicator_audit$equal_width_height),
+  all(node_indicator_audit$qgraph_pie_matches_specification),
+  all(abs(
+    node_indicator_audit$ring_border_fraction - node_ring_border_fraction
+  ) < 1e-10),
+  all(node_indicator_audit$display_fraction_minimum >= 0),
+  all(node_indicator_audit$display_fraction_maximum <= 1),
+  all(qgraph_audit$node_shape == "circle"),
+  all(qgraph_audit$node_width_equals_height),
+  all(qgraph_audit$outer_ring_visible),
+  all(abs(
+    edge_encoding_audit$minimum_edge_width - constant_edge_width
+  ) < 1e-10),
+  all(abs(
+    edge_encoding_audit$maximum_edge_width - constant_edge_width
+  ) < 1e-10),
+  all(edge_encoding_audit$minimum_transparency <= 1 / 255 + 1e-10),
+  all(abs(
+    edge_encoding_audit$maximum_transparency - maximum_edge_transparency
+  ) <= 1 / 255 + 1e-10),
+  all(edge_encoding_audit$transparency_monotonic),
+  all(!qgraph_audit$qgraph_weighted_width_scaling),
+  all(qgraph_audit$arrow_size[qgraph_audit$network %in%
+    c("Temporal", "TemporalWithAR")] <= 2.0),
+  all(qgraph_audit$combined_temporal_arrow_size[
+    qgraph_audit$network %in% c("Temporal", "TemporalWithAR")
+  ] > qgraph_audit$arrow_size[
+    qgraph_audit$network %in% c("Temporal", "TemporalWithAR")
+  ]),
+  all(qgraph_audit$curve_all_edges[qgraph_audit$network %in%
+    c("Temporal", "TemporalWithAR")]),
+  all(abs(qgraph_audit$actual_minimum_abs_curve[
+    qgraph_audit$network %in% c("Temporal", "TemporalWithAR")
+  ] - temporal_edge_curve) < 1e-10),
+  all(abs(qgraph_audit$actual_maximum_abs_curve[
+    qgraph_audit$network %in% c("Temporal", "TemporalWithAR")
+  ] - temporal_edge_curve) < 1e-10),
+  all(abs(qgraph_audit$actual_maximum_abs_curve[
+    qgraph_audit$network %in% c("Contemporaneous", "Between")
+  ]) < 1e-10),
+  all(!qgraph_audit$ggplot_network_geometry)
+)
+knitr::kable(qgraph_audit)
+knitr::kable(edge_encoding_audit, digits = 3)
+knitr::kable(node_indicator_audit, digits = 3)
+knitr::kable(render_profile_audit, digits = 2)
+knitr::kable(layout_data[c(
+  "order", "node", "visual_label", "community", "subgroup", "x", "y"
+)], digits = 4)
+```
+
+# Compare Temporal layouts and generate the fixed-layout network variants
+
+The SVG device is opened by `svglite`, after which `qgraph` draws directly to
+that device. The report embeds these SVG files directly.
+
+```{r generate-figures, fig.width=10, fig.height=8}
+draw_one_network <- function(
+  specification, layout_override = layout_matrix, compact = FALSE
+) {
+  graph <- qgraph_call(
+    specification, layout_override = layout_override,
+    do_not_plot = FALSE, compact = compact
+  )
+  subtitle <- if (!compact) {
+    specification$subtitle
+  } else if (specification$directed) {
+    "Raw p < .05; curved arrows; ring = temporal R2"
+  } else {
+    "Raw p < .05 (AND); ring = relative full strength"
+  }
+  graphics::mtext(
+    subtitle, side = 1, line = 1.0,
+    cex = if (compact) 0.68 else 0.74, col = "#4A4A4A"
+  )
+  invisible(graph)
+}
+
+save_native_qgraph <- function(
+  path, specification, width, height,
+  layout_override = layout_matrix
+) {
+  svglite::svglite(path, width = width, height = height, bg = "white")
+  on.exit(grDevices::dev.off(), add = TRUE)
+  draw_one_network(specification, layout_override = layout_override)
+  invisible(path)
+}
+
+save_native_combined <- function(path) {
+  svglite::svglite(
+    path, width = combined_canvas[["width"]],
+    height = combined_canvas[["height"]], bg = "white"
+  )
+  on.exit(grDevices::dev.off(), add = TRUE)
+  old_parameters <- graphics::par(mfrow = c(1, 3), oma = c(1.6, 0, 0, 0))
+  on.exit(graphics::par(old_parameters), add = TRUE, after = FALSE)
+  for (specification in network_specifications[c(
+    "Temporal", "Contemporaneous", "Between"
+  )]) {
+    draw_one_network(
+      specification, layout_override = layout_matrix, compact = TRUE
+    )
+  }
+  graphics::mtext(
+    paste(
+      "Identical coordinates; Temporal self-loops omitted; edge opacity =",
+      "|weight|; strength rings are scaled within network"
+    ),
+    side = 1, outer = TRUE, line = 0.15, cex = 0.72, col = "#404040"
+  )
+  invisible(path)
+}
+
+for (layout_name in qgraph_builtin_layouts) {
+  candidate_specification <- network_specifications$Temporal
+  candidate_specification$title <- paste0(
+    "Temporal network - ", layout_name, " layout"
+  )
+  save_native_qgraph(
+    layout_candidate_files[[layout_name]], candidate_specification,
+    width = individual_canvas[["width"]],
+    height = individual_canvas[["height"]],
+    layout_override = candidate_layouts[[layout_name]]
+  )
+}
+
+layout_selection_audit <- data.frame(
+  algorithm = qgraph_builtin_layouts,
+  seed = unname(layout_seeds[qgraph_builtin_layouts]),
+  candidate_svg = basename(layout_candidate_files[qgraph_builtin_layouts]),
+  bytes = as.numeric(file.info(layout_candidate_files[qgraph_builtin_layouts])$size),
+  selected = qgraph_builtin_layouts == selected_layout_algorithm,
+  visual_assessment = c(
+    paste(
+      "Even node spacing, but many long chords cross the lower-center PSMU",
+      "region and make arrow directions harder to follow."
+    ),
+    paste(
+      "Substantial node and arrow overlap with plot-edge",
+      "clipping; least readable candidate."
+    ),
+    paste(
+      "Best node separation, shorter connected paths, fewer central crossings,",
+      "and clearest arrow directions; selected."
+    )
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  identical(qgraph_builtin_layouts, c("circle", "groups", "spring")),
+  all(file.exists(layout_candidate_files)),
+  all(layout_selection_audit$bytes > 1000),
+  sum(layout_selection_audit$selected) == 1L
+)
+
+knitr::kable(layout_selection_audit)
+knitr::include_graphics(
+  unname(layout_candidate_files[qgraph_builtin_layouts]), rel_path = FALSE
+)
+
+for (network in names(network_specifications)) {
+  save_native_qgraph(
+    figure_files[[network]], network_specifications[[network]],
+    width = individual_canvas[["width"]],
+    height = individual_canvas[["height"]],
+    layout_override = layout_matrix
+  )
+}
+save_native_combined(figure_files[["Combined"]])
+
+knitr::include_graphics(
+  unname(figure_files[c("Temporal", "Contemporaneous", "Between")]),
+  rel_path = FALSE
+)
+```
+
+# Edge-weight adjacency tables
+
+The workbook uses the full unthresholded S5.3 matrices rather than replacing
+nonsignificant estimates with zero. Significance stars use the same raw-p rule
+as the sparse figures. For Temporal, rows are source nodes at `t-1` and columns
+are outcome nodes at `t`. The two undirected matrices are symmetric. Their
+diagonals use `N/A` because no self-edge is defined.
+
+```{r adjacency-tables}
+visual_labels <- layout_data$visual_label
+
+significance_stars <- function(p) {
+  stars <- matrix("", nrow(p), ncol(p), dimnames = dimnames(p))
+  stars[is.finite(p) & p >= .01 & p < .05] <- "*"
+  stars[is.finite(p) & p >= .001 & p < .01] <- "**"
+  stars[is.finite(p) & p < .001] <- "***"
+  stars
+}
+
+format_adjacency_matrix <- function(weight, p, diagonal_defined) {
+  stars <- significance_stars(p)
+  display_weight <- weight
+  display_weight[abs(display_weight) < .0005] <- 0
+  formatted <- matrix(
+    sprintf("%.3f", as.vector(display_weight)),
+    nrow = nrow(weight), ncol = ncol(weight), dimnames = dimnames(weight)
+  )
+  formatted[is.finite(p)] <- paste0(
+    formatted[is.finite(p)], stars[is.finite(p)]
+  )
+  formatted[!is.finite(p)] <- ""
+  if (!diagonal_defined) diag(formatted) <- "N/A"
+  dimnames(formatted) <- list(visual_labels, visual_labels)
+  formatted
+}
+
+star_matrices <- lapply(p_matrices, significance_stars)
+formatted_adjacency_matrices <- list(
+  Temporal = format_adjacency_matrix(
+    full_matrices$temporal, p_matrices$temporal, diagonal_defined = TRUE
+  ),
+  Contemporaneous = format_adjacency_matrix(
+    full_matrices$contemporaneous, p_matrices$contemporaneous,
+    diagonal_defined = FALSE
+  ),
+  Between_Person = format_adjacency_matrix(
+    full_matrices$between, p_matrices$between, diagonal_defined = FALSE
+  )
+)
+for (network in names(star_matrices)) {
+  dimnames(star_matrices[[network]]) <- list(visual_labels, visual_labels)
+}
+
+matrix_to_sheet <- function(matrix) {
+  output <- data.frame(Node = rownames(matrix), matrix, check.names = FALSE)
+  rownames(output) <- NULL
+  output
+}
+
+node_key <- layout_data |>
+  dplyr::transmute(
+    Code = visual_label,
+    Full_Node = label,
+    Community = community,
+    PSMU_Subgroup = dplyr::coalesce(subgroup, "Not applicable")
+  )
+
+legend_sheet <- data.frame(
+  Symbol = c("***", "**", "*", "No star", "N/A diagonal", "Temporal orientation"),
+  Meaning = c(
+    "p < .001",
+    ".001 <= p < .01",
+    ".01 <= p < .05",
+    "p >= .05; estimate retained in table",
+    "No self-edge is defined for contemporaneous or between-person networks",
+    "Rows are source nodes at t-1; columns are outcome nodes at t"
+  ),
+  stringsAsFactors = FALSE
+)
+
+workbook_sheets <- list(
+  Temporal = matrix_to_sheet(formatted_adjacency_matrices$Temporal),
+  Contemporaneous = matrix_to_sheet(
+    formatted_adjacency_matrices$Contemporaneous
+  ),
+  Between_Person = matrix_to_sheet(
+    formatted_adjacency_matrices$Between_Person
+  ),
+  Node_Key = node_key,
+  Legend = legend_sheet
+)
+
+bruceR::export(workbook_sheets, file = table_file, overwrite = TRUE)
+style_and_sanitize_workbook(table_file, workbook_sheets)
+
+# Add matrix-specific community styling after the project-wide workbook style.
+workbook <- openxlsx::loadWorkbook(table_file)
+engagement_style <- openxlsx::createStyle(
+  fgFill = "#F3C677", fontColour = "#202020", textDecoration = "bold",
+  halign = "center", valign = "center"
+)
+psmu_style <- openxlsx::createStyle(
+  fgFill = "#B69AE8", fontColour = "#202020", textDecoration = "bold",
+  halign = "center", valign = "center"
+)
+distress_style <- openxlsx::createStyle(
+  fgFill = "#82D992", fontColour = "#202020", textDecoration = "bold",
+  halign = "center", valign = "center"
+)
+matrix_style <- openxlsx::createStyle(halign = "center", valign = "center")
+diagonal_style <- openxlsx::createStyle(
+  fgFill = "#E7E7E7", fontColour = "#666666",
+  halign = "center", valign = "center"
+)
+significant_style <- openxlsx::createStyle(textDecoration = "bold")
+
+for (sheet in c("Temporal", "Contemporaneous", "Between_Person")) {
+  openxlsx::addStyle(
+    workbook, sheet, matrix_style, rows = 2:13, cols = 2:13,
+    gridExpand = TRUE, stack = TRUE
+  )
+  openxlsx::addStyle(
+    workbook, sheet, engagement_style, rows = 1, cols = 2:4,
+    gridExpand = TRUE, stack = TRUE
+  )
+  openxlsx::addStyle(
+    workbook, sheet, psmu_style, rows = 1, cols = 5:10,
+    gridExpand = TRUE, stack = TRUE
+  )
+  openxlsx::addStyle(
+    workbook, sheet, distress_style, rows = 1, cols = 11:13,
+    gridExpand = TRUE, stack = TRUE
+  )
+  openxlsx::addStyle(
+    workbook, sheet, engagement_style, rows = 2:4, cols = 1,
+    gridExpand = TRUE, stack = TRUE
+  )
+  openxlsx::addStyle(
+    workbook, sheet, psmu_style, rows = 5:10, cols = 1,
+    gridExpand = TRUE, stack = TRUE
+  )
+  openxlsx::addStyle(
+    workbook, sheet, distress_style, rows = 11:13, cols = 1,
+    gridExpand = TRUE, stack = TRUE
+  )
+  for (index in seq_len(12L)) {
+    openxlsx::addStyle(
+      workbook, sheet, diagonal_style,
+      rows = index + 1L, cols = index + 1L, stack = TRUE
+    )
+  }
+  significance_grid <- as.matrix(workbook_sheets[[sheet]][, -1L])
+  significant_positions <- which(
+    matrix(
+      grepl("\\*", significance_grid),
+      nrow = nrow(significance_grid), ncol = ncol(significance_grid)
+    ),
+    arr.ind = TRUE
+  )
+  if (nrow(significant_positions) > 0L) {
+    for (index in seq_len(nrow(significant_positions))) {
+      openxlsx::addStyle(
+        workbook, sheet, significant_style,
+        rows = significant_positions[index, 1L] + 1L,
+        cols = significant_positions[index, 2L] + 1L,
+        stack = TRUE
+      )
+    }
+  }
+  openxlsx::setColWidths(workbook, sheet, cols = 1, widths = 10)
+  openxlsx::setColWidths(workbook, sheet, cols = 2:13, widths = 11)
+  openxlsx::setRowHeights(workbook, sheet, rows = 1:13, heights = 22)
+  openxlsx::freezePane(workbook, sheet, firstRow = TRUE, firstCol = TRUE)
+}
+openxlsx::setColWidths(workbook, "Node_Key", cols = 1:4, widths = c(10, 18, 20, 18))
+openxlsx::setColWidths(workbook, "Legend", cols = 1:2, widths = c(22, 72))
+workbook$worksheets_rels <- lapply(
+  workbook$worksheets_rels,
+  function(x) x[grepl("printerSettings", x, fixed = TRUE)]
+)
+workbook$Content_Types <- workbook$Content_Types[
+  !grepl("/xl/drawings/", workbook$Content_Types, fixed = TRUE)
+]
+openxlsx::saveWorkbook(workbook, table_file, overwrite = TRUE)
+
+sheet_names <- readxl::excel_sheets(table_file)
+reloaded_sheets <- stats::setNames(
+  lapply(sheet_names, function(sheet) {
+    as.data.frame(readxl::read_excel(table_file, sheet = sheet))
+  }),
+  sheet_names
+)
+formula_errors <- sum(vapply(reloaded_sheets, function(data) {
+  sum(vapply(data, function(column) {
+    sum(grepl("^#(REF!|VALUE!|NAME\\?|DIV/0!|N/A)", as.character(column)))
+  }, integer(1)))
+}, integer(1)))
+
+valid_formatted_cells <- function(matrix, diagonal_defined) {
+  cells <- if (diagonal_defined) {
+    as.vector(matrix)
+  } else {
+    matrix[row(matrix) != col(matrix)]
+  }
+  all(grepl("^-?[0-9]+\\.[0-9]{3}(\\*{1,3})?$", cells))
+}
+
+star_rule_valid <- function(stars, p) {
+  all(stars[is.finite(p) & p < .001] == "***") &&
+    all(stars[is.finite(p) & p >= .001 & p < .01] == "**") &&
+    all(stars[is.finite(p) & p >= .01 & p < .05] == "*") &&
+    all(stars[is.finite(p) & p >= .05] == "")
+}
+
+workbook_audit <- data.frame(
+  file = "Res_3_Results/Table_S5_4_mlVAR_AdjacencyMatrices.xlsx",
+  sheets = length(sheet_names),
+  exact_sheet_names = identical(sheet_names, names(workbook_sheets)),
+  three_decimal_cells =
+    valid_formatted_cells(formatted_adjacency_matrices$Temporal, TRUE) &&
+    valid_formatted_cells(
+      formatted_adjacency_matrices$Contemporaneous, FALSE
+    ) &&
+    valid_formatted_cells(formatted_adjacency_matrices$Between_Person, FALSE),
+  significance_stars =
+    star_rule_valid(star_matrices$temporal, p_matrices$temporal) &&
+    star_rule_valid(
+      star_matrices$contemporaneous, p_matrices$contemporaneous
+    ) &&
+    star_rule_valid(star_matrices$between, p_matrices$between),
+  ordered_E_P_D = all(vapply(
+    formatted_adjacency_matrices,
+    function(matrix) identical(rownames(matrix), visual_labels) &&
+      identical(colnames(matrix), visual_labels),
+    logical(1)
+  )),
+  undefined_diagonal_NA =
+    all(diag(formatted_adjacency_matrices$Contemporaneous) == "N/A") &&
+    all(diag(formatted_adjacency_matrices$Between_Person) == "N/A"),
+  formula_errors = formula_errors,
+  bytes = file.info(table_file)$size,
+  md5 = unname(tools::md5sum(table_file)),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  workbook_audit$exact_sheet_names,
+  workbook_audit$three_decimal_cells,
+  workbook_audit$significance_stars,
+  workbook_audit$ordered_E_P_D,
+  workbook_audit$undefined_diagonal_NA,
+  workbook_audit$formula_errors == 0L,
+  workbook_audit$bytes > 1000,
+  all(vapply(reloaded_sheets[c(
+    "Temporal", "Contemporaneous", "Between_Person"
+  )], nrow, integer(1)) == 12L)
+)
+knitr::kable(workbook_audit)
+```
+
+# Edge-weight heatmaps
+
+Each heatmap uses a separate within-network color scale. Only supported
+raw-`p < .05` cells receive color. Nonsignificant and undefined cells are
+explicitly white, and no cell contains a text label.
+
+```{r heatmaps, fig.width=9, fig.height=8}
+heatmap_titles <- c(
+  temporal = "Temporal edge weights",
+  contemporaneous = "Contemporaneous edge weights",
+  between = "Between-person edge weights"
+)
+
+make_heatmap_data <- function(network) {
+  weight <- full_matrices[[network]]
+  p <- p_matrices[[network]]
+  supported <- is.finite(p) & p < .05
+  if (network != "temporal") diag(supported) <- FALSE
+  display_weight <- weight
+  display_weight[!supported] <- NA_real_
+  grid <- expand.grid(
+    row_index = seq_along(visual_labels),
+    column_index = seq_along(visual_labels)
+  )
+  grid$row_label <- factor(
+    visual_labels[grid$row_index], levels = rev(visual_labels)
+  )
+  grid$column_label <- factor(
+    visual_labels[grid$column_index], levels = visual_labels
+  )
+  grid$weight <- display_weight[cbind(grid$row_index, grid$column_index)]
+  grid$supported <- supported[cbind(grid$row_index, grid$column_index)]
+  grid
+}
+
+make_heatmap_plot <- function(network) {
+  data <- make_heatmap_data(network)
+  max_abs <- max(abs(data$weight), na.rm = TRUE)
+  if (!is.finite(max_abs) || max_abs <= 0) max_abs <- 1
+  plot <- ggplot2::ggplot(
+    data,
+    ggplot2::aes(x = column_label, y = row_label, fill = weight)
+  ) +
+    ggplot2::geom_tile(color = "#D9D9D9", linewidth = 0.35) +
+    ggplot2::geom_vline(
+      xintercept = c(3.5, 9.5), color = "#606060", linewidth = 0.65
+    ) +
+    ggplot2::geom_hline(
+      yintercept = c(3.5, 9.5), color = "#606060", linewidth = 0.65
+    ) +
+    ggplot2::scale_fill_gradient2(
+      low = "#2166AC", mid = "#FFFFFF", high = "#B2182B",
+      midpoint = 0, limits = c(-max_abs, max_abs),
+      na.value = "#FFFFFF", name = "Edge weight"
+    ) +
+    ggplot2::coord_fixed() +
+    ggplot2::labs(
+      title = heatmap_titles[[network]],
+      subtitle = paste(
+        "Colored cells: unadjusted p < .05; white cells: nonsignificant",
+        if (network == "temporal")
+          "| rows = source at t-1, columns = outcome at t" else "| AND rule"
+      ),
+      x = if (network == "temporal") "Outcome node at t" else "Node",
+      y = if (network == "temporal") "Source node at t-1" else "Node"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(
+      panel.grid = ggplot2::element_blank(),
+      plot.title = ggplot2::element_text(face = "bold", color = "#202020"),
+      plot.subtitle = ggplot2::element_text(color = "#4A4A4A"),
+      axis.text = ggplot2::element_text(color = "#202020"),
+      legend.position = "right"
+    )
+  attr(plot, "scale_max_abs") <- max_abs
+  plot
+}
+
+heatmap_plots <- stats::setNames(
+  lapply(c("temporal", "contemporaneous", "between"), make_heatmap_plot),
+  c("Temporal", "Contemporaneous", "Between")
+)
+
+for (network in names(heatmap_plots)) {
+  ggplot2::ggsave(
+    filename = heatmap_files[[network]], plot = heatmap_plots[[network]],
+    width = heatmap_canvas[["width"]], height = heatmap_canvas[["height"]],
+    units = "in", bg = "white"
+  )
+}
+
+heatmap_audit <- data.frame(
+  network = names(heatmap_plots),
+  svg_file = basename(heatmap_files),
+  svg_bytes = as.numeric(file.info(heatmap_files)$size),
+  svg_md5 = unname(tools::md5sum(heatmap_files)),
+  row_column_order = "E1-E3, P1-P6, D1-D3",
+  positive_color = "#B2182B",
+  negative_color = "#2166AC",
+  nonsignificant_color = "#FFFFFF",
+  nonsignificant_cells_masked = vapply(
+    c("temporal", "contemporaneous", "between"),
+    function(network) {
+      data <- make_heatmap_data(network)
+      all(is.na(data$weight[!data$supported]))
+    },
+    logical(1)
+  ),
+  cell_text = FALSE,
+  within_network_scale_max = vapply(
+    heatmap_plots, attr, numeric(1), which = "scale_max_abs"
+  ),
+  saved_by_ggsave = TRUE,
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  all(heatmap_audit$svg_bytes > 1000),
+  all(heatmap_audit$row_column_order == "E1-E3, P1-P6, D1-D3"),
+  all(heatmap_audit$nonsignificant_color == "#FFFFFF"),
+  all(heatmap_audit$nonsignificant_cells_masked),
+  !any(heatmap_audit$cell_text),
+  all(heatmap_audit$saved_by_ggsave)
+)
+knitr::kable(heatmap_audit)
+knitr::include_graphics(unname(heatmap_files), rel_path = FALSE)
+```
+
+# File and rule validation
+
+```{r validate-figures}
+all_figure_files <- figure_files
+stopifnot(all(file.exists(all_figure_files)))
+
+display_edge_tables <- list(
+  temporal_nonself = edge_tables$temporal |>
+    dplyr::filter(supported_p05, !self_loop),
+  temporal_self = edge_tables$temporal |>
+    dplyr::filter(supported_p05, self_loop),
+  contemporaneous = edge_tables$contemporaneous |>
+    dplyr::filter(supported_p05),
+  between = edge_tables$between |>
+    dplyr::filter(supported_p05)
+)
+svg_lines <- lapply(figure_files, function(path) {
+  readLines(path, warn = FALSE)
+})
+svg_text <- lapply(svg_lines, function(lines) {
+  toupper(paste(lines, collapse = "\n"))
+})
+svg_text_elements <- lapply(svg_lines, function(lines) {
+  paste(lines[grepl("<text", lines, fixed = TRUE)], collapse = "\n")
+})
+positive_color_expected <- c(
+  vapply(network_specifications, function(x) any(x$matrix > 0), logical(1)),
+  Combined = any(vapply(sparse_matrices, function(x) any(x > 0), logical(1)))
+)
+negative_color_expected <- c(
+  vapply(network_specifications, function(x) any(x$matrix < 0), logical(1)),
+  Combined = any(vapply(sparse_matrices, function(x) any(x < 0), logical(1)))
+)
+
+figure_audit <- data.frame(
+  network = names(figure_files),
+  svg_file = basename(figure_files),
+  svg_bytes = as.numeric(file.info(figure_files)$size),
+  svg_md5 = unname(tools::md5sum(figure_files)),
+  positive_color_expected = unname(positive_color_expected[names(figure_files)]),
+  positive_color_present = vapply(
+    svg_text, function(x) grepl("#E64B35", x, fixed = TRUE), logical(1)
+  ),
+  negative_color_expected = unname(negative_color_expected[names(figure_files)]),
+  negative_color_present = vapply(
+    svg_text, function(x) grepl("#4DBBD5", x, fixed = TRUE), logical(1)
+  ),
+  edge_weight_text_present = vapply(
+    svg_text_elements,
+    function(x) grepl("[+-][0-9]+\\.[0-9]{3}", x),
+    logical(1)
+  ),
+  saved_by_qgraph_native = TRUE,
+  saved_by_ggsave = FALSE,
+  stringsAsFactors = FALSE
+)
+
+network_display_audit <- data.frame(
+  network = c("Temporal", "TemporalWithAR", "Contemporaneous", "Between"),
+  displayed_edges = c(
+    nrow(display_edge_tables$temporal_nonself),
+    nrow(display_edge_tables$temporal_nonself) +
+      nrow(display_edge_tables$temporal_self),
+    nrow(display_edge_tables$contemporaneous),
+    nrow(display_edge_tables$between)
+  ),
+  autoregressive_self_loops = c(
+    0L, nrow(display_edge_tables$temporal_self), 0L, 0L
+  ),
+  edge_weight_labels = 0L,
+  arrow_size = c(
+    individual_temporal_arrow_size,
+    individual_temporal_arrow_size,
+    NA_real_, NA_real_
+  ),
+  combined_temporal_arrow_size = c(
+    combined_temporal_arrow_size,
+    combined_temporal_arrow_size,
+    NA_real_, NA_real_
+  ),
+  edge_curve = c(
+    temporal_edge_curve, temporal_edge_curve, 0, 0
+  ),
+  curve_all_edges = c(
+    temporal_curve_all, temporal_curve_all, FALSE, FALSE
+  ),
+  individual_canvas_width_inches = individual_canvas[["width"]],
+  individual_canvas_height_inches = individual_canvas[["height"]],
+  individual_node_size = individual_node_size,
+  edge_width_rule = "constant",
+  edge_width = edge_encoding_audit$minimum_edge_width,
+  edge_width_range = edge_encoding_audit$maximum_edge_width -
+    edge_encoding_audit$minimum_edge_width,
+  weight_encoding = "within-network linear transparency",
+  minimum_transparency = edge_encoding_audit$minimum_transparency,
+  maximum_transparency = edge_encoding_audit$maximum_transparency,
+  transparency_monotonic = edge_encoding_audit$transparency_monotonic,
+  node_shape = node_indicator_audit$node_shape,
+  equal_node_width_height = node_indicator_audit$equal_width_height,
+  outer_ring_metric = node_indicator_audit$ring_metric,
+  outer_ring_scaling = node_indicator_audit$ring_scaling,
+  outer_ring_fraction_minimum =
+    node_indicator_audit$display_fraction_minimum,
+  outer_ring_fraction_maximum =
+    node_indicator_audit$display_fraction_maximum,
+  outer_ring_matches_metric =
+    node_indicator_audit$qgraph_pie_matches_specification,
+  identical_layout = TRUE,
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  all(figure_audit$svg_bytes > 1000),
+  all(figure_audit$positive_color_present == figure_audit$positive_color_expected),
+  all(figure_audit$negative_color_present == figure_audit$negative_color_expected),
+  !any(figure_audit$edge_weight_text_present),
+  all(figure_audit$saved_by_qgraph_native),
+  !any(figure_audit$saved_by_ggsave),
+  all(network_display_audit$edge_weight_labels == 0L),
+  all(network_display_audit$edge_width_rule == "constant"),
+  all(abs(network_display_audit$edge_width - constant_edge_width) < 1e-10),
+  all(abs(network_display_audit$edge_width_range) < 1e-10),
+  all(network_display_audit$minimum_transparency <= 1 / 255 + 1e-10),
+  all(abs(
+    network_display_audit$maximum_transparency - maximum_edge_transparency
+  ) <= 1 / 255 + 1e-10),
+  all(network_display_audit$transparency_monotonic),
+  all(network_display_audit$node_shape == "circle"),
+  all(network_display_audit$equal_node_width_height),
+  all(network_display_audit$outer_ring_matches_metric),
+  all(network_display_audit$outer_ring_fraction_minimum >= 0),
+  all(network_display_audit$outer_ring_fraction_maximum <= 1),
+  all(network_display_audit$arrow_size[
+    network_display_audit$network %in% c("Temporal", "TemporalWithAR")
+  ] <= 2.0),
+  all(network_display_audit$combined_temporal_arrow_size[
+    network_display_audit$network %in% c("Temporal", "TemporalWithAR")
+  ] > network_display_audit$arrow_size[
+    network_display_audit$network %in% c("Temporal", "TemporalWithAR")
+  ]),
+  all(network_display_audit$curve_all_edges[
+    network_display_audit$network %in% c("Temporal", "TemporalWithAR")
+  ]),
+  all(abs(network_display_audit$edge_curve[
+    network_display_audit$network %in% c("Temporal", "TemporalWithAR")
+  ] - temporal_edge_curve) < 1e-10),
+  all(abs(network_display_audit$edge_curve[
+    network_display_audit$network %in% c("Contemporaneous", "Between")
+  ]) < 1e-10),
+  all(network_display_audit$individual_canvas_width_inches > 9.8),
+  all(network_display_audit$individual_canvas_height_inches > 8.2),
+  all(network_display_audit$individual_node_size < 6.4),
+  network_display_audit$autoregressive_self_loops[
+    network_display_audit$network == "Temporal"
+  ] == 0L,
+  network_display_audit$autoregressive_self_loops[
+    network_display_audit$network == "TemporalWithAR"
+  ] == nrow(display_edge_tables$temporal_self),
+  all(network_display_audit$identical_layout)
+)
+
+knitr::kable(figure_audit)
+knitr::kable(network_display_audit)
+```
+
+# Save the figure-provenance object
+
+```{r save-result}
+results_s5_4_mlvar_figures <- list(
+  layout = layout_data,
+  layout_selection_audit = layout_selection_audit,
+  display_edge_tables = display_edge_tables,
+  p_matrices = p_matrices,
+  star_matrices = star_matrices,
+  adjacency_tables = formatted_adjacency_matrices,
+  qgraph_audit = qgraph_audit,
+  edge_encoding_audit = edge_encoding_audit,
+  node_indicator_values = node_indicator_values,
+  node_indicator_audit = node_indicator_audit,
+  render_profile_audit = render_profile_audit,
+  network_display_audit = network_display_audit,
+  figure_audit = figure_audit,
+  workbook_audit = workbook_audit,
+  heatmap_audit = heatmap_audit,
+  provenance = list(
+    data_input = "Res_2_Data_for_Analysis/dat_step5_mlvar.rda",
+    data_md5 = unname(tools::md5sum(data_file)),
+    fit_input = "Res_2_Data_for_Analysis/fit_s5_2_primary_mlvar.rda",
+    fit_md5 = unname(tools::md5sum(fit_file)),
+    network_input = "Res_2_Data_for_Analysis/results_s5_3_mlvar_networks.rda",
+    network_md5 = unname(tools::md5sum(result_input_file)),
+    generating_script = "Step_5_mlVAR_Network_Analysis/S5_4_VisualizemlVARNetworks.Rmd",
+    graph_engine = "qgraph native base graphics",
+    layout_rule = paste(
+      "All qgraph 1.9.8 built-in layouts (circle, groups, spring) were rendered",
+      "for the no-autoregression Temporal network and visually audited; the",
+      "selected spring coordinates are frozen and reused unchanged by all",
+      "network variants"
+    ),
+    visual_label_rule = paste(
+      "Engagement E1-E3; PSMU P1-P6; Distress D1-D3 in canonical node order"
+    ),
+    edge_selection_rule = "Unadjusted two-sided p < .05; AND rule for undirected edges",
+    edge_color_rule = paste(
+      "Positive #E64B35; negative #4DBBD5; within each visible network",
+      "absolute weight maps linearly to transparency 0-0.75"
+    ),
+    network_display_rule = paste(
+      "Network figures omit edge-weight text; primary Temporal omits self-loops;",
+      "companion Temporal retains self-loops; every edge has constant width 1.4;",
+      "directed arrow size is 2.0; all Temporal edges use curve 0.35;",
+      "every node is a circle"
+    ),
+    node_indicator_rule = paste(
+      "qgraph pie-border rings display raw nodewise temporal R2 on both",
+      "Temporal variants and full-network strength divided by the relevant",
+      "network maximum on contemporaneous and between-person figures"
+    ),
+    publication_render_rule = paste(
+      "Individual network canvas 11.5 x 9.5 inches with node size 5.2;",
+      "combined canvas 15.6 x 6.0 inches with Temporal arrow size 3.0;",
+      "SVG output embeds directly in the report"
+    ),
+    adjacency_rule = paste(
+      "Full matrices displayed to three decimals; * .01<=p<.05;",
+      "** .001<=p<.01; *** p<.001; no multiplicity correction"
+    ),
+    heatmap_rule = paste(
+      "Within-network magnitude scales; positive #B2182B; negative #2166AC;",
+      "nonsignificant #FFFFFF; no cell text; E/P/D row-column order"
+    ),
+    save_rule = paste(
+      "qgraph draws networks directly to svglite SVG devices;",
+      "ggplot2::ggsave writes only the three non-network heatmaps"
+    )
+  )
+)
+
+save(results_s5_4_mlvar_figures, file = result_file, version = 2)
+rm(results_s5_4_mlvar_figures)
+results_s5_4_mlvar_figures <- load_single_object(
+  result_file, "results_s5_4_mlvar_figures"
+)
+
+stopifnot(
+  identical(
+    names(results_s5_4_mlvar_figures),
+    c(
+      "layout", "layout_selection_audit", "display_edge_tables", "p_matrices",
+      "star_matrices", "adjacency_tables", "qgraph_audit",
+      "edge_encoding_audit", "node_indicator_values", "node_indicator_audit",
+      "render_profile_audit",
+      "network_display_audit", "figure_audit", "workbook_audit",
+      "heatmap_audit", "provenance"
+    )
+  ),
+  all(results_s5_4_mlvar_figures$network_display_audit$identical_layout),
+  all(results_s5_4_mlvar_figures$network_display_audit$edge_weight_labels == 0L),
+  all(results_s5_4_mlvar_figures$network_display_audit$edge_width_rule ==
+    "constant"),
+  all(abs(
+    results_s5_4_mlvar_figures$network_display_audit$edge_width_range
+  ) < 1e-10),
+  all(results_s5_4_mlvar_figures$network_display_audit$transparency_monotonic),
+  all(results_s5_4_mlvar_figures$network_display_audit$node_shape == "circle"),
+  all(results_s5_4_mlvar_figures$network_display_audit$equal_node_width_height),
+  all(results_s5_4_mlvar_figures$network_display_audit$outer_ring_matches_metric),
+  results_s5_4_mlvar_figures$render_profile_audit$temporal_arrow_size[
+    results_s5_4_mlvar_figures$render_profile_audit$profile ==
+      "Three-network combined"
+  ] > results_s5_4_mlvar_figures$render_profile_audit$temporal_arrow_size[
+    results_s5_4_mlvar_figures$render_profile_audit$profile ==
+      "Individual network"
+  ],
+  all(results_s5_4_mlvar_figures$figure_audit$saved_by_qgraph_native),
+  !any(results_s5_4_mlvar_figures$figure_audit$saved_by_ggsave),
+  isTRUE(results_s5_4_mlvar_figures$workbook_audit$significance_stars),
+  !any(results_s5_4_mlvar_figures$heatmap_audit$cell_text)
+)
+```
+
+```{r validate-rendered-artifacts, include=FALSE}
+s5_4_acceptance <- data.frame(
+  criterion = c(
+    "qgraph natively renders four accepted sparse network variants",
+    "All qgraph built-in layouts audited on no-autoregression Temporal",
+    "Selected Temporal spring coordinates reused identically by all networks",
+    "Visualization labels use E1-E3, P1-P6, and D1-D3",
+    "Every qgraph node is an equal-width equal-height circle",
+    paste(
+      "Outer rings show temporal R2 or maximum-scaled full-network",
+      "strength with exact qgraph pie fractions"
+    ),
+    "Individual canvases are enlarged and individual nodes are reduced",
+    "Primary Temporal omits self-loops and companion Temporal retains them",
+    "Only S5.3 unadjusted p < .05 edges are drawn",
+    "Every displayed positive/negative edge uses the locked sign color",
+    paste(
+      "All edges use constant width and within-network transparency encodes",
+      "absolute weight from 0 to 0.75"
+    ),
+    "No network figure contains edge-weight text labels",
+    "Temporal arrowheads use the reduced size",
+    "Combined-panel Temporal arrowheads are enlarged for print legibility",
+    "Every Temporal directed edge is curved while undirected edges remain straight",
+    "Temporal arrows and undirected contemporaneous/between edges",
+    "Five canonical network SVGs written from native qgraph",
+    "Full adjacency workbook uses three decimals and raw-p significance stars",
+    "Three no-text heatmaps use E-P-D order and white nonsignificant cells",
+    "Sole figure-provenance RDA reload"
+  ),
+  passed = c(
+    all(qgraph_audit$object_class == "qgraph") &&
+      all(qgraph_audit$graph_engine == "qgraph native base graphics") &&
+      !any(qgraph_audit$ggplot_network_geometry),
+    identical(layout_selection_audit$algorithm, c("circle", "groups", "spring")) &&
+      all(file.exists(layout_candidate_files)) &&
+      identical(
+        layout_selection_audit$algorithm[layout_selection_audit$selected],
+        "spring"
+      ),
+    all(network_display_audit$identical_layout) &&
+      all(qgraph_audit$layout_algorithm == "spring"),
+    identical(
+      layout_data$visual_label,
+      c(paste0("E", 1:3), paste0("P", 1:6), paste0("D", 1:3))
+    ),
+    all(node_indicator_audit$node_shape == "circle") &&
+      all(node_indicator_audit$equal_width_height) &&
+      all(qgraph_audit$node_shape == "circle") &&
+      all(qgraph_audit$node_width_equals_height),
+    identical(
+      node_indicator_audit$ring_metric,
+      c(
+        "Temporal nodewise R2", "Temporal nodewise R2",
+        "Full-network strength", "Full-network strength"
+      )
+    ) &&
+      all(node_indicator_audit$qgraph_pie_matches_specification) &&
+      all(node_indicator_audit$display_fraction_minimum >= 0) &&
+      all(node_indicator_audit$display_fraction_maximum <= 1) &&
+      max(node_indicator_values$display_fraction[
+        node_indicator_values$network == "Contemporaneous"
+      ]) == 1 &&
+      max(node_indicator_values$display_fraction[
+        node_indicator_values$network == "Between"
+      ]) == 1,
+    individual_canvas[["width"]] > 9.8 &&
+      individual_canvas[["height"]] > 8.2 &&
+      individual_node_size < 6.4 &&
+      all(node_indicator_audit$node_width == individual_node_size) &&
+      all(node_indicator_audit$node_height == individual_node_size),
+    all(diag(network_specifications$Temporal$matrix) == 0) &&
+      all(diag(network_specifications$TemporalWithAR$matrix) != 0) &&
+      network_display_audit$autoregressive_self_loops[
+        network_display_audit$network == "Temporal"
+      ] == 0L &&
+      network_display_audit$autoregressive_self_loops[
+        network_display_audit$network == "TemporalWithAR"
+      ] == 12L,
+    identical(
+      unname(network_display_audit$displayed_edges),
+      c(
+        sum(edge_tables$temporal$supported_p05 & !edge_tables$temporal$self_loop),
+        sum(edge_tables$temporal$supported_p05),
+        sum(edge_tables$contemporaneous$supported_p05),
+        sum(edge_tables$between$supported_p05)
+      )
+    ),
+    all(figure_audit$positive_color_present == figure_audit$positive_color_expected) &&
+      all(figure_audit$negative_color_present == figure_audit$negative_color_expected),
+    all(network_display_audit$edge_width_rule == "constant") &&
+      all(abs(network_display_audit$edge_width - constant_edge_width) < 1e-10) &&
+      all(abs(network_display_audit$edge_width_range) < 1e-10) &&
+      all(network_display_audit$minimum_transparency <= 1 / 255 + 1e-10) &&
+      all(abs(
+        network_display_audit$maximum_transparency - maximum_edge_transparency
+      ) <= 1 / 255 + 1e-10) &&
+      all(network_display_audit$transparency_monotonic) &&
+      all(!qgraph_audit$qgraph_weighted_width_scaling),
+    all(network_display_audit$edge_weight_labels == 0L) &&
+      !any(figure_audit$edge_weight_text_present) &&
+      !any(qgraph_audit$edge_weight_labels),
+    all(network_display_audit$arrow_size[
+      network_display_audit$network %in% c("Temporal", "TemporalWithAR")
+    ] <= 2.0),
+    combined_temporal_arrow_size > individual_temporal_arrow_size &&
+      all(network_display_audit$combined_temporal_arrow_size[
+        network_display_audit$network %in% c("Temporal", "TemporalWithAR")
+      ] == combined_temporal_arrow_size),
+    all(qgraph_audit$curve_all_edges[
+      qgraph_audit$network %in% c("Temporal", "TemporalWithAR")
+    ]) &&
+      all(abs(qgraph_audit$actual_minimum_abs_curve[
+        qgraph_audit$network %in% c("Temporal", "TemporalWithAR")
+      ] - temporal_edge_curve) < 1e-10) &&
+      all(abs(qgraph_audit$actual_maximum_abs_curve[
+        qgraph_audit$network %in% c("Contemporaneous", "Between")
+      ]) < 1e-10),
+    network_specifications$Temporal$directed &&
+      network_specifications$TemporalWithAR$directed &&
+      !network_specifications$Contemporaneous$directed &&
+      !network_specifications$Between$directed,
+    all(file.exists(all_figure_files)) &&
+      all(figure_audit$saved_by_qgraph_native) &&
+      !any(figure_audit$saved_by_ggsave),
+    file.exists(table_file) &&
+      workbook_audit$three_decimal_cells &&
+      workbook_audit$significance_stars &&
+      workbook_audit$ordered_E_P_D &&
+      workbook_audit$undefined_diagonal_NA &&
+      workbook_audit$formula_errors == 0L,
+    all(file.exists(heatmap_files)) &&
+      !any(heatmap_audit$cell_text) &&
+      all(heatmap_audit$nonsignificant_color == "#FFFFFF") &&
+      all(heatmap_audit$nonsignificant_cells_masked) &&
+      all(heatmap_audit$row_column_order == "E1-E3, P1-P6, D1-D3") &&
+      all(heatmap_audit$saved_by_ggsave),
+    file.exists(result_file)
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(all(s5_4_acceptance$passed))
+```

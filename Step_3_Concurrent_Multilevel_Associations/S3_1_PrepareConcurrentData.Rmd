@@ -1,0 +1,892 @@
+---
+title: "S3.1 Prepare Step 3 concurrent multilevel data"
+author: "Kunru Song"
+date: "2026-07-20"
+params:
+  use_saved_results: false
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+
+<style>
+table { display: block; max-width: 100%; overflow-x: auto; }
+th, td { padding: 6px 9px; white-space: nowrap; }
+</style>
+
+This report creates the sole stage-specific data entry for Step 3. It preserves
+the complete prompt scaffold, applies the strict-complete construct-mean rules,
+keeps all three engagement-duration variables in raw minutes, and creates
+within-person deviations, between-person means, and level-specific standardized
+derivatives. No prompt is aggregated to a day, no Engagement composite is
+created, and no `log1p()` transformation is used.
+
+Step 3 is a repository-only sensitivity analysis, retained for transparency
+but not reported in the manuscript or supplementary materials.
+
+```{r setup, include=FALSE}
+use_saved_results <- {
+  value <- params$use_saved_results
+  if (!is.logical(value) || length(value) != 1L || is.na(value)) {
+    stop("use_saved_results must be one non-missing logical value")
+  }
+  value
+}
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA
+)
+
+required_packages <- c(
+  "dplyr", "knitr", "psych", "rmarkdown", "tibble", "tidyr"
+)
+package_available <- vapply(
+  required_packages,
+  requireNamespace,
+  logical(1),
+  quietly = TRUE
+)
+if (!all(package_available)) {
+  stop(
+    "Missing required R packages: ",
+    paste(names(package_available)[!package_available], collapse = ", ")
+  )
+}
+
+locate_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(current)) current <- dirname(current)
+  repeat {
+    if (all(dir.exists(file.path(current, c(
+      "Step_1_Descriptive_and_Reliability",
+      "Step_3_Concurrent_Multilevel_Associations"
+    ))))) return(current)
+    parent <- dirname(current)
+    if (identical(parent, current)) break
+    current <- parent
+  }
+  stop("Could not locate the project from its public Step directories")
+}
+
+load_single_object <- function(path, expected_name) {
+  environment <- new.env(parent = emptyenv())
+  loaded <- load(path, envir = environment)
+  if (!identical(loaded, expected_name)) {
+    stop(
+      "Expected only ", expected_name, " in ", path,
+      "; found: ", paste(loaded, collapse = ", ")
+    )
+  }
+  environment[[expected_name]]
+}
+
+strict_complete_mean <- function(data, variables) {
+  values <- as.data.frame(lapply(data[variables], as.numeric))
+  complete <- rowSums(!is.na(values)) == length(variables)
+  score <- rep(NA_real_, nrow(values))
+  score[complete] <- rowMeans(values[complete, , drop = FALSE])
+  score
+}
+
+safe_person_mean <- function(x) {
+  if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+}
+
+vif_table <- function(data, variables, level_label, model_label) {
+  complete <- stats::complete.cases(data[variables])
+  x <- as.data.frame(data[complete, variables, drop = FALSE])
+  rows <- lapply(variables, function(target) {
+    others <- setdiff(variables, target)
+    fit <- stats::lm(
+      stats::reformulate(others, response = target),
+      data = x
+    )
+    r_squared <- summary(fit)$r.squared
+    data.frame(
+      model = model_label,
+      level = level_label,
+      variable = target,
+      r_squared_from_other_predictors = r_squared,
+      vif = 1 / (1 - r_squared),
+      stringsAsFactors = FALSE
+    )
+  })
+  dplyr::bind_rows(rows)
+}
+
+condition_index <- function(data, variables) {
+  complete <- stats::complete.cases(data[variables])
+  correlation <- stats::cor(data[complete, variables, drop = FALSE])
+  eigenvalues <- eigen(correlation, symmetric = TRUE, only.values = TRUE)$values
+  sqrt(max(eigenvalues) / min(eigenvalues))
+}
+
+report_file <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(
+  if (length(report_file) == 1L && file.exists(report_file)) report_file else getwd()
+)
+knitr::opts_knit$set(root.dir = project_root)
+
+input_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "dat_focal_analysis.rda"
+)
+measurement_result_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "fit_s2_10_multilevel_cfa_new_model_order_p2var0.rda"
+)
+output_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "dat_step3_concurrent.rda"
+)
+
+stopifnot(file.exists(input_file))
+if (!use_saved_results) {
+  stopifnot(file.exists(measurement_result_file))
+  dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+```{r load-saved-results, include=FALSE, eval=use_saved_results}
+load_saved_display <- function(path, focal_path) {
+  saved <- load_single_object(path, "dat_step3_concurrent")
+  stopifnot(
+    is.list(saved),
+    all(c("prompt", "person", "variable_map", "standardization",
+          "sample_audit", "diagnostics", "provenance") %in% names(saved)),
+    is.data.frame(saved$prompt), nrow(saved$prompt) == 18810L,
+    is.data.frame(saved$person), nrow(saved$person) == 209L,
+    is.list(saved$diagnostics), is.list(saved$provenance)
+  )
+  provenance <- saved$provenance
+  sources <- provenance$source_files
+  stopifnot(is.data.frame(sources), all(c("object", "md5") %in% names(sources)))
+  focal <- sources[sources$object == "dat_focal_analysis", , drop = FALSE]
+  stopifnot(
+    nrow(focal) == 1L,
+    identical(as.character(focal$md5), unname(tools::md5sum(focal_path))),
+    identical(provenance$duration_treatment, "Raw minutes; no log1p in Step 3"),
+    identical(provenance$scoring, c(
+      Peripheral = "Mean PMU1-PMU2; require 2/2",
+      Core = "Mean PMU3-PMU6; require 4/4",
+      Distress = "Mean DASS1-DASS6; require 6/6"
+    ))
+  )
+  tables <- list(
+    measurement_bridge = provenance$measurement_bridge,
+    source_checks = saved$diagnostics$source_checks,
+    score_completeness = saved$diagnostics$score_completeness,
+    standardization = saved$standardization,
+    sample_audit = saved$sample_audit,
+    duration_descriptives = saved$diagnostics$duration_descriptives,
+    vif_diagnostics = saved$diagnostics$vif,
+    condition_diagnostics = saved$diagnostics$condition_index,
+    diagnostic_flags = saved$diagnostics$flags,
+    variable_map = saved$variable_map
+  )
+  columns <- list(
+    measurement_bridge = c("retained_model", "normal_termination", "admissible",
+      "pmu2_between_residual_fixed_zero", "step3_score_representation"),
+    source_checks = c("check", "observed", "expected", "passed"),
+    score_completeness = c("variable", "observed_prompts", "missing_prompts", "participants_with_score"),
+    standardization = c("variable", "within_center", "within_sd", "between_center", "between_sd"),
+    sample_audit = c("sample", "prompts", "participants", "person_days"),
+    duration_descriptives = c("variable", "behavior", "n_observed", "mean_minutes", "sd_minutes",
+      "median_minutes", "minimum", "maximum", "zero_percent", "endpoint_300_count", "skewness", "excess_kurtosis"),
+    vif_diagnostics = c("model", "level", "variable", "r_squared_from_other_predictors", "vif"),
+    condition_diagnostics = c("model", "level", "condition_index"),
+    diagnostic_flags = c("diagnostic", "flagged"),
+    variable_map = c("role", "variable", "source_or_rule")
+  )
+  expected_rows <- c(1L, 8L, 6L, 6L, 2L, 3L, 16L, 4L, 4L, 13L)
+  for (index in seq_along(tables)) {
+    table <- tables[[index]]
+    required <- columns[[index]]
+    optional <- if (index == 1L) "heywood_remediation_success" else character()
+    stopifnot(is.data.frame(table), nrow(table) == expected_rows[index],
+              all(required %in% names(table)),
+              all(names(table) %in% c(required, optional)),
+              !anyDuplicated(names(table)))
+  }
+  bridge <- tables$measurement_bridge
+  stopifnot(
+    identical(as.character(bridge$retained_model), provenance$retained_measurement_model),
+    provenance$retained_measurement_model %in% c("M3_2W2B", "M3b_2W2B_PMU2Residual0"),
+    isTRUE(bridge$normal_termination), isTRUE(bridge$admissible),
+    isTRUE(bridge$pmu2_between_residual_fixed_zero),
+    all(tables$source_checks$passed),
+    all(tables$score_completeness$participants_with_score == 209L),
+    all(tables$sample_audit$participants == 209L),
+    all(tables$standardization$within_sd > 0),
+    all(tables$standardization$between_sd > 0)
+  )
+  tables
+}
+saved_display <- load_saved_display(output_file, input_file)
+list2env(saved_display, envir = environment())
+```
+
+```{r saved-mode-note, echo=FALSE, results='asis', eval=use_saved_results}
+cat("This report displays the aggregate tables stored with the accepted Step 3 data. ",
+    "No source items were rescored, and no statistical diagnostics or models were rerun. ",
+    "The measurement table preserves the model label recorded at the original preparation; ",
+    "the current preparation code below validates the same grouping through S2.6.\n\n", sep = "")
+```
+
+# Step 3 scoring and measurement basis
+
+The retained S2.6 Model 3 (`M3_2W2B`, the two-within/two-between
+representation formerly labelled M3b) provides the measurement basis.
+Its between-person `PMU2` residual remains fixed at zero in the
+measurement model; Step 3 does not reproduce that latent model or extract
+factor scores. Instead, it uses strict-complete unit-weighted means based on the same Peripheral/Core grouping.
+
+```{r validate-measurement-bridge, eval=!use_saved_results}
+measurement_results <- load_single_object(
+  measurement_result_file,
+  "fit_s2_10_multilevel_cfa_new_model_order_p2var0"
+)
+
+required_model_id <- "M3_2W2B"
+m3b_diagnostic <- measurement_results$diagnostics |>
+  dplyr::filter(model_id == required_model_id)
+
+# Validate the retained owner's syntax and diagnostics, not an archived
+# extraction artifact. No CFA parameter is used to calculate manifest scores.
+expected_measurement_syntax <- paste(
+  "%WITHIN%", "pw BY p1-p2;", "cw BY p3-p6;", "pw WITH cw;",
+  "%BETWEEN%", "pb BY p1-p2;", "cb BY p3-p6;", "pb WITH cb;", "p2@0;",
+  sep = "\n"
+)
+pmu2_between_residual <- measurement_results$parsed_models[[required_model_id]]$
+  parameters$unstandardized |>
+  dplyr::filter(paramHeader == "Residual.Variances", toupper(param) == "P2",
+                toupper(BetweenWithin) == "BETWEEN")
+stopifnot(
+  identical(measurement_results$model_syntax[[required_model_id]], expected_measurement_syntax),
+  identical(measurement_results$variable_map$project_variable, paste0("PMU", 1:6)),
+  identical(measurement_results$variable_map$theoretical_group,
+            c(rep("Peripheral", 2L), rep("Core", 4L))),
+  nrow(m3b_diagnostic) == 1L,
+  isTRUE(m3b_diagnostic$normal_termination),
+  identical(m3b_diagnostic$errors_n, 0L),
+  isFALSE(m3b_diagnostic$negative_variance_flag),
+  isFALSE(m3b_diagnostic$theta_warning),
+  isTRUE(m3b_diagnostic$minimum_unstandardized_residual_variance == 0),
+  nrow(pmu2_between_residual) == 1L,
+  isTRUE(as.numeric(pmu2_between_residual$est) == 0),
+  isTRUE(as.numeric(pmu2_between_residual$se) == 0)
+)
+
+measurement_bridge <- data.frame(
+  retained_model = required_model_id,
+  normal_termination = m3b_diagnostic$normal_termination,
+  admissible = !m3b_diagnostic$negative_variance_flag && !m3b_diagnostic$theta_warning,
+  pmu2_between_residual_fixed_zero = TRUE,
+  step3_score_representation = "Strict-complete unit-weighted means",
+  stringsAsFactors = FALSE
+)
+
+```
+
+```{r measurement-bridge-table, echo=FALSE}
+knitr::kable(measurement_bridge, format = "html", row.names = FALSE)
+```
+
+# Load and validate the canonical prompt scaffold
+
+```{r load-and-validate-source, eval=!use_saved_results}
+dat_focal_analysis <- load_single_object(input_file, "dat_focal_analysis")
+
+id_variables <- c("Data_ID", "Name_ID", "Day", "Time")
+peripheral_items <- paste0("PMU", 1:2)
+core_items <- paste0("PMU", 3:6)
+distress_items <- paste0("DASS", 1:6)
+duration_variables <- paste0("mu_time", 1:3)
+required_variables <- c(
+  id_variables,
+  peripheral_items,
+  core_items,
+  distress_items,
+  duration_variables
+)
+
+missing_variables <- setdiff(required_variables, names(dat_focal_analysis))
+if (length(missing_variables)) {
+  stop("Missing required variables: ", paste(missing_variables, collapse = ", "))
+}
+
+duplicate_prompt_keys <- dat_focal_analysis |>
+  dplyr::count(Name_ID, Day, Time, name = "n") |>
+  dplyr::filter(n > 1L)
+duplicate_data_ids <- dat_focal_analysis |>
+  dplyr::count(Data_ID, name = "n") |>
+  dplyr::filter(n > 1L)
+prompts_per_participant <- dat_focal_analysis |>
+  dplyr::count(Name_ID, name = "scheduled_prompts")
+days_per_participant <- dat_focal_analysis |>
+  dplyr::distinct(Name_ID, Day) |>
+  dplyr::count(Name_ID, name = "scheduled_days")
+
+item_out_of_range <- sum(vapply(
+  dat_focal_analysis[c(peripheral_items, core_items, distress_items)],
+  function(x) sum(!is.na(x) & !(x %in% 1:5)),
+  integer(1)
+))
+duration_out_of_range <- sum(vapply(
+  dat_focal_analysis[duration_variables],
+  function(x) sum(!is.na(x) & (x < 0 | x > 300)),
+  integer(1)
+))
+
+stopifnot(
+  nrow(dat_focal_analysis) == 18810L,
+  dplyr::n_distinct(dat_focal_analysis$Name_ID) == 209L,
+  nrow(duplicate_prompt_keys) == 0L,
+  nrow(duplicate_data_ids) == 0L,
+  !anyNA(dat_focal_analysis[id_variables]),
+  identical(sort(unique(dat_focal_analysis$Day)), 1:30),
+  identical(sort(unique(dat_focal_analysis$Time)), 1:3),
+  all(prompts_per_participant$scheduled_prompts == 90L),
+  all(days_per_participant$scheduled_days == 30L),
+  item_out_of_range == 0L,
+  duration_out_of_range == 0L
+)
+
+source_checks <- data.frame(
+  check = c(
+    "Scheduled prompt rows", "Participants", "Duplicate prompt keys",
+    "Duplicate Data_ID values", "Days per participant",
+    "Prompts per participant", "Out-of-range item cells",
+    "Out-of-range duration cells"
+  ),
+  observed = c(
+    nrow(dat_focal_analysis),
+    dplyr::n_distinct(dat_focal_analysis$Name_ID),
+    nrow(duplicate_prompt_keys),
+    nrow(duplicate_data_ids),
+    paste(range(days_per_participant$scheduled_days), collapse = "-"),
+    paste(range(prompts_per_participant$scheduled_prompts), collapse = "-"),
+    item_out_of_range,
+    duration_out_of_range
+  ),
+  expected = c("18810", "209", "0", "0", "30", "90", "0", "0"),
+  passed = TRUE,
+  stringsAsFactors = FALSE
+)
+
+```
+
+```{r source-checks-table, echo=FALSE}
+knitr::kable(source_checks, format = "html", row.names = FALSE)
+```
+
+# Create construct means and raw-minute variables
+
+```{r score-constructs, eval=!use_saved_results}
+dat_prompt <- dat_focal_analysis |>
+  dplyr::select(dplyr::all_of(required_variables)) |>
+  dplyr::arrange(Name_ID, Day, Time) |>
+  dplyr::mutate(
+    Peripheral = strict_complete_mean(
+      dplyr::pick(dplyr::all_of(peripheral_items)),
+      peripheral_items
+    ),
+    Core = strict_complete_mean(
+      dplyr::pick(dplyr::all_of(core_items)),
+      core_items
+    ),
+    Distress = strict_complete_mean(
+      dplyr::pick(dplyr::all_of(distress_items)),
+      distress_items
+    ),
+    InteractiveTime = as.numeric(mu_time1),
+    ActiveTime = as.numeric(mu_time2),
+    PassiveTime = as.numeric(mu_time3),
+    Day_c = as.numeric(Day) - 15.5,
+    Time_2 = as.integer(Time == 2L),
+    Time_3 = as.integer(Time == 3L)
+  ) |>
+  as.data.frame()
+
+analysis_variables <- c(
+  "Core", "Peripheral", "Distress",
+  "InteractiveTime", "ActiveTime", "PassiveTime"
+)
+
+score_completeness <- data.frame(
+  variable = analysis_variables,
+  observed_prompts = vapply(
+    dat_prompt[analysis_variables],
+    function(x) sum(!is.na(x)),
+    integer(1)
+  ),
+  missing_prompts = vapply(
+    dat_prompt[analysis_variables],
+    function(x) sum(is.na(x)),
+    integer(1)
+  ),
+  participants_with_score = vapply(
+    analysis_variables,
+    function(variable) dplyr::n_distinct(
+      dat_prompt$Name_ID[!is.na(dat_prompt[[variable]])]
+    ),
+    integer(1)
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  all(dat_prompt$Peripheral[!is.na(dat_prompt$Peripheral)] >= 1),
+  all(dat_prompt$Peripheral[!is.na(dat_prompt$Peripheral)] <= 5),
+  all(dat_prompt$Core[!is.na(dat_prompt$Core)] >= 1),
+  all(dat_prompt$Core[!is.na(dat_prompt$Core)] <= 5),
+  all(dat_prompt$Distress[!is.na(dat_prompt$Distress)] >= 1),
+  all(dat_prompt$Distress[!is.na(dat_prompt$Distress)] <= 5),
+  all(score_completeness$participants_with_score == 209L)
+)
+
+```
+
+```{r score-completeness-table, echo=FALSE}
+knitr::kable(score_completeness, format = "html", row.names = FALSE)
+```
+
+# Decompose within and between components
+
+```{r decompose-and-standardize, eval=!use_saved_results}
+for (variable in analysis_variables) {
+  between_name <- paste0(variable, "_B")
+  within_name <- paste0(variable, "_W")
+  dat_prompt[[between_name]] <- ave(
+    dat_prompt[[variable]],
+    dat_prompt$Name_ID,
+    FUN = safe_person_mean
+  )
+  dat_prompt[[within_name]] <-
+    dat_prompt[[variable]] - dat_prompt[[between_name]]
+}
+
+person_data <- dat_prompt |>
+  dplyr::distinct(
+    Name_ID,
+    dplyr::across(dplyr::all_of(paste0(analysis_variables, "_B")))
+  ) |>
+  dplyr::arrange(Name_ID) |>
+  as.data.frame()
+
+stopifnot(nrow(person_data) == 209L, !anyNA(person_data))
+
+standardization_rows <- lapply(analysis_variables, function(variable) {
+  within_name <- paste0(variable, "_W")
+  between_name <- paste0(variable, "_B")
+  within_sd <- stats::sd(dat_prompt[[within_name]], na.rm = TRUE)
+  between_values <- person_data[[between_name]]
+  between_mean <- mean(between_values)
+  between_sd <- stats::sd(between_values)
+  if (!is.finite(within_sd) || within_sd <= 0 ||
+      !is.finite(between_sd) || between_sd <= 0) {
+    stop("Invalid level-specific SD for ", variable)
+  }
+  dat_prompt[[paste0(within_name, "_Z")]] <<-
+    dat_prompt[[within_name]] / within_sd
+  dat_prompt[[paste0(between_name, "_Z")]] <<-
+    (dat_prompt[[between_name]] - between_mean) / between_sd
+  data.frame(
+    variable = variable,
+    within_center = 0,
+    within_sd = within_sd,
+    between_center = between_mean,
+    between_sd = between_sd,
+    stringsAsFactors = FALSE
+  )
+})
+standardization <- dplyr::bind_rows(standardization_rows)
+
+person_data <- dat_prompt |>
+  dplyr::distinct(
+    Name_ID,
+    dplyr::across(dplyr::all_of(c(
+      paste0(analysis_variables, "_B"),
+      paste0(analysis_variables, "_B_Z")
+    )))
+  ) |>
+  dplyr::arrange(Name_ID) |>
+  as.data.frame()
+
+for (variable in analysis_variables) {
+  within_values <- dat_prompt[[paste0(variable, "_W")]]
+  within_z <- dat_prompt[[paste0(variable, "_W_Z")]]
+  between_z <- person_data[[paste0(variable, "_B_Z")]]
+  stopifnot(
+    abs(mean(within_values, na.rm = TRUE)) < 1e-10,
+    abs(mean(within_z, na.rm = TRUE)) < 1e-10,
+    abs(stats::sd(within_z, na.rm = TRUE) - 1) < 1e-10,
+    abs(mean(between_z)) < 1e-10,
+    abs(stats::sd(between_z) - 1) < 1e-10
+  )
+}
+
+```
+
+```{r standardization-table, echo=FALSE}
+knitr::kable(standardization, format = "html", digits = 5, row.names = FALSE)
+```
+
+# Define Step 3 analysis samples
+
+S3.3 and S3.4 use the same complete-prompt sample so coefficient changes cannot
+be attributed to different rows. S3.2 has its own outcome-relevant sample.
+
+```{r define-analysis-samples, eval=!use_saved_results}
+s32_variables <- c(
+  "Core", "Peripheral", "InteractiveTime", "ActiveTime", "PassiveTime"
+)
+common_distress_variables <- c(
+  "Distress", "Core", "Peripheral",
+  "InteractiveTime", "ActiveTime", "PassiveTime"
+)
+
+dat_prompt$s32_sample <- stats::complete.cases(dat_prompt[s32_variables])
+dat_prompt$s33_s34_sample <- stats::complete.cases(
+  dat_prompt[common_distress_variables]
+)
+
+sample_audit <- dplyr::bind_rows(
+  data.frame(
+    sample = "S3.2 Engagement-Time to Core/Peripheral",
+    prompts = sum(dat_prompt$s32_sample),
+    participants = dplyr::n_distinct(
+      dat_prompt$Name_ID[dat_prompt$s32_sample]
+    ),
+    person_days = dplyr::n_distinct(interaction(
+      dat_prompt$Name_ID[dat_prompt$s32_sample],
+      dat_prompt$Day[dat_prompt$s32_sample],
+      drop = TRUE
+    )),
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    sample = "S3.3/S3.4 common Distress sample",
+    prompts = sum(dat_prompt$s33_s34_sample),
+    participants = dplyr::n_distinct(
+      dat_prompt$Name_ID[dat_prompt$s33_s34_sample]
+    ),
+    person_days = dplyr::n_distinct(interaction(
+      dat_prompt$Name_ID[dat_prompt$s33_s34_sample],
+      dat_prompt$Day[dat_prompt$s33_s34_sample],
+      drop = TRUE
+    )),
+    stringsAsFactors = FALSE
+  )
+)
+
+stopifnot(
+  all(sample_audit$prompts > 0L),
+  all(sample_audit$participants == 209L),
+  all(dat_prompt$s33_s34_sample <= dat_prompt$s32_sample)
+)
+
+```
+
+```{r sample-table, echo=FALSE}
+knitr::kable(sample_audit, format = "html", row.names = FALSE)
+```
+
+# Duration and multicollinearity diagnostics
+
+```{r diagnostic-audit, eval=!use_saved_results}
+duration_labels <- c(
+  InteractiveTime = "Interactive/message",
+  ActiveTime = "Active/posting",
+  PassiveTime = "Passive/browsing"
+)
+
+duration_descriptives <- dplyr::bind_rows(lapply(
+  names(duration_labels),
+  function(variable) {
+    x <- dat_prompt[[variable]]
+    described <- psych::describe(x, fast = FALSE)
+    data.frame(
+      variable = variable,
+      behavior = unname(duration_labels[[variable]]),
+      n_observed = sum(!is.na(x)),
+      mean_minutes = mean(x, na.rm = TRUE),
+      sd_minutes = stats::sd(x, na.rm = TRUE),
+      median_minutes = stats::median(x, na.rm = TRUE),
+      minimum = min(x, na.rm = TRUE),
+      maximum = max(x, na.rm = TRUE),
+      zero_percent = 100 * mean(x == 0, na.rm = TRUE),
+      endpoint_300_count = sum(x == 300, na.rm = TRUE),
+      skewness = described$skew,
+      excess_kurtosis = described$kurtosis,
+      stringsAsFactors = FALSE
+    )
+  }
+))
+
+within_full_predictors <- c(
+  "Core_W", "Peripheral_W", "InteractiveTime_W",
+  "ActiveTime_W", "PassiveTime_W"
+)
+between_full_predictors <- c(
+  "Core_B", "Peripheral_B", "InteractiveTime_B",
+  "ActiveTime_B", "PassiveTime_B"
+)
+within_engagement_predictors <- c(
+  "InteractiveTime_W", "ActiveTime_W", "PassiveTime_W"
+)
+between_engagement_predictors <- c(
+  "InteractiveTime_B", "ActiveTime_B", "PassiveTime_B"
+)
+
+vif_diagnostics <- dplyr::bind_rows(
+  vif_table(
+    dat_prompt[dat_prompt$s32_sample, ],
+    within_engagement_predictors,
+    "Within", "S3.2 engagement predictors"
+  ),
+  vif_table(
+    person_data,
+    between_engagement_predictors,
+    "Between", "S3.2 engagement predictors"
+  ),
+  vif_table(
+    dat_prompt[dat_prompt$s33_s34_sample, ],
+    within_full_predictors,
+    "Within", "S3.4 full predictors"
+  ),
+  vif_table(
+    person_data,
+    between_full_predictors,
+    "Between", "S3.4 full predictors"
+  )
+)
+
+condition_diagnostics <- data.frame(
+  model = c(
+    "S3.2 engagement predictors", "S3.2 engagement predictors",
+    "S3.4 full predictors", "S3.4 full predictors"
+  ),
+  level = c("Within", "Between", "Within", "Between"),
+  condition_index = c(
+    condition_index(
+      dat_prompt[dat_prompt$s32_sample, ],
+      within_engagement_predictors
+    ),
+    condition_index(person_data, between_engagement_predictors),
+    condition_index(
+      dat_prompt[dat_prompt$s33_s34_sample, ],
+      within_full_predictors
+    ),
+    condition_index(person_data, between_full_predictors)
+  ),
+  stringsAsFactors = FALSE
+)
+
+correlation_diagnostics <- list(
+  s32_within = stats::cor(
+    dat_prompt[dat_prompt$s32_sample, within_engagement_predictors]
+  ),
+  s32_between = stats::cor(person_data[between_engagement_predictors]),
+  s34_within = stats::cor(
+    dat_prompt[dat_prompt$s33_s34_sample, within_full_predictors]
+  ),
+  s34_between = stats::cor(person_data[between_full_predictors])
+)
+
+diagnostic_flags <- data.frame(
+  diagnostic = c(
+    "Maximum VIF exceeds 5",
+    "Maximum condition index exceeds 30",
+    "Posting zero percentage differs from verified 75.13 by > 0.05",
+    "Unexpected duration endpoint"
+  ),
+  flagged = c(
+    max(vif_diagnostics$vif) > 5,
+    max(condition_diagnostics$condition_index) > 30,
+    abs(
+      duration_descriptives$zero_percent[
+        duration_descriptives$variable == "ActiveTime"
+      ] - 75.13
+    ) > 0.05,
+    any(duration_descriptives$minimum < 0) ||
+      any(duration_descriptives$maximum > 300)
+  ),
+  stringsAsFactors = FALSE
+)
+
+```
+
+```{r duration-table, echo=FALSE}
+knitr::kable(duration_descriptives, format = "html", digits = 3, row.names = FALSE)
+```
+
+```{r vif-table, echo=FALSE}
+knitr::kable(vif_diagnostics, format = "html", digits = 3, row.names = FALSE)
+```
+
+```{r condition-table, echo=FALSE}
+knitr::kable(condition_diagnostics, format = "html", digits = 3, row.names = FALSE)
+```
+
+```{r diagnostic-flags-table, echo=FALSE}
+knitr::kable(diagnostic_flags, format = "html", row.names = FALSE)
+```
+
+# Step 3 variable definitions
+
+```{r save-and-reload, include=FALSE, eval=!use_saved_results}
+variable_map <- data.frame(
+  role = c(
+    rep("Identifier/time", 4),
+    rep("Construct mean", 3),
+    rep("Raw engagement-duration predictor", 3),
+    rep("Nuisance covariate", 3)
+  ),
+  variable = c(
+    id_variables,
+    "Peripheral", "Core", "Distress",
+    "InteractiveTime", "ActiveTime", "PassiveTime",
+    "Day_c", "Time_2", "Time_3"
+  ),
+  source_or_rule = c(
+    id_variables,
+    "Mean PMU1-PMU2; require 2/2",
+    "Mean PMU3-PMU6; require 4/4",
+    "Mean DASS1-DASS6; require 6/6",
+    "mu_time1 raw minutes", "mu_time2 raw minutes",
+    "mu_time3 raw minutes", "Day - 15.5",
+    "1 if Time = 2", "1 if Time = 3"
+  ),
+  stringsAsFactors = FALSE
+)
+
+source_files <- data.frame(
+  role = c("Canonical focal data", "Step 2 measurement results"),
+  file = c(
+    "Res_2_Data_for_Analysis/dat_focal_analysis.rda",
+    "Res_2_Data_for_Analysis/fit_s2_10_multilevel_cfa_new_model_order_p2var0.rda"
+  ),
+  object = c("dat_focal_analysis", "fit_s2_10_multilevel_cfa_new_model_order_p2var0"),
+  md5 = unname(tools::md5sum(c(input_file, measurement_result_file))),
+  stringsAsFactors = FALSE
+)
+
+dat_step3_concurrent <- list(
+  prompt = dat_prompt,
+  person = person_data,
+  variable_map = variable_map,
+  standardization = standardization,
+  sample_audit = sample_audit,
+  diagnostics = list(
+    source_checks = source_checks,
+    score_completeness = score_completeness,
+    duration_descriptives = duration_descriptives,
+    vif = vif_diagnostics,
+    condition_index = condition_diagnostics,
+    correlations = correlation_diagnostics,
+    flags = diagnostic_flags
+  ),
+  provenance = list(
+    generated_by = paste0(
+      "Step_3_Concurrent_Multilevel_Associations/",
+      "S3_1_PrepareConcurrentData.Rmd"
+    ),
+    output_file = "Res_2_Data_for_Analysis/dat_step3_concurrent.rda",
+    source_files = source_files,
+    retained_measurement_model = required_model_id,
+    measurement_bridge = measurement_bridge,
+    duration_treatment = "Raw minutes; no log1p in Step 3",
+    scoring = c(
+      Peripheral = "Mean PMU1-PMU2; require 2/2",
+      Core = "Mean PMU3-PMU6; require 4/4",
+      Distress = "Mean DASS1-DASS6; require 6/6"
+    )
+  )
+)
+
+expected_components <- c(
+  "prompt", "person", "variable_map", "standardization",
+  "sample_audit", "diagnostics", "provenance"
+)
+stopifnot(
+  identical(names(dat_step3_concurrent), expected_components),
+  nrow(dat_step3_concurrent$prompt) == 18810L,
+  nrow(dat_step3_concurrent$person) == 209L,
+  !anyDuplicated(dat_step3_concurrent$prompt[c("Name_ID", "Day", "Time")])
+)
+
+save(dat_step3_concurrent, file = output_file, compress = "xz", version = 3)
+
+verified_step3 <- load_single_object(output_file, "dat_step3_concurrent")
+stopifnot(
+  identical(names(verified_step3), expected_components),
+  identical(verified_step3$sample_audit, sample_audit),
+  identical(verified_step3$standardization, standardization),
+  identical(verified_step3$provenance$source_files, source_files),
+  nrow(verified_step3$prompt) == 18810L,
+  nrow(verified_step3$person) == 209L
+)
+
+output_manifest <- data.frame(
+  file = "Res_2_Data_for_Analysis/dat_step3_concurrent.rda",
+  top_level_object = "dat_step3_concurrent",
+  components = paste(names(verified_step3), collapse = ", "),
+  rows_prompt = nrow(verified_step3$prompt),
+  rows_person = nrow(verified_step3$person),
+  bytes = file.info(output_file)$size,
+  md5 = unname(tools::md5sum(output_file)),
+  stringsAsFactors = FALSE
+)
+
+```
+
+```{r variable-map-table, echo=FALSE}
+knitr::kable(variable_map, format = "html", row.names = FALSE)
+```
+
+```{r final-acceptance, include=FALSE, eval=!use_saved_results}
+acceptance <- data.frame(
+  gate = c(
+    "Source structure validated",
+    "Constrained 2W2B measurement basis validated",
+    "Strict construct means valid",
+    "Raw durations retained",
+    "Within/between standardization valid",
+    "S3.2 sample covers 209 participants",
+    "S3.3/S3.4 common sample covers 209 participants",
+    "Saved RDA reloaded successfully"
+  ),
+  passed = c(
+    all(source_checks$passed),
+    nrow(measurement_bridge) == 1L && measurement_bridge$admissible,
+    all(score_completeness$participants_with_score == 209L),
+    all(duration_descriptives$minimum >= 0) &&
+      all(duration_descriptives$maximum <= 300),
+    all(standardization$within_sd > 0) &&
+      all(standardization$between_sd > 0),
+    sample_audit$participants[1] == 209L,
+    sample_audit$participants[2] == 209L,
+    file.exists(output_file) && nrow(verified_step3$prompt) == 18810L
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(all(acceptance$passed))
+```
+
+The canonical output is
+`Res_2_Data_for_Analysis/dat_step3_concurrent.rda`. S3.2-S3.4 must treat this
+file as read-only and must not independently rescore the source items.

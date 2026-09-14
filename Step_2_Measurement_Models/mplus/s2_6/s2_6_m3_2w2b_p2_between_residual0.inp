@@ -1,0 +1,31 @@
+TITLE:
+! Author: Kunru Song
+! Missing values are declared as . and handled by default MLR FIML.
+S2.6 Model 3 with between-level P2 residual fixed to zero;
+DATA:
+FILE = "G:/2026_[8]_PSMU_Daily_CorePeripheral/Step_2_Measurement_Models/
+mplus/s2_6/s2_6_m3_2w2b_p2_between_residual0.dat"; 
+VARIABLE:
+NAMES = cluster p1 p2 p3 p4 p5 p6; 
+ MISSING=.;
+ CLUSTER = cluster;
+ANALYSIS:
+TYPE = TWOLEVEL;
+ESTIMATOR = MLR;
+MODEL:
+%WITHIN%
+pw BY p1-p2;
+cw BY p3-p6;
+pw WITH cw;
+%BETWEEN%
+pb BY p1-p2;
+cb BY p3-p6;
+pb WITH cb;
+p2@0;
+OUTPUT:
+SAMPSTAT;
+STANDARDIZED(STDYX);
+CINTERVAL;
+RESIDUAL;
+TECH1;
+TECH4;

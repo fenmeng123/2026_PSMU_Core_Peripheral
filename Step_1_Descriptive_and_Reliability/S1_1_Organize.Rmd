@@ -1,0 +1,487 @@
+---
+title: "S1.1 Organize baseline, daily diary, and EMA data"
+author: "Kunru Song"
+params:
+  write_artifacts: true
+date: "2026-07-17 18:13:43 +08:00"
+output:
+  html_document:
+    md_extensions: "-markdown_in_html_blocks"
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+<!-- Report date: earliest retained HTML CreationTime; not a verified analysis-start log. Keep fixed on re-render. -->
+
+<style>
+/* Keep wide audit/correlation tables within the report column. */
+.main-container table.table { display: block; max-width: 100%; overflow-x: auto; }
+.main-container table.table th, .main-container table.table td { padding: 6px 9px; }
+.main-container table.table td { white-space: nowrap; }
+.main-container table.table th:first-child, .main-container table.table td:first-child { min-width: 140px; }
+.main-container table.item-description-table td:nth-child(3) { white-space: normal; min-width: 320px; max-width: 320px; }
+.main-container table.table caption { text-align: left; font-weight: 600; color: #333; }
+</style>
+
+This report preprocesses each data source separately. It does not read the band-data SAV file, aggregate EMA observations to days, construct
+new focal-variable scales, or merge baseline, daily-diary, and EMA data. All
+source variables are retained so focal-variable selection can be made from the
+clean RDA objects in the next stage.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA
+)
+
+required_packages <- c("bruceR", "dplyr", "haven", "jsonlite", "knitr", "readxl", "rmarkdown")
+package_available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(package_available)) {
+  stop("Missing required R packages: ", paste(names(package_available)[!package_available], collapse = ", "))
+}
+
+locate_project_root <- function(start = getwd()) {
+  candidates <- unique(normalizePath(c(start, file.path(start, "..")), winslash = "/", mustWork = FALSE))
+  hits <- candidates[
+    dir.exists(file.path(candidates, "Step_1_Descriptive_and_Reliability")) &
+      dir.exists(file.path(candidates, "Step_2_Measurement_Models"))
+  ]
+  if (length(hits) != 1L) {
+    stop("Could not identify a unique analysis project root from: ", start)
+  }
+  hits[[1L]]
+}
+
+project_root <- locate_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+
+raw_dir <- file.path(project_root, "Res_1_PreprocessedData")
+out_dir <- file.path(project_root, "Res_2_Data_for_Analysis")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+baseline_file <- file.path(raw_dir, "DD_Baseline_209_0604.sav")
+daily_file <- file.path(raw_dir, "data_daily correct997-6041.sav")
+ema_file <- file.path(raw_dir, "data_ema correct997-6041.sav")
+tracker_file <- file.path(raw_dir, "tracker.xlsx")
+correction_file <- Sys.getenv(
+  "PSMU_PRIVATE_CORRECTIONS",
+  unset = file.path(out_dir, "private_baseline_corrections.json")
+)
+if (!file.exists(correction_file)) {
+  stop("Raw-source preprocessing requires a private correction file. ",
+       "Use the prepared, de-identified entry data for public reproduction.")
+}
+private_corrections <- jsonlite::fromJSON(correction_file)
+if (!identical(private_corrections$schema_version, 1L)) {
+  stop("Unsupported private correction schema.")
+}
+
+input_files <- c(baseline_file, daily_file, ema_file, tracker_file)
+if (!all(file.exists(input_files))) {
+  stop("Missing required input files: ", paste(input_files[!file.exists(input_files)], collapse = ", "))
+}
+```
+
+# Import scope
+
+The wearable/band file is outside this project's current scope and is neither
+read nor written by this script.
+
+```{r input-paths}
+data.frame(
+  source = c("baseline", "daily", "EMA", "baseline age tracker"),
+  path = normalizePath(input_files, winslash = "/"),
+  stringsAsFactors = FALSE
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "Input paths",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Helper functions
+
+```{r helpers}
+apply_private_baseline_corrections <- function(data, specification, phase) {
+  stopifnot(phase %in% c("name", "age"), all(c("Name_ID", "Name") %in% names(data)))
+  rules <- specification[[paste0(phase, "_corrections")]]
+  required <- if (phase == "name") c("id", "value") else c("id", "match_name", "value")
+  if (!is.data.frame(rules) || !all(required %in% names(rules)) ||
+      anyNA(rules[required]) || anyDuplicated(rules$id)) {
+    stop("Invalid private correction specification.")
+  }
+  if (phase == "age" && (!"AgeInYears" %in% names(data) ||
+      !is.numeric(rules$value) || any(!is.finite(rules$value)))) {
+    stop("Invalid age-correction input.")
+  }
+  for (index in seq_len(nrow(rules))) {
+    matched <- data$Name_ID == rules$id[[index]]
+    if (phase == "name") {
+      data$Name <- dplyr::if_else(matched, rules$value[[index]], data$Name)
+    } else {
+      matched <- matched | data$Name == rules$match_name[[index]]
+      data$AgeInYears <- dplyr::if_else(matched, rules$value[[index]], data$AgeInYears)
+    }
+  }
+  data
+}
+
+recode_missing_999 <- function(data, missing_code = -999) {
+  data[] <- lapply(data, function(x) {
+    if (is.numeric(x)) {
+      x[x == missing_code] <- NA
+    }
+    x
+  })
+  data
+}
+
+as_plain_numeric <- function(x) {
+  if (!haven::is.labelled(x)) return(x)
+  variable_label <- attr(x, "label", exact = TRUE)
+  out <- as.numeric(x)
+  if (!is.null(variable_label)) attr(out, "label") <- variable_label
+  out
+}
+
+duplicate_key_summary <- function(data, keys) {
+  duplicate_groups <- data |>
+    dplyr::count(dplyr::across(dplyr::all_of(keys)), name = "n") |>
+    dplyr::filter(n > 1L)
+  data.frame(
+    key = paste(keys, collapse = " + "),
+    duplicate_groups = nrow(duplicate_groups),
+    rows_in_duplicate_groups = sum(duplicate_groups$n),
+    stringsAsFactors = FALSE
+  )
+}
+
+source_summary <- function(raw, clean, id_var, level) {
+  data.frame(
+    level = level,
+    raw_rows = nrow(raw),
+    raw_columns = ncol(raw),
+    clean_rows = nrow(clean),
+    clean_columns = ncol(clean),
+    participants = dplyr::n_distinct(clean[[id_var]]),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+# Read source files
+
+All SAV files are read with `bruceR::import()`. Raw objects are retained in memory only for audit comparisons and
+are not saved to the output directory.
+
+```{r import}
+dat_baseline_raw <- bruceR::import(baseline_file)
+dat_daily_raw <- bruceR::import(daily_file)
+dat_ema_raw <- bruceR::import(ema_file)
+tracker_raw <- bruceR::import(tracker_file)
+
+data.frame(
+  source = c("baseline", "daily", "EMA", "tracker"),
+  rows = c(nrow(dat_baseline_raw), nrow(dat_daily_raw), nrow(dat_ema_raw), nrow(tracker_raw)),
+  columns = c(ncol(dat_baseline_raw), ncol(dat_daily_raw), ncol(dat_ema_raw), ncol(tracker_raw))
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "Import",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Baseline preprocessing
+
+All 405 baseline variables are retained. `pid` is renamed to `Name_ID`.
+Labelled demographic variables are converted to factors so their category
+labels remain interpretable; labelled scale/item variables are converted to
+plain numeric columns. The tracker is used only to derive questionnaire end
+date and analytic age within the baseline object.
+
+```{r baseline-clean}
+baseline_demographic_vars <- intersect(
+  c(
+    "Gender", "School", "Grade", "Ethnicity", "FamilyResidence",
+    "ParentsMaritalStatus", "ParentsHighestEdu", "TotalFamilyIncome",
+    "SilbingStructure", "NumOfChildsInFamliy", "PaternalEducation",
+    "PaternalOccupation", "MaternalEducation", "MaternalOccupation"
+  ),
+  names(dat_baseline_raw)
+)
+baseline_demographic_vars[baseline_demographic_vars == "SilbingStructure"] <- "SiblingStructure"
+
+dat_baseline <- recode_missing_999(dat_baseline_raw) |>
+  dplyr::rename(Name_ID = pid, SiblingStructure = SilbingStructure) |>
+  dplyr::mutate(
+    dplyr::across(dplyr::all_of(baseline_demographic_vars), ~ {
+      if (haven::is.labelled(.x)) haven::as_factor(.x) else .x
+    }),
+    dplyr::across(
+      -dplyr::all_of(c("Name_ID", "Name", "DateOfBirth", baseline_demographic_vars)),
+      as_plain_numeric
+    ),
+    Name_ID = as.numeric(Name_ID),
+    Name = as.character(Name),
+    DateOfBirth = as.Date(DateOfBirth)
+  )
+
+# Identifying correction values are supplied privately, never embedded in source.
+dat_baseline <- apply_private_baseline_corrections(
+  dat_baseline, private_corrections, phase = "name"
+)
+
+tracker <- tracker_raw |>
+  dplyr::transmute(
+    Tracker_ID = as.character(编号),
+    Name = as.character(姓名),
+    QuestionnaireStartDate = as.Date(问卷开始日期),
+    QuestionnaireEndDate = as.Date(问卷结束日期)
+  )
+
+if (anyDuplicated(tracker$Name)) {
+  stop("Tracker participant names are not unique; audit before deriving age.")
+}
+
+dat_baseline <- dat_baseline |>
+  dplyr::left_join(tracker, by = "Name") |>
+  dplyr::mutate(
+    AgeInDays = as.numeric(QuestionnaireEndDate - DateOfBirth),
+    AgeInYears = AgeInDays / 365.25
+  )
+dat_baseline <- apply_private_baseline_corrections(
+  dat_baseline, private_corrections, phase = "age"
+) |>
+  dplyr::arrange(Name_ID)
+```
+
+## Baseline audit
+
+```{r baseline-audit}
+baseline_duplicates <- duplicate_key_summary(dat_baseline, "Name_ID")
+baseline_unmatched_tracker <- dat_baseline |>
+  dplyr::filter(is.na(QuestionnaireEndDate)) |>
+  dplyr::select(Name_ID, Name)
+
+baseline_duplicates |>
+  knitr::kable(
+    format = "html",
+    caption = "Baseline audit",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+baseline_unmatched_tracker |>
+  knitr::kable(
+    format = "html",
+    caption = "Baseline audit (2)",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+
+dat_baseline |>
+  dplyr::summarise(
+    participants = dplyr::n_distinct(Name_ID),
+    missing_id = sum(is.na(Name_ID)),
+    missing_age = sum(is.na(AgeInYears)),
+    minimum_age = min(AgeInYears, na.rm = TRUE),
+    maximum_age = max(AgeInYears, na.rm = TRUE),
+    age_below_18 = sum(AgeInYears < 18, na.rm = TRUE)
+  ) |>
+  knitr::kable(
+    format = "html",
+    caption = "Baseline audit (3)",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Daily-diary preprocessing
+
+The daily data remain at person-day level. All columns are retained, `-999` is
+converted to `NA`, labelled numeric columns are converted to plain numeric, and
+the existing source-derived variables are preserved without recalculation.
+
+```{r daily-clean}
+dat_daily <- recode_missing_999(dat_daily_raw)
+dat_daily[] <- lapply(dat_daily, as_plain_numeric)
+dat_daily <- dat_daily |>
+  dplyr::mutate(
+    Data_ID = as.numeric(Data_ID),
+    Name_ID = as.numeric(Name_ID),
+    Day = as.integer(Day)
+  ) |>
+  dplyr::arrange(Name_ID, Day)
+
+daily_duplicates <- duplicate_key_summary(dat_daily, c("Name_ID", "Day"))
+daily_duplicates |>
+  knitr::kable(
+    format = "html",
+    caption = "Daily clean",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+
+dat_daily |>
+  dplyr::summarise(
+    participants = dplyr::n_distinct(Name_ID),
+    person_days = dplyr::n(),
+    minimum_day = min(Day, na.rm = TRUE),
+    maximum_day = max(Day, na.rm = TRUE),
+    missing_id = sum(is.na(Name_ID)),
+    missing_day = sum(is.na(Day))
+  ) |>
+  knitr::kable(
+    format = "html",
+    caption = "Daily clean (2)",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# EMA preprocessing
+
+The EMA data remain at prompt level. All columns are retained, `-999` is
+converted to `NA`, and labelled numeric columns are converted to plain numeric.
+No daily aggregation or new scale construction is performed.
+
+```{r ema-clean}
+dat_ema <- recode_missing_999(dat_ema_raw)
+dat_ema[] <- lapply(dat_ema, as_plain_numeric)
+dat_ema <- dat_ema |>
+  dplyr::mutate(
+    Data_ID = as.numeric(Data_ID),
+    Name_ID = as.numeric(Name_ID),
+    Day = as.integer(Day),
+    Time = as.integer(Time)
+  ) |>
+  dplyr::arrange(Name_ID, Day, Time)
+
+ema_prompt_duplicates <- duplicate_key_summary(dat_ema, c("Name_ID", "Day", "Time"))
+ema_prompt_duplicates |>
+  knitr::kable(
+    format = "html",
+    caption = "Ema clean",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+
+dat_ema |>
+  dplyr::summarise(
+    participants = dplyr::n_distinct(Name_ID),
+    prompts = dplyr::n(),
+    person_days = dplyr::n_distinct(paste(Name_ID, Day)),
+    minimum_day = min(Day, na.rm = TRUE),
+    maximum_day = max(Day, na.rm = TRUE),
+    minimum_time = min(Time, na.rm = TRUE),
+    maximum_time = max(Time, na.rm = TRUE),
+    missing_id = sum(is.na(Name_ID)),
+    missing_day = sum(is.na(Day)),
+    missing_time = sum(is.na(Time))
+  ) |>
+  knitr::kable(
+    format = "html",
+    caption = "Ema clean (2)",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Cross-source ID audit without merging
+
+This comparison does not combine rows or columns. It only checks whether the
+three independently cleaned sources contain the same participant IDs.
+
+```{r id-audit}
+id_sets <- list(
+  baseline = sort(unique(dat_baseline$Name_ID)),
+  daily = sort(unique(dat_daily$Name_ID)),
+  EMA = sort(unique(dat_ema$Name_ID))
+)
+
+id_audit <- list(
+  baseline_not_daily = setdiff(id_sets$baseline, id_sets$daily),
+  daily_not_baseline = setdiff(id_sets$daily, id_sets$baseline),
+  EMA_not_daily = setdiff(id_sets$EMA, id_sets$daily),
+  daily_not_EMA = setdiff(id_sets$daily, id_sets$EMA)
+)
+
+data.frame(
+  comparison = names(id_audit),
+  unmatched_count = lengths(id_audit),
+  unmatched_ids = vapply(id_audit, function(ids) paste(ids, collapse = ", "), character(1)),
+  stringsAsFactors = FALSE
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "Id audit",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Save clean component RDA files
+
+Each source is saved separately for focused inspection. A combined RDA file is
+also provided for convenience; it contains three separate R objects and does
+not contain a merged data frame.
+
+```{r validate-and-save}
+stopifnot(
+  baseline_duplicates$duplicate_groups == 0L,
+  daily_duplicates$duplicate_groups == 0L,
+  ema_prompt_duplicates$duplicate_groups == 0L,
+  !anyNA(dat_baseline$Name_ID),
+  !anyNA(dat_daily[c("Name_ID", "Day")]),
+  !anyNA(dat_ema[c("Name_ID", "Day", "Time")])
+)
+
+baseline_output <- file.path(out_dir, "dat_baseline_clean.rda")
+daily_output <- file.path(out_dir, "dat_daily_clean.rda")
+ema_output <- file.path(out_dir, "dat_ema_clean.rda")
+components_output <- file.path(out_dir, "dat_clean_components.rda")
+
+if (isTRUE(params$write_artifacts)) {
+  save(dat_baseline, file = baseline_output, compress = "xz")
+  save(dat_daily, file = daily_output, compress = "xz")
+  save(dat_ema, file = ema_output, compress = "xz")
+  save(dat_baseline, dat_daily, dat_ema, file = components_output, compress = "xz")
+}
+
+output_manifest <- data.frame(
+  file = normalizePath(
+    c(baseline_output, daily_output, ema_output, components_output),
+    winslash = "/",
+    mustWork = TRUE
+  ),
+  objects = c("dat_baseline", "dat_daily", "dat_ema", "dat_baseline; dat_daily; dat_ema"),
+  stringsAsFactors = FALSE
+)
+output_manifest$bytes <- file.info(output_manifest$file)$size
+output_manifest |>
+  knitr::kable(
+    format = "html",
+    caption = "Validate and save",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```

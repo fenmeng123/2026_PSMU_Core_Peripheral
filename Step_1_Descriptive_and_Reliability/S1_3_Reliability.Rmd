@@ -1,0 +1,883 @@
+---
+title: "S1.3 Reliability analysis"
+author: "Kunru Song"
+date: "2026-09-14"
+params:
+  write_artifacts: true
+output:
+  html_document:
+    md_extensions: "-markdown_in_html_blocks"
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+
+<style>
+/* Keep wide audit/correlation tables within the report column. */
+.main-container table.table { display: block; max-width: 100%; overflow-x: auto; }
+.main-container table.table th, .main-container table.table td { padding: 6px 9px; }
+.main-container table.table td { white-space: nowrap; }
+.main-container table.table th:first-child, .main-container table.table td:first-child { min-width: 140px; }
+.main-container table.item-description-table td:nth-child(3) { white-space: normal; min-width: 320px; max-width: 320px; }
+.main-container table.table caption { text-align: left; font-weight: 600; color: #333; }
+</style>
+
+This report evaluates the reliability of the focal psychometric item sets in
+`Res_2_Data_for_Analysis/dat_focal_analysis.rda`, the canonical analysis-entry
+file created by S1.2.
+
+Baseline reliability is estimated at the participant level using Cronbach's
+alpha and McDonald's omega from the `psych` package. EMA reliability is
+estimated at the prompt-within-person and person-between levels using
+`multilevelTools::omegaSEM()`. The CRAN package named `multilevel` does not
+provide a multilevel omega function; `omegaSEM()` is implemented in
+`multilevelTools`.
+
+The EMA analyses cover the six-item PSMU and Psychological Distress item sets,
+the Core and Peripheral PSMU subdimensions, and the three two-item Psychological
+Distress subdomains: Depressive symptoms, Anxiety symptoms, and Perceived stress.
+All seven item sets are included in the final reliability summary.
+
+No scale total, scale mean, daily aggregate, or new analysis RDA is created by
+this report.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA
+)
+
+required_packages <- c(
+  "dplyr",
+  "GPArotation",
+  "knitr",
+  "lavaan",
+  "multilevelTools",
+  "openxlsx",
+  "psych",
+  "readxl",
+  "rmarkdown",
+  "xml2",
+  "zip"
+)
+package_available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(package_available)) {
+  stop("Missing required R packages: ", paste(names(package_available)[!package_available], collapse = ", "))
+}
+
+locate_project_root <- function(start = getwd()) {
+  candidate <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(candidate)) candidate <- dirname(candidate)
+  repeat {
+    if (all(dir.exists(file.path(candidate, c(
+      "Step_1_Descriptive_and_Reliability", "Step_2_Measurement_Models"
+    ))))) return(candidate)
+    parent <- dirname(candidate)
+    if (identical(parent, candidate)) break
+    candidate <- parent
+  }
+  stop("Could not identify the project root from the public Step folders")
+}
+
+input_context <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(
+  if (length(input_context) == 1L && !is.na(input_context) && nzchar(input_context)) {
+    input_context
+  } else getwd()
+)
+knitr::opts_knit$set(root.dir = project_root)
+
+input_file <- file.path(project_root, "Res_2_Data_for_Analysis", "dat_focal_analysis.rda")
+excel_output <- file.path(project_root, "Res_3_Results", "Table_S1_3_Reliability.xlsx")
+if (!file.exists(input_file)) stop("Missing canonical analysis-entry RDA: ", input_file)
+```
+
+# Load and validate analysis data
+
+```{r load-and-validate}
+input_environment <- new.env(parent = emptyenv())
+loaded_objects <- load(input_file, envir = input_environment)
+if (!identical(loaded_objects, "dat_focal_analysis")) {
+  stop("The analysis-entry RDA must contain only dat_focal_analysis.")
+}
+dat_focal_analysis <- input_environment$dat_focal_analysis
+
+stopifnot(
+  nrow(dat_focal_analysis) == 18810L,
+  dplyr::n_distinct(dat_focal_analysis$Name_ID) == 209L,
+  anyDuplicated(dat_focal_analysis[c("Name_ID", "Day", "Time")]) == 0L,
+  !anyNA(dat_focal_analysis[c("Name_ID", "Day", "Time")])
+)
+
+data.frame(
+  rows = nrow(dat_focal_analysis),
+  columns = ncol(dat_focal_analysis),
+  participants = dplyr::n_distinct(dat_focal_analysis$Name_ID),
+  person_days = dplyr::n_distinct(paste(dat_focal_analysis$Name_ID, dat_focal_analysis$Day)),
+  observation_level = "EMA prompt",
+  stringsAsFactors = FALSE
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "Load and validate",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Reliability specifications
+
+```{r scale-specifications}
+baseline_scale_items <- list(
+  `Trait PSMU (18-item BSMAS)` = paste0("V_BSMAS_", 1:18),
+  `Depression (7 selected CES-D items)` = paste0("K_CESD_", 1:7),
+  `Anxiety (7 selected DASS items)` = paste0("L_DASS_", 1:7),
+  `Perceived stress (PSS-10)` = paste0("M_PSS_", 1:10)
+)
+
+baseline_reverse_keys <- list(
+  `Trait PSMU (18-item BSMAS)` = character(0),
+  `Depression (7 selected CES-D items)` = character(0),
+  `Anxiety (7 selected DASS items)` = character(0),
+  `Perceived stress (PSS-10)` = paste0("M_PSS_", c(4, 5, 7, 8))
+)
+
+ema_scale_items <- list(
+  `Momentary PSMU (6 items)` = paste0("PMU", 1:6),
+  `EMA Psychological Distress (6 items)` = paste0("DASS", 1:6)
+)
+
+ema_psmu_subdimension_items <- list(
+  `Core PSMU symptoms` = paste0("PMU", 3:6),
+  `Peripheral PSMU symptoms` = c("PMU1", "PMU2")
+)
+
+ema_distress_subdomain_items <- list(
+  `Depressive symptoms` = c("DASS5", "DASS6"),
+  `Anxiety symptoms` = c("DASS3", "DASS4"),
+  `Perceived stress` = c("DASS1", "DASS2")
+)
+
+all_required_items <- unique(c(
+  unlist(baseline_scale_items), unlist(ema_scale_items),
+  unlist(ema_psmu_subdimension_items),
+  unlist(ema_distress_subdomain_items)
+))
+missing_items <- setdiff(all_required_items, names(dat_focal_analysis))
+if (length(missing_items)) {
+  stop("Missing reliability items: ", paste(missing_items, collapse = ", "))
+}
+
+data.frame(
+  level = c(
+    rep("Baseline", length(baseline_scale_items)),
+    rep("EMA total scale", length(ema_scale_items)),
+    rep("EMA PSMU subdimension", length(ema_psmu_subdimension_items)),
+    rep("EMA distress subdomain", length(ema_distress_subdomain_items))
+  ),
+  scale = c(names(baseline_scale_items), names(ema_scale_items),
+            names(ema_psmu_subdimension_items), names(ema_distress_subdomain_items)),
+  item_count = c(lengths(baseline_scale_items), lengths(ema_scale_items),
+                 lengths(ema_psmu_subdimension_items), lengths(ema_distress_subdomain_items)),
+  method = c(
+    rep("psych::alpha() and psych::omega()", length(baseline_scale_items)),
+    rep("multilevelTools::omegaSEM()", length(ema_scale_items) +
+          length(ema_psmu_subdimension_items) + length(ema_distress_subdomain_items))
+  ),
+  stringsAsFactors = FALSE
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "Scale specifications",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Helper functions
+
+```{r helpers}
+run_baseline_reliability <- function(data, scale_name, items) {
+  item_data <- data[, items, drop = FALSE]
+  n_complete <- sum(stats::complete.cases(item_data))
+
+  alpha_fit <- psych::alpha(
+    item_data,
+    check.keys = FALSE,
+    warnings = FALSE,
+    na.rm = TRUE
+  )
+
+  omega_fit <- suppressWarnings(
+    psych::omega(
+      item_data,
+      nfactors = 1,
+      plot = FALSE,
+      title = scale_name
+    )
+  )
+
+  summary <- data.frame(
+    scale = scale_name,
+    items = length(items),
+    participants = nrow(item_data),
+    complete_cases = n_complete,
+    cronbach_alpha_raw = alpha_fit$total$raw_alpha,
+    cronbach_alpha_standardized = alpha_fit$total$std.alpha,
+    guttman_lambda_6 = alpha_fit$total[["G6(smc)"]],
+    average_interitem_correlation = alpha_fit$total$average_r,
+    mcdonald_omega_total = omega_fit$omega.tot,
+    stringsAsFactors = FALSE
+  )
+
+  alpha_if_deleted <- data.frame(
+    scale = scale_name,
+    item_deleted = rownames(alpha_fit$alpha.drop),
+    alpha_raw_if_deleted = alpha_fit$alpha.drop$raw_alpha,
+    alpha_standardized_if_deleted = alpha_fit$alpha.drop$std.alpha,
+    stringsAsFactors = FALSE,
+    row.names = NULL
+  )
+
+  list(summary = summary, alpha_if_deleted = alpha_if_deleted)
+}
+
+run_multilevel_omega <- function(data, scale_name, items, require_saturated = FALSE) {
+  complete_rows <- stats::complete.cases(data[, c("Name_ID", items), drop = FALSE])
+  n_complete_prompts <- sum(complete_rows)
+  n_complete_people <- dplyr::n_distinct(data$Name_ID[complete_rows])
+
+  omega_fit <- multilevelTools::omegaSEM(
+    items = items,
+    id = "Name_ID",
+    data = data,
+    savemodel = TRUE
+  )
+
+  if (!isTRUE(lavaan::lavInspect(omega_fit$Fit, "converged"))) {
+    stop("Multilevel omega model did not converge for: ", scale_name)
+  }
+
+  # Retain the original two-item diagnostic internally; do not report fit indices.
+  if (isTRUE(require_saturated)) {
+    model_df <- unname(lavaan::fitMeasures(omega_fit$Fit, "df"))
+    if (!isTRUE(all.equal(as.numeric(model_df), 0))) {
+      stop("Expected a saturated two-item model for: ", scale_name)
+    }
+  }
+
+  reliability <- omega_fit$Results |>
+    dplyr::transmute(
+      scale = scale_name,
+      level = dplyr::recode(label, omega_within = "Within person", omega_between = "Between person"),
+      omega = est,
+      ci_lower = ci.lower,
+      ci_upper = ci.upper,
+      items = length(items),
+      complete_prompts = n_complete_prompts,
+      participants_with_complete_prompt = n_complete_people
+    )
+
+  list(reliability = reliability, model = omega_fit$Fit)
+}
+```
+
+# Baseline
+
+Baseline variables are repeated across EMA prompts in the analysis-entry file.
+They are therefore reduced to one verified-constant row per participant before
+reliability estimation.
+
+## Prepare participant-level item data
+
+PSS items 4, 5, 7, and 8 are reverse-keyed in the focal-variable Word document.
+The observed response range is 1-5, so the temporary reliability copy applies
+`6 - x`. These recoded values are used only within S1.3 and are not written back
+to `dat_focal_analysis.rda`.
+
+```{r baseline-preparation}
+baseline_item_names <- unique(unlist(baseline_scale_items))
+
+baseline_constancy <- vapply(
+  baseline_item_names,
+  function(variable) {
+    max(vapply(
+      split(dat_focal_analysis[[variable]], dat_focal_analysis$Name_ID),
+      function(x) length(unique(x[!is.na(x)])),
+      integer(1)
+    ))
+  },
+  integer(1)
+)
+if (any(baseline_constancy > 1L)) {
+  stop("Baseline items vary within participant: ", paste(names(baseline_constancy)[baseline_constancy > 1L], collapse = ", "))
+}
+
+dat_baseline_reliability <- dat_focal_analysis |>
+  dplyr::distinct(Name_ID, .keep_all = TRUE) |>
+  dplyr::select(Name_ID, dplyr::all_of(baseline_item_names)) |>
+  dplyr::arrange(Name_ID)
+
+pss_reverse_items <- baseline_reverse_keys[["Perceived stress (PSS-10)"]]
+dat_baseline_reliability <- dat_baseline_reliability |>
+  dplyr::mutate(dplyr::across(dplyr::all_of(pss_reverse_items), ~ 6 - .x))
+
+stopifnot(
+  nrow(dat_baseline_reliability) == 209L,
+  dplyr::n_distinct(dat_baseline_reliability$Name_ID) == 209L
+)
+
+data.frame(
+  participants = nrow(dat_baseline_reliability),
+  baseline_items = length(baseline_item_names),
+  reverse_scored_for_reliability = paste(pss_reverse_items, collapse = ", "),
+  saved_to_analysis_rda = "No",
+  stringsAsFactors = FALSE
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "Baseline preparation",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+## Cronbach alpha and McDonald omega
+
+McDonald's omega is estimated as a one-factor omega total for each prespecified
+item set. The result should be interpreted together with the construct's known
+content structure rather than as proof of unidimensionality.
+
+```{r baseline-reliability}
+baseline_reliability_objects <- lapply(names(baseline_scale_items), function(scale_name) {
+  run_baseline_reliability(
+    data = dat_baseline_reliability,
+    scale_name = scale_name,
+    items = baseline_scale_items[[scale_name]]
+  )
+})
+
+baseline_reliability_summary <- dplyr::bind_rows(
+  lapply(baseline_reliability_objects, `[[`, "summary")
+)
+
+baseline_alpha_if_deleted <- dplyr::bind_rows(
+  lapply(baseline_reliability_objects, `[[`, "alpha_if_deleted")
+)
+
+baseline_reliability_summary |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 3))) |>
+  knitr::kable(
+    format = "html",
+    caption = "Baseline reliability",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+## Alpha if item deleted
+
+```{r baseline-alpha-if-deleted}
+baseline_alpha_if_deleted |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 3))) |>
+  knitr::kable(
+    format = "html",
+    caption = "Baseline alpha if deleted",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# EMA
+
+EMA data remain at the prompt level, with prompts nested within `Name_ID`.
+Multilevel omega is estimated separately at the within-person and between-person
+levels using a two-level single-factor SEM for each item set.
+
+The models use the original 1-5 item responses as continuous indicators. The
+`omegaSEM()` function delegates estimation to `lavaan::sem()` with ML and
+listwise missing-data handling, so each model uses prompts complete on its own
+item set. It fixes the factor variance to one at each level and constrains
+item residual variances to be positive. Reported 95% confidence intervals use
+the default normal-theory intervals for the defined omega parameters.
+
+The use-time and use-frequency variables represent distinct behavior categories
+(messaging, posting, and browsing), not exchangeable indicators of a single
+reflective construct, so internal-consistency reliability is not estimated for
+them.
+
+## Multilevel omega
+
+```{r ema-multilevel-omega}
+ema_reliability_objects <- lapply(names(ema_scale_items), function(scale_name) {
+  run_multilevel_omega(
+    data = dat_focal_analysis,
+    scale_name = scale_name,
+    items = ema_scale_items[[scale_name]]
+  )
+})
+
+ema_multilevel_omega <- dplyr::bind_rows(
+  lapply(ema_reliability_objects, `[[`, "reliability")
+)
+
+ema_multilevel_omega |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 3))) |>
+  knitr::kable(
+    format = "html",
+    caption = "Multilevel omega for EMA PSMU and Psychological Distress",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+## Multilevel Omegas for Core and Peripheral PSMU Symptoms
+
+Core comprises PMU3 mood modification, PMU4 relapse, PMU5 withdrawal, and PMU6
+conflict. Peripheral comprises PMU1 salience and PMU2 tolerance. These are
+prespecified groups of state manifestations. The same `run_multilevel_omega()`
+helper used for the total scales estimates each subdimension directly from the
+canonical prompt-level item data, without constructing scores or daily means.
+
+```{r ema-psmu-subdimension-specifications}
+data.frame(
+  subdimension = names(ema_psmu_subdimension_items),
+  items = vapply(ema_psmu_subdimension_items, paste, collapse = ", ", character(1)),
+  item_count = lengths(ema_psmu_subdimension_items),
+  method = "multilevelTools::omegaSEM()",
+  stringsAsFactors = FALSE
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "Core and Peripheral PSMU subdimension specifications",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+```{r ema-psmu-subdimension-omega}
+ema_psmu_subdimension_objects <- lapply(names(ema_psmu_subdimension_items), function(subdimension_name) {
+  items <- ema_psmu_subdimension_items[[subdimension_name]]
+  run_multilevel_omega(
+    data = dat_focal_analysis,
+    scale_name = subdimension_name,
+    items = items,
+    require_saturated = length(items) == 2L
+  )
+})
+
+ema_psmu_subdimension_omega <- dplyr::bind_rows(
+  lapply(ema_psmu_subdimension_objects, `[[`, "reliability")
+)
+
+stopifnot(
+  nrow(ema_psmu_subdimension_omega) == 4L,
+  all(ema_psmu_subdimension_omega$participants_with_complete_prompt == 209L),
+  all(is.finite(as.matrix(ema_psmu_subdimension_omega[c("omega", "ci_lower", "ci_upper")]))),
+  all(ema_psmu_subdimension_omega$ci_lower <= ema_psmu_subdimension_omega$omega),
+  all(ema_psmu_subdimension_omega$omega <= ema_psmu_subdimension_omega$ci_upper)
+)
+
+ema_psmu_subdimension_omega |>
+  dplyr::select(
+    subdimension = scale, level, items, complete_prompts,
+    participants_with_complete_prompt, omega, ci_lower, ci_upper
+  ) |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 3))) |>
+  knitr::kable(
+    format = "html",
+    caption = "Multilevel omega and 95% confidence intervals for Core and Peripheral PSMU symptoms",
+    col.names = c("Subdimension", "Level", "Items", "Complete prompts", "Participants", "Omega", "95% CI lower", "95% CI upper"),
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+For Peripheral, `omegaSEM()` identifies the two-item model by constraining its
+loadings equal separately at the within-person and between-person levels. This
+essential tau-equivalence assumption is not tested by the saturated model.
+Core's four loadings are freely estimated at each level. High omega alone does
+not establish unidimensionality or a formal Core-versus-Peripheral difference.
+
+## Multilevel Omegas for EMA Psychological Distress Subdomains
+
+The three prespecified two-item subdomains retain the same item grouping and
+estimation settings as the total-scale analyses. No domain score is created:
+each model receives the canonical prompt-level item data with missing values
+retained and prompts nested within `Name_ID`. The reported complete-prompt
+counts describe each model's own listwise-complete estimation sample.
+
+```{r ema-distress-subdomain-specifications}
+data.frame(
+  subdomain = names(ema_distress_subdomain_items),
+  items = vapply(ema_distress_subdomain_items, paste, collapse = ", ", character(1)),
+  item_count = lengths(ema_distress_subdomain_items),
+  method = "multilevelTools::omegaSEM()",
+  stringsAsFactors = FALSE
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "EMA Psychological Distress subdomain specifications",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+```{r ema-distress-subdomain-omega}
+ema_distress_subdomain_objects <- lapply(names(ema_distress_subdomain_items), function(subdomain_name) {
+  run_multilevel_omega(
+    data = dat_focal_analysis,
+    scale_name = subdomain_name,
+    items = ema_distress_subdomain_items[[subdomain_name]],
+    require_saturated = TRUE
+  )
+})
+
+ema_distress_subdomain_omega <- dplyr::bind_rows(
+  lapply(ema_distress_subdomain_objects, `[[`, "reliability")
+)
+
+stopifnot(
+  nrow(ema_distress_subdomain_omega) == 6L,
+  all(ema_distress_subdomain_omega$participants_with_complete_prompt == 209L),
+  all(is.finite(as.matrix(ema_distress_subdomain_omega[c("omega", "ci_lower", "ci_upper")]))),
+  all(ema_distress_subdomain_omega$ci_lower <= ema_distress_subdomain_omega$omega),
+  all(ema_distress_subdomain_omega$omega <= ema_distress_subdomain_omega$ci_upper)
+)
+
+ema_distress_subdomain_omega |>
+  dplyr::select(
+    subdomain = scale, level, items, complete_prompts,
+    participants_with_complete_prompt, omega, ci_lower, ci_upper
+  ) |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 3))) |>
+  knitr::kable(
+    format = "html",
+    caption = "Multilevel omega and 95% confidence intervals for EMA Psychological Distress subdomains",
+    col.names = c("Subdomain", "Level", "Items", "Complete prompts", "Participants", "Omega", "95% CI lower", "95% CI upper"),
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+Each subdomain has only two items, with loadings constrained equal separately
+at each level, and a saturated two-level model. Its omega
+estimates summarize reliability; they do not establish unidimensionality or
+measurement-model adequacy. Convergence and the expected saturation are checked
+in code, without a model-fit table.
+
+Within-person omega concerns occasion-to-occasion variation within participants;
+between-person omega concerns differences in participants' average levels and
+should not be interpreted as single-prompt reliability. All 209 participants
+contribute at least one complete prompt to each subdomain. Some participants
+have no within-person variation on individual items; this does not imply that
+they were excluded, but warrants interpreting reliability alongside the item
+distributions.
+
+# Reliability Summary
+
+Baseline reliability is reported for four participant-level item sets. The EMA
+summary covers both six-item total scales, Core and Peripheral PSMU, and all
+three two-item Psychological Distress subdomains, with separate within-person
+and between-person estimates (14 coefficients across seven item sets).
+High reliability alone does not demonstrate a single underlying dimension.
+
+## Baseline reliability
+
+```{r final-summary}
+baseline_reliability_summary |>
+  dplyr::select(
+    scale,
+    items,
+    participants,
+    complete_cases,
+    cronbach_alpha = cronbach_alpha_raw,
+    mcdonald_omega = mcdonald_omega_total
+  ) |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 3))) |>
+  knitr::kable(
+    format = "html",
+    caption = "Baseline reliability summary",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+## EMA reliability
+
+```{r final-ema-reliability-summary}
+ema_reliability_summary <- dplyr::bind_rows(
+  ema_multilevel_omega,
+  ema_psmu_subdimension_omega,
+  ema_distress_subdomain_omega
+)
+
+stopifnot(
+  nrow(ema_reliability_summary) == 14L,
+  dplyr::n_distinct(ema_reliability_summary$scale) == 7L,
+  anyDuplicated(ema_reliability_summary[c("scale", "level")]) == 0L
+)
+
+ema_reliability_summary |>
+  dplyr::select(scale, level, items, complete_prompts, participants_with_complete_prompt, omega, ci_lower, ci_upper) |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 3))) |>
+  knitr::kable(
+    format = "html",
+    caption = "EMA reliability summary: two total scales, Core and Peripheral PSMU, and three Psychological Distress subdomains",
+    col.names = c("Scale or subdomain", "Level", "Items", "Complete prompts", "Participants", "Omega", "95% CI lower", "95% CI upper"),
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Excel results
+
+The tables above are exported to
+`Res_3_Results/Table_S1_3_Reliability.xlsx`. The two sheets are `Baseline`
+(scale reliability and alpha if item deleted) and `EMA` (the two total scales,
+Core and Peripheral PSMU, and three distress subdomains; 14 level-specific rows).
+No measurement-model fit table is exported.
+Numeric estimates retain their available precision; Excel formats control
+display rounding. `write_artifacts: false` disables only file writes, not the
+analyses earlier in this report.
+
+```{r export-excel}
+if (isTRUE(params$write_artifacts)) {
+  # Retain an existing report's layout when its baseline results are unchanged.
+  # A fresh checkout falls through to the self-contained workbook export below.
+  update_existing_ema <- function(path, baseline, item_deleted, ema) {
+    if (!file.exists(path)) return(FALSE)
+    same_values <- function(x, y) {
+      identical(dim(x), dim(y)) && all(vapply(seq_len(ncol(x)), function(j) {
+        isTRUE(all.equal(x[[j]], y[[j]], tolerance = 0, check.attributes = FALSE))
+      }, logical(1)))
+    }
+    read_block <- function(sheet, range) as.data.frame(readxl::read_xlsx(
+      path, sheet = sheet, range = range, .name_repair = "minimal"))
+    compatible <- tryCatch(
+      identical(readxl::excel_sheets(path), c("Baseline", "EMA")) &&
+        same_values(read_block("Baseline", "A5:I9"), baseline) &&
+        same_values(read_block("Baseline", "A12:D54"), item_deleted) &&
+        identical(names(read_block("EMA", "A5:H9")), c(
+          "Scale", "Level", "Items", "Complete prompts", "Participants",
+          "Omega", "95% CI lower", "95% CI upper")),
+      error = function(e) FALSE)
+    if (!compatible) return(FALSE)
+    scratch <- tempfile("s1_3_excel_")
+    dir.create(scratch)
+    on.exit(unlink(scratch, recursive = TRUE), add = TRUE)
+    members <- utils::unzip(path, list = TRUE)$Name
+    stopifnot(!any(grepl("(^/|^[A-Za-z]:|(^|/)\\.\\.(/|$)|\\\\)", members)))
+    utils::unzip(path, exdir = scratch)
+    worksheet <- file.path(scratch, "xl/worksheets/sheet2.xml")
+    doc <- xml2::read_xml(worksheet)
+    ns <- c(x = "http://schemas.openxmlformats.org/spreadsheetml/2006/main")
+    rows <- xml2::xml_find_first(doc, ".//x:sheetData", ns)
+    template <- xml2::xml_find_first(rows, "x:row[@r='9']", ns)
+    stopifnot(!inherits(template, "xml_missing"), nrow(ema) == 14L, ncol(ema) == 8L)
+    if (length(xml2::xml_find_all(template, "x:c[@t='str']", ns)) != 2L) return(FALSE)
+    # Preserve total-scale values; synchronize their labels with the report.
+    old_ema <- read_block("EMA", "A5:H9")
+    if (!same_values(old_ema[-1L], ema[1:4, -1L])) return(FALSE)
+    for (index in seq_len(4L)) {
+      label_cell <- xml2::xml_find_first(rows, paste0(
+        "x:row/x:c[@r='A", index + 5L, "']/x:v"), ns)
+      stopifnot(!inherits(label_cell, "xml_missing"))
+      xml2::xml_text(label_cell) <- as.character(ema[[1L]][index])
+    }
+    xml2::xml_remove(xml2::xml_find_all(rows, "x:row[number(@r) >= 10]", ns))
+    merges <- xml2::xml_find_all(doc, ".//x:mergeCells/x:mergeCell", ns)
+    for (merge in merges) {
+      span <- strsplit(xml2::xml_attr(merge, "ref"), ":", fixed = TRUE)[[1L]]
+      if (max(as.integer(gsub("[A-Z]", "", span))) >= 10L) xml2::xml_remove(merge)
+    }
+    merge_parent <- xml2::xml_find_first(doc, ".//x:mergeCells", ns)
+    if (!inherits(merge_parent, "xml_missing")) {
+      xml2::xml_set_attr(merge_parent, "count", length(xml2::xml_children(merge_parent)))
+    }
+    for (index in seq.int(5L, nrow(ema))) {
+      row_number <- index + 5L
+      row <- xml2::xml_add_child(rows, template, .copy = TRUE)
+      xml2::xml_set_attr(row, "r", row_number)
+      cells <- xml2::xml_find_all(row, "x:c", ns)
+      stopifnot(length(cells) == 8L)
+      for (column in seq_len(8L)) {
+        cell <- cells[[column]]
+        xml2::xml_set_attr(cell, "r", paste0(LETTERS[column], row_number))
+        value <- ema[[column]][index]
+        if (column <= 2L) {
+          target <- xml2::xml_find_first(cell, "x:v", ns)
+          stopifnot(!inherits(target, "xml_missing"), !is.na(value))
+          xml2::xml_text(target) <- as.character(value)
+        } else {
+          target <- xml2::xml_find_first(cell, "x:v", ns)
+          stopifnot(!inherits(target, "xml_missing"), is.finite(value))
+          xml2::xml_text(target) <- sprintf("%.17g", value)
+        }
+      }
+    }
+    dimension <- xml2::xml_find_first(doc, ".//x:dimension", ns)
+    if (!inherits(dimension, "xml_missing")) {
+      xml2::xml_set_attr(dimension, "ref", paste0("A1:H", nrow(ema) + 5L))
+    }
+    xml2::write_xml(doc, worksheet)
+    candidate <- file.path(scratch, "updated.xlsx")
+    zip::zipr(candidate, files = members, root = scratch,
+              include_directories = FALSE, mode = "mirror")
+    reloaded <- as.data.frame(readxl::read_xlsx(candidate, sheet = "EMA",
+      range = paste0("A5:H", nrow(ema) + 5L), .name_repair = "minimal"))
+    stopifnot(same_values(reloaded, ema), file.info(candidate)$size > 1000,
+              file.copy(candidate, path, overwrite = TRUE))
+    TRUE
+  }
+  ema_export <- ema_reliability_summary[c("scale", "level", "items", "complete_prompts",
+    "participants_with_complete_prompt", "omega", "ci_lower", "ci_upper")]
+  if (!update_existing_ema(excel_output, baseline_reliability_summary,
+                          baseline_alpha_if_deleted, ema_export)) {
+  normalize_openxml_relationships <- function(path) {
+    # Remove only worksheet drawing/VML relationships whose internal targets
+    # are absent. Preserve valid drawings, external links and all other parts.
+    unpack_dir <- tempfile("s1_3_xlsx_")
+    dir.create(unpack_dir, recursive = TRUE)
+    on.exit(unlink(unpack_dir, recursive = TRUE, force = TRUE), add = TRUE)
+
+    members <- utils::unzip(path, list = TRUE)$Name
+    unsafe_member <- function(member) {
+      parts <- strsplit(gsub("\\\\", "/", member), "/", fixed = TRUE)[[1L]]
+      grepl("^[/\\\\]|^[A-Za-z]:", member) || any(parts == "..")
+    }
+    stopifnot(length(members) > 0L, !anyDuplicated(members),
+              !any(vapply(members, unsafe_member, logical(1))))
+    utils::unzip(path, exdir = unpack_dir)
+    relationship_files <- list.files(
+      file.path(unpack_dir, "xl", "worksheets", "_rels"),
+      pattern = "[.]rels$", full.names = TRUE
+    )
+    if (!length(relationship_files)) return(invisible(path))
+
+    resolve_member <- function(target) {
+      target <- gsub("\\\\", "/", utils::URLdecode(target))
+      if (!nzchar(target) || grepl("^[A-Za-z][A-Za-z0-9+.-]*:", target)) {
+        stop("Invalid internal drawing target")
+      }
+      parts <- strsplit(target, "/", fixed = TRUE)[[1L]]
+      result <- if (startsWith(target, "/")) character() else c("xl", "worksheets")
+      for (part in parts) {
+        if (!nzchar(part) || part == ".") next
+        if (part == "..") {
+          if (!length(result)) stop("Drawing target escapes the workbook package")
+          result <- head(result, -1L)
+        } else result <- c(result, part)
+      }
+      paste(result, collapse = "/")
+    }
+    drawing_types <- paste0(
+      "http://schemas.openxmlformats.org/officeDocument/2006/relationships/",
+      c("drawing", "vmlDrawing")
+    )
+    removed_relationships <- 0L
+    for (relationship_file in relationship_files) {
+      document <- xml2::read_xml(relationship_file, options = "NONET")
+      relationships <- xml2::xml_find_all(
+        document, "/*[local-name()='Relationships']/*[local-name()='Relationship']"
+      )
+      changed <- FALSE
+      for (relationship in relationships) {
+        type <- xml2::xml_attr(relationship, "Type")
+        external <- identical(xml2::xml_attr(relationship, "TargetMode"), "External")
+        if (!type %in% drawing_types || external) next
+        target <- xml2::xml_attr(relationship, "Target")
+        if (is.na(target)) stop("Drawing relationship is missing its Target")
+        if (!resolve_member(target) %in% members) {
+          xml2::xml_remove(relationship)
+          removed_relationships <- removed_relationships + 1L
+          changed <- TRUE
+        }
+      }
+      if (changed) xml2::write_xml(document, relationship_file)
+    }
+    if (removed_relationships == 0L) return(invisible(path))
+
+    normalized_file <- tempfile(fileext = ".xlsx")
+    on.exit(unlink(normalized_file, force = TRUE), add = TRUE)
+    zip::zipr(
+      normalized_file,
+      files = list.files(unpack_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE),
+      root = unpack_dir,
+      include_directories = FALSE,
+      mode = "mirror"
+    )
+    if (!file.copy(normalized_file, path, overwrite = TRUE)) {
+      stop("Could not replace the workbook with its normalized OpenXML package.")
+    }
+    unlink(normalized_file, force = TRUE)
+    invisible(path)
+  }
+
+  wb <- openxlsx::createWorkbook(creator = "Kunru Song")
+  header_style <- openxlsx::createStyle(textDecoration = "bold", wrapText = TRUE)
+  decimal_style <- openxlsx::createStyle(numFmt = "0.000")
+  integer_style <- openxlsx::createStyle(numFmt = "0")
+
+  write_result_section <- function(sheet, title, data, headers, start_row,
+                                   integer_columns = integer()) {
+    stopifnot(is.data.frame(data), ncol(data) == length(headers))
+    openxlsx::writeData(wb, sheet, title, startRow = start_row, colNames = FALSE)
+    names(data) <- headers
+    openxlsx::writeData(wb, sheet, data, startRow = start_row + 1L,
+                        rowNames = FALSE, headerStyle = header_style, keepNA = TRUE)
+    if (nrow(data)) {
+      rows <- seq.int(start_row + 2L, length.out = nrow(data))
+      numeric_columns <- which(vapply(data, is.numeric, logical(1)))
+      for (column in numeric_columns) {
+        openxlsx::addStyle(wb, sheet,
+          if (column %in% integer_columns) integer_style else decimal_style,
+          rows = rows, cols = column, gridExpand = TRUE, stack = TRUE)
+      }
+    }
+    start_row + nrow(data) + 4L
+  }
+
+  for (sheet in c("Baseline", "EMA")) {
+    openxlsx::addWorksheet(wb, sheet, gridLines = FALSE)
+    openxlsx::freezePane(wb, sheet, firstActiveRow = 3L)
+  }
+  next_row <- write_result_section("Baseline", "Baseline reliability",
+    baseline_reliability_summary,
+    c("Scale", "Items", "N", "Complete N", "Cronbach alpha", "Standardized alpha",
+      "Guttman lambda 6", "Average inter-item r", "McDonald omega"), 1L, 2:4)
+  write_result_section("Baseline", "Alpha if item deleted", baseline_alpha_if_deleted,
+    c("Scale", "Item deleted", "Raw alpha if deleted", "Standardized alpha if deleted"),
+    next_row)
+  write_result_section("EMA", "EMA multilevel reliability",
+    ema_reliability_summary[c("scale", "level", "items", "complete_prompts",
+      "participants_with_complete_prompt", "omega", "ci_lower", "ci_upper")],
+    c("Scale", "Level", "Items", "Complete prompts", "Participants", "Omega",
+      "95% CI lower", "95% CI upper"), 1L, 3:5)
+  for (sheet in c("Baseline", "EMA")) {
+    openxlsx::setColWidths(wb, sheet, cols = 1L, widths = 46)
+    openxlsx::setColWidths(wb, sheet, cols = 2:9, widths = 22)
+  }
+  dir.create(dirname(excel_output), recursive = TRUE, showWarnings = FALSE)
+  openxlsx::saveWorkbook(wb, excel_output, overwrite = TRUE)
+  normalize_openxml_relationships(excel_output)
+  }
+}
+```

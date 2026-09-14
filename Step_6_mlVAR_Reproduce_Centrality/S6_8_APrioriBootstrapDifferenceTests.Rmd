@@ -1,0 +1,195 @@
+---
+title: "S6.8 Paired-bootstrap differences"
+author: Kunru Song
+date: "2026-08-11 20:09:46 CST"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    self_contained: true
+params:
+  use_saved_results: false
+---
+
+<!-- Author: Kunru Song -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = FALSE, comment = NA, message = FALSE,
+                      warning = FALSE, dev = "svglite")
+report_input <- knitr::current_input(dir = TRUE)
+if (is.null(report_input) || !nzchar(report_input)) {
+  stop("Knit this Rmd with rmarkdown::render() or the Knit command.")
+}
+report_dir <- dirname(normalizePath(report_input, winslash = "/", mustWork = TRUE))
+knitr::opts_knit$set(root.dir = report_dir)
+implementation_file <- file.path(report_dir, "S6_8_APrioriBootstrapDifferenceTests.R")
+implementation_lines <- readLines(implementation_file, encoding = "UTF-8", warn = FALSE)
+section_start <- function(pattern) {
+  found <- grep(pattern, implementation_lines, fixed = TRUE)
+  if (length(found) != 1L) stop("Cannot identify implementation section: ", pattern)
+  found
+}
+section_lines <- function(first, next_first) {
+  if (first >= next_first) stop("Implementation sections are out of order.")
+  implementation_lines[seq.int(first, next_first - 1L)]
+}
+starts <- c(
+  inputs = 1L,
+  definitions = section_start("point_estimates <- s6_2$point_estimates"),
+  node_target = section_start("# Family 1: 24 within-node target contrasts"),
+  core_peripheral = section_start("# Family 2: 64 pairwise Core-minus-Peripheral node contrasts"),
+  temporal_edge = section_start("# Family 3: the six original S5.3 Temporal edge-family contrasts"),
+  export = section_start("format_number <- function(value)"),
+  internal_checks = section_start("expected_sheet_names <- names(workbook_sheets)")
+)
+report_code <- lapply(seq_len(length(starts) - 1L), function(index) {
+  section_lines(starts[[index]], starts[[index + 1L]])
+})
+names(report_code) <- names(starts)[seq_along(report_code)]
+if (!is.logical(params$use_saved_results) || length(params$use_saved_results) != 1L ||
+    is.na(params$use_saved_results)) stop("use_saved_results must be TRUE or FALSE.")
+```
+
+```{r compute-differences, include=FALSE, eval=!params$use_saved_results}
+# The R implementation owns the differences and workbook. It consumes existing
+# Bootstrap estimates and does not fit models or resample participants.
+analysis_environment <- new.env(parent = globalenv())
+source(implementation_file, local = analysis_environment, chdir = FALSE)
+```
+
+```{r load-report-results, include=FALSE}
+result_path <- file.path(report_dir, "../Res_2_Data_for_Analysis",
+                         "results_s6_8_apriori_bootstrap_difference_tests.rda")
+result_environment <- new.env(parent = emptyenv())
+loaded <- load(result_path, envir = result_environment)
+stopifnot(identical(loaded, "results_s6_8_apriori_bootstrap_difference_tests"))
+report_result <- result_environment[[loaded]]
+stopifnot(all(report_result$validation$passed), all(report_result$workbook_audit$passed),
+          identical(report_result$bootstrap_resolution$replications, 1000L),
+          identical(unname(vapply(report_result$workbook_sheets, nrow, integer(1))), c(24L, 64L, 6L)))
+input_files <- c(
+  s6_2_md5 = "results_s6_2_node_bridge_expected_influence.rda",
+  s5_3_md5 = "results_s5_3_mlvar_networks.rda",
+  cluster_checkpoint_md5 = "checkpoint_s5_6_cluster_bootstrap.rda"
+)
+for (key in names(input_files)) {
+  input_path <- file.path(report_dir, "../Res_2_Data_for_Analysis", input_files[[key]])
+  stopifnot(identical(unname(tools::md5sum(input_path)), report_result$provenance[[key]]))
+}
+display_table <- function(sheet_name, columns, labels) {
+  values <- report_result$workbook_sheets[[sheet_name]][, columns, drop = FALSE]
+  names(values) <- labels
+  knitr::kable(values, format = "html", digits = 4L, row.names = FALSE, escape = TRUE)
+}
+```
+
+<style>
+.table-scroll { overflow-x: auto; margin-bottom: 1.5em; }
+.table-scroll table { font-size: 0.9em; }
+.table-scroll th, .table-scroll td { padding: 0.4em 0.6em; vertical-align: top; }
+</style>
+
+## Purpose and inputs
+
+This repository-only analysis is provided for transparency and is not reported
+in the manuscript or supplementary materials. It examines paired differences
+using the existing 1,000 participant-cluster Bootstrap replications. The full
+unthresholded networks are used throughout; case-dropping results and raw-p
+support masks do not enter these comparisons.
+
+The date above records the original analysis. The displayed result object's
+execution time is `r report_result$created_at`.
+`r if (params$use_saved_results) "This report displays saved results without recalculating differences or rewriting result files." else "This report recalculates the paired differences from saved Bootstrap estimates using the accompanying R implementation."`
+
+Knit normally to calculate the differences and export their workbook. To render
+only the saved results, use `params = list(use_saved_results = TRUE)` with
+`rmarkdown::render()`. Neither mode reruns the upstream network or Bootstrap fits.
+The accompanying `S6_8_APrioriBootstrapDifferenceTests.R` contains the complete
+implementation; the sections below display its input and calculation code
+without executing that code a second time.
+
+```{r input-code, eval=FALSE, code=report_code$inputs}
+```
+
+## Interval interpretation
+
+All differences are paired within each Bootstrap replication. The nominal
+two-sided 99.9% percentile interval uses quantile type 6. With only 1,000
+replications, its endpoints equal the observed minimum and maximum. Accordingly,
+“Excludes zero” means that all stored paired differences have the same sign.
+It is a conservative exploratory sign-stability summary, not an FDR-adjusted
+test, a p value, or a fully resolved 99.9% confidence interval. Temporal
+associations are conditional predictive associations, not causal effects.
+
+```{r interval-code, eval=FALSE, code=report_code$definitions}
+```
+
+## Within-node target differences
+
+Each of the 24 contrasts is Distress-target minus Engagement-target Bridge EI
+for one PSMU manifestation and one network/direction. Positive values indicate
+a larger signed value toward Distress within that metric.
+
+```{r node-target-code, eval=FALSE, code=report_code$node_target}
+```
+
+<div class="table-scroll">
+
+```{r node-target-results}
+display_table("Node_Target",
+  c("Contrast ID", "Network", "Bridge EI metric", "Node", "Estimate [99.9% CI]", "Bootstrap median", "Excludes zero"),
+  c("ID", "Network", "Metric", "Node", "Difference [min–max envelope]", "Bootstrap median", "Excludes zero"))
+```
+
+</div>
+
+## Core–Peripheral node differences
+
+Each of the 64 contrasts subtracts a Peripheral node's signed Bridge EI from a
+Core node's value, within the same target community and network/direction.
+These are node-pair comparisons, not a difference between subgroup averages.
+
+```{r core-peripheral-code, eval=FALSE, code=report_code$core_peripheral}
+```
+
+<div class="table-scroll">
+
+```{r core-peripheral-results}
+display_table("Core_Peripheral",
+  c("Contrast ID", "Network", "Bridge EI metric", "Target community", "Core node", "Peripheral node", "Estimate [99.9% CI]", "Bootstrap median", "Excludes zero"),
+  c("ID", "Network", "Metric", "Target", "Core node", "Peripheral node", "Difference [min–max envelope]", "Bootstrap median", "Excludes zero"))
+```
+
+</div>
+
+## Prespecified Temporal edge-family differences
+
+These six contrasts retain the S5.3 directions: mean Core-minus-Peripheral
+prediction for Distress outcomes, and mean Peripheral-minus-Core prediction
+for Engagement outcomes. The original S5.3 estimates are retained; this section
+summarizes their paired participant-cluster Bootstrap distributions.
+
+```{r temporal-edge-code, eval=FALSE, code=report_code$temporal_edge}
+```
+
+<div class="table-scroll">
+
+```{r temporal-edge-results}
+display_table("Temporal_Edge_Family",
+  c("Contrast ID", "Outcome", "Contrast direction", "Estimate [99.9% CI]", "Bootstrap median", "Excludes zero"),
+  c("ID", "Outcome", "Direction", "Difference [min–max envelope]", "Bootstrap median", "Excludes zero"))
+```
+
+</div>
+
+## Result exports
+
+The R implementation writes
+`Res_3_Results/Table_S6_8_APrioriBootstrapDifferenceTests.xlsx` and
+`Res_2_Data_for_Analysis/results_s6_8_apriori_bootstrap_difference_tests.rda`.
+The workbook contains the three contrast families, with separate numerical columns for the differences, medians and interval endpoints. The RDA also keeps
+the full paired-contrast matrices and input provenance.
+
+```{r export-code, eval=FALSE, code=report_code$export}
+```

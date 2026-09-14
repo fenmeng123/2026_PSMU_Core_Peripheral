@@ -1,0 +1,1098 @@
+---
+title: "S3.2 Engagement Time and Core-Peripheral concurrent associations"
+author: "Kunru Song"
+date: "2026-07-20"
+params:
+  use_saved_results: false
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+
+<style>
+table { display: block; max-width: 100%; overflow-x: auto; }
+th, td { padding: 6px 9px; white-space: nowrap; }
+</style>
+
+This analysis is retained in the public repository for transparency and is not
+reported in the manuscript or supplementary materials.
+
+This report examines concurrent associations between engagement duration and PSMU manifestations. Interactive/message,
+active/posting, and passive/browsing duration are entered simultaneously as
+raw-minute predictors of both Core and Peripheral state-manifestation means.
+Engagement and manifestation reports cover five-hour and three-hour recall windows, respectively. Because these windows overlap, the estimates represent concurrent associations rather than causal effects.
+
+```{r setup, include=FALSE}
+use_saved_results <- {
+  value <- params$use_saved_results
+  if (!is.logical(value) || length(value) != 1L || is.na(value)) {
+    stop("use_saved_results must be one non-missing logical value")
+  }
+  value
+}
+
+public_model_diagnostics <- function(data) {
+  if ("warning_summary" %in% names(data) && !"warning_text" %in% names(data)) return(data)
+  warning_text <- as.character(data$warning_text)
+  stopifnot(length(warning_text) == nrow(data))
+  output <- data[, setdiff(names(data), c("warning_text", "error_text")), drop = FALSE]
+  output$warning_summary <- ifelse(
+    grepl("following clusters|cluster IDs", warning_text, ignore.case = TRUE),
+    "Includes a within-cluster variation warning; individual details remain private",
+    ifelse(nzchar(warning_text), "Other warning; details retained locally", "None")
+  )
+  output
+}
+
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  collapse = FALSE, comment = NA, dev = "svglite"
+)
+
+required_packages <- c(
+  "bruceR", "dplyr", "ggplot2", "knitr", "MplusAutomation",
+  "openxlsx", "readxl", "rmarkdown", "svglite", "tibble", "tidyr"
+)
+package_available <- vapply(
+  required_packages, requireNamespace, logical(1), quietly = TRUE
+)
+if (!all(package_available)) {
+  stop(
+    "Missing required R packages: ",
+    paste(names(package_available)[!package_available], collapse = ", ")
+  )
+}
+
+locate_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(current)) current <- dirname(current)
+  repeat {
+    if (all(dir.exists(file.path(current, c(
+      "Step_1_Descriptive_and_Reliability",
+      "Step_3_Concurrent_Multilevel_Associations"
+    ))))) return(current)
+    parent <- dirname(current)
+    if (identical(parent, current)) break
+    current <- parent
+  }
+  stop("Could not locate the project from its public Step directories")
+}
+
+load_single_object <- function(path, expected_name) {
+  environment <- new.env(parent = emptyenv())
+  loaded <- load(path, envir = environment)
+  if (!identical(loaded, expected_name)) {
+    stop(
+      "Expected only ", expected_name, " in ", path,
+      "; found: ", paste(loaded, collapse = ", ")
+    )
+  }
+  environment[[expected_name]]
+}
+
+mplus_numeric <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+summary_value <- function(summary_row, candidates, type = c("numeric", "character")) {
+  type <- match.arg(type)
+  hit <- intersect(candidates, names(summary_row))
+  if (!length(hit)) return(if (type == "numeric") NA_real_ else NA_character_)
+  value <- summary_row[[hit[[1L]]]][[1L]]
+  if (type == "numeric") mplus_numeric(value) else as.character(value)
+}
+
+flatten_messages <- function(x) {
+  if (is.null(x) || !length(x)) return("")
+  paste(unlist(x, recursive = TRUE, use.names = FALSE), collapse = " | ")
+}
+
+parse_output_integer <- function(path, label) {
+  lines <- readLines(path, warn = FALSE)
+  hit <- grep(label, lines, ignore.case = TRUE, value = TRUE, fixed = TRUE)
+  if (!length(hit)) return(NA_integer_)
+  numbers <- regmatches(hit[[1L]], gregexpr("[0-9]+", hit[[1L]]))[[1L]]
+  if (!length(numbers)) NA_integer_ else as.integer(tail(numbers, 1L))
+}
+
+round_numeric_columns <- function(data, digits = 4L) {
+  data |>
+    dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, digits)))
+}
+
+style_and_sanitize_workbook <- function(path, sheet_data) {
+  workbook <- openxlsx::loadWorkbook(path)
+  header_style <- openxlsx::createStyle(
+    fontName = "Aptos", fontSize = 10, textDecoration = "bold",
+    fontColour = "#FFFFFF", fgFill = "#1F4E78",
+    halign = "center", valign = "center", wrapText = TRUE,
+    border = "bottom", borderColour = "#163A5C"
+  )
+  body_style <- openxlsx::createStyle(
+    fontName = "Aptos", fontSize = 10, valign = "top", wrapText = TRUE
+  )
+  integer_style <- openxlsx::createStyle(numFmt = "0")
+  decimal_style <- openxlsx::createStyle(numFmt = "0.0000")
+
+  for (sheet_name in names(sheet_data)) {
+    data <- sheet_data[[sheet_name]]
+    row_count <- nrow(data) + 1L
+    column_count <- ncol(data)
+    openxlsx::showGridLines(workbook, sheet = sheet_name, showGridLines = FALSE)
+    openxlsx::freezePane(workbook, sheet = sheet_name, firstRow = TRUE)
+    openxlsx::setRowHeights(workbook, sheet = sheet_name, rows = 1L, heights = 30)
+    openxlsx::addStyle(
+      workbook, sheet = sheet_name, style = header_style,
+      rows = 1L, cols = seq_len(column_count), gridExpand = TRUE,
+      stack = TRUE
+    )
+    if (row_count > 1L) {
+      openxlsx::addStyle(
+        workbook, sheet = sheet_name, style = body_style,
+        rows = 2L:row_count, cols = seq_len(column_count),
+        gridExpand = TRUE, stack = TRUE
+      )
+    }
+
+    integer_columns <- which(
+      vapply(data, is.integer, logical(1)) |
+        names(data) %in% c("observations", "clusters", "free_parameters", "df",
+          "errors_n", "warnings_n", "required_paths", "required_contrasts",
+          "endpoint_300_count", "n_observed")
+    )
+    numeric_columns <- setdiff(which(vapply(data, is.numeric, logical(1))), integer_columns)
+    if (row_count > 1L && length(integer_columns)) {
+      openxlsx::addStyle(
+        workbook, sheet = sheet_name, style = integer_style,
+        rows = 2L:row_count, cols = integer_columns,
+        gridExpand = TRUE, stack = TRUE
+      )
+    }
+    if (row_count > 1L && length(numeric_columns)) {
+      openxlsx::addStyle(
+        workbook, sheet = sheet_name, style = decimal_style,
+        rows = 2L:row_count, cols = numeric_columns,
+        gridExpand = TRUE, stack = TRUE
+      )
+    }
+
+    column_widths <- vapply(seq_len(column_count), function(column_index) {
+      values <- c(names(data)[column_index], as.character(data[[column_index]]))
+      values[is.na(values)] <- ""
+      max_width <- max(nchar(values, type = "width"), na.rm = TRUE) + 2L
+      min(42, max(11, max_width))
+    }, numeric(1))
+    openxlsx::setColWidths(
+      workbook, sheet = sheet_name, cols = seq_len(column_count),
+      widths = column_widths
+    )
+  }
+
+  # bruceR/openxlsx can retain empty drawing relationships for data-only sheets.
+  # Remove only those dangling relationships; preserve printer settings and data.
+  workbook$worksheets_rels <- lapply(
+    workbook$worksheets_rels,
+    function(x) x[grepl("printerSettings", x, fixed = TRUE)]
+  )
+  workbook$Content_Types <- workbook$Content_Types[
+    !grepl("/xl/drawings/", workbook$Content_Types, fixed = TRUE)
+  ]
+  openxlsx::saveWorkbook(workbook, path, overwrite = TRUE)
+  invisible(path)
+}
+
+report_file <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(
+  if (length(report_file) == 1L && file.exists(report_file)) report_file else getwd()
+)
+knitr::opts_knit$set(root.dir = project_root)
+
+input_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "dat_step3_concurrent.rda"
+)
+result_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis",
+  "fit_s3_2_engagement_core_peripheral.rda"
+)
+table_file <- file.path(
+  project_root, "Res_3_Results",
+  "Table_S3_2_EngagementTimeCorePeripheral.xlsx"
+)
+figure_file <- file.path(
+  project_root, "Res_3_Results",
+  "Figure_S3_2_EngagementTimeCorePeripheral.svg"
+)
+mplus_directory <- file.path(
+  project_root, "Step_3_Concurrent_Multilevel_Associations",
+  "mplus", "s3_2"
+)
+mplus_command <- Sys.getenv("MPLUS_COMMAND", unset = "D:/Program Files/Mplus/Mplus.exe")
+
+stopifnot(file.exists(input_file))
+if (!use_saved_results) {
+  stopifnot(file.exists(mplus_command))
+  dir.create(dirname(result_file), recursive = TRUE, showWarnings = FALSE)
+  dir.create(dirname(table_file), recursive = TRUE, showWarnings = FALSE)
+  dir.create(dirname(figure_file), recursive = TRUE, showWarnings = FALSE)
+  dir.create(mplus_directory, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+
+```{r load-saved-results, include=FALSE, eval=use_saved_results}
+load_saved_display <- function(path, input_path) {
+  saved <- load_single_object(path, "fit_s3_2_engagement_core_peripheral")
+  stopifnot(is.list(saved), is.list(saved$metadata))
+  metadata <- saved$metadata
+  stopifnot(
+    identical(metadata$input_md5, unname(tools::md5sum(input_path))),
+    isTRUE(metadata$observations == 17758L), isTRUE(metadata$clusters == 209L),
+    identical(metadata$estimator, "MLR"),
+    length(metadata$mplus_version) == 1L,
+    metadata$mplus_version %in% c("8.7", "9")
+  )
+  fields <- c("variable_map", "model_fit", "raw_paths", "standardized_paths", "standardized_contrasts", "r_squared", "diagnostics", "duration_diagnostics", "vif_diagnostics", "condition_diagnostics", "binned_linearity")
+  stopifnot(all(fields %in% names(saved)))
+  tables <- saved[fields]
+  # Raw message text can contain individual cluster identifiers.
+  tables$diagnostics <- public_model_diagnostics(tables$diagnostics)
+  expected_rows <- c(variable_map = 28L, model_fit = 2L, raw_paths = 12L, standardized_paths = 12L, standardized_contrasts = 6L, r_squared = 8L, diagnostics = 2L, duration_diagnostics = 3L, vif_diagnostics = 6L, condition_diagnostics = 2L, binned_linearity = 30L)
+  stopifnot(setequal(names(tables), names(expected_rows)))
+  required_columns <- list(
+    variable_map = c("representation", "mplus_variable", "project_variable"),
+    model_fit = c("model_id", "representation", "mplus_version", "estimator", "observations", "clusters", "free_parameters", "scaled_chi_square", "scaling_correction", "df", "p_value", "cfi", "tli", "rmsea", "srmr_within", "srmr_between", "loglikelihood", "aic", "bic", "adjusted_bic"),
+    raw_paths = c("model_id", "representation", "scale", "level", "outcome", "predictor", "estimate", "se", "z", "p_value", "ci_lower", "ci_upper"),
+    standardized_paths = c("model_id", "representation", "scale", "level", "outcome", "predictor", "estimate", "se", "z", "p_value", "ci_lower", "ci_upper"),
+    standardized_contrasts = c("model_id", "representation", "scale", "level", "engagement_mode", "contrast", "estimate", "se", "z", "p_value", "ci_lower", "ci_upper"),
+    r_squared = c("model_id", "representation", "level", "outcome", "r_squared"),
+    diagnostics = c("model_id", "representation", "normal_termination", "errors_n", "warnings_n", "minimum_residual_variance", "residual_variances_positive", "required_paths", "required_contrasts", "expected_paths_present", "expected_contrasts_present", "technical_pass", "warning_summary"),
+    duration_diagnostics = c("variable", "behavior", "n_observed", "mean_minutes", "sd_minutes", "median_minutes", "minimum", "maximum", "zero_percent", "endpoint_300_count", "skewness", "excess_kurtosis"),
+    vif_diagnostics = c("model", "level", "variable", "r_squared_from_other_predictors", "vif"),
+    condition_diagnostics = c("model", "level", "condition_index"),
+    binned_linearity = c("bin", "duration_variable", "engagement_mode", "n", "mean_minutes", "mean_core", "mean_peripheral")
+  )
+  for (name in names(tables)) {
+    table <- tables[[name]]
+    stopifnot(is.data.frame(table), nrow(table) == expected_rows[[name]],
+      identical(names(table), required_columns[[name]]),
+      !anyDuplicated(names(table)),
+      !any(grepl("^(Name_ID|Data_ID|cluster_id|rank|warning_text|error_text)$",
+                 names(table), ignore.case = TRUE)))
+  }
+  stopifnot(
+    nrow(tables$model_fit) == 2L,
+    all(tables$model_fit$observations == metadata$observations),
+    all(tables$model_fit$clusters == metadata$clusters),
+    all(tables$model_fit$estimator == metadata$estimator),
+    all(tables$model_fit$mplus_version == metadata$mplus_version),
+    length(tables$diagnostics$technical_pass) == 2L,
+    all(tables$diagnostics$technical_pass),
+    all(tables$r_squared$r_squared >= 0 & tables$r_squared$r_squared <= 1),
+    file.exists(figure_file)
+  )
+  tables
+}
+saved_display <- load_saved_display(result_file, input_file)
+list2env(saved_display, envir = environment())
+```
+
+```{r saved-mode-note, echo=FALSE, results='asis', eval=use_saved_results}
+cat("This report displays accepted saved estimates and the existing SVG. ",
+    "No model, diagnostic regression, bootstrap or result export was rerun. ",
+    "The fit table retains the original Mplus version; the current reproduction code uses 8.7.\n\n", sep = "")
+```
+
+# Load and validate the S3.1 entry
+
+```{r load-and-validate-input, eval=!use_saved_results}
+dat_step3_concurrent <- load_single_object(
+  input_file, "dat_step3_concurrent"
+)
+
+stopifnot(
+  identical(
+    names(dat_step3_concurrent),
+    c(
+      "prompt", "person", "variable_map", "standardization",
+      "sample_audit", "diagnostics", "provenance"
+    )
+  ),
+  nrow(dat_step3_concurrent$prompt) == 18810L,
+  nrow(dat_step3_concurrent$person) == 209L,
+  identical(
+    dat_step3_concurrent$provenance$duration_treatment,
+    "Raw minutes; no log1p in Step 3"
+  )
+)
+
+dat_s32 <- dat_step3_concurrent$prompt |>
+  dplyr::filter(s32_sample) |>
+  dplyr::arrange(Name_ID, Day, Time) |>
+  as.data.frame()
+
+expected_observations <- dat_step3_concurrent$sample_audit$prompts[
+  dat_step3_concurrent$sample_audit$sample ==
+    "S3.2 Engagement-Time to Core/Peripheral"
+]
+expected_clusters <- 209L
+
+stopifnot(
+  nrow(dat_s32) == expected_observations,
+  dplyr::n_distinct(dat_s32$Name_ID) == expected_clusters,
+  !anyNA(dat_s32[c(
+    "Core", "Peripheral", "InteractiveTime", "ActiveTime", "PassiveTime"
+  )])
+)
+
+input_audit <- data.frame(
+  scheduled_rows = nrow(dat_step3_concurrent$prompt),
+  analyzed_rows = nrow(dat_s32),
+  clusters = dplyr::n_distinct(dat_s32$Name_ID),
+  person_days = dplyr::n_distinct(interaction(
+    dat_s32$Name_ID, dat_s32$Day, drop = TRUE
+  )),
+  step3_rda_md5 = unname(tools::md5sum(input_file)),
+  duration_treatment = dat_step3_concurrent$provenance$duration_treatment,
+  stringsAsFactors = FALSE
+)
+
+```
+
+# Construct raw and standardized Mplus data
+
+The raw model preserves mean-score and minute units. The matching standardized
+model uses the level-specific z variables created in S3.1 and supplies direct
+standardized Peripheral-minus-Core slope contrasts. Both models use the exact
+same prompt rows and structural paths.
+
+```{r prepare-mplus-data, eval=!use_saved_results}
+raw_map <- c(
+  id = "Name_ID", dayc = "Day_c", tm2 = "Time_2", tm3 = "Time_3",
+  corew = "Core_W", periw = "Peripheral_W",
+  intw = "InteractiveTime_W", actw = "ActiveTime_W", pasw = "PassiveTime_W",
+  coreb = "Core_B", perib = "Peripheral_B",
+  intb = "InteractiveTime_B", actb = "ActiveTime_B", pasb = "PassiveTime_B"
+)
+standardized_map <- c(
+  id = "Name_ID", dayc = "Day_c", tm2 = "Time_2", tm3 = "Time_3",
+  corewz = "Core_W_Z", periwz = "Peripheral_W_Z",
+  intwz = "InteractiveTime_W_Z", actwz = "ActiveTime_W_Z",
+  paswz = "PassiveTime_W_Z", corebz = "Core_B_Z",
+  peribz = "Peripheral_B_Z", intbz = "InteractiveTime_B_Z",
+  actbz = "ActiveTime_B_Z", pasbz = "PassiveTime_B_Z"
+)
+
+make_mplus_data <- function(map) {
+  output <- dat_s32[unname(map)]
+  names(output) <- names(map)
+  output$id <- as.integer(factor(output$id, levels = sort(unique(output$id))))
+  stopifnot(!anyNA(output), nrow(output) == expected_observations)
+  as.data.frame(output)
+}
+
+mplus_data_raw <- make_mplus_data(raw_map)
+mplus_data_standardized <- make_mplus_data(standardized_map)
+
+variable_map <- dplyr::bind_rows(
+  data.frame(
+    representation = "Raw",
+    mplus_variable = names(raw_map),
+    project_variable = unname(raw_map),
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    representation = "Level-standardized",
+    mplus_variable = names(standardized_map),
+    project_variable = unname(standardized_map),
+    stringsAsFactors = FALSE
+  )
+)
+
+```
+
+```{r variable-map-table, echo=FALSE}
+knitr::kable(variable_map, format = "html", row.names = FALSE)
+```
+
+# Define and run the Mplus models
+
+```{r run-mplus-models, eval=!use_saved_results}
+model_specifications <- list(
+  raw = list(
+    id = "S3_2_RAW",
+    label = "Raw mean scores and raw minutes",
+    stem = "s3_2_engagement_core_peripheral_raw",
+    data = mplus_data_raw,
+    usevariables = names(raw_map),
+    variable = paste(
+      "CLUSTER = id;",
+      "WITHIN = corew periw intw actw pasw dayc tm2 tm3;",
+      "BETWEEN = coreb perib intb actb pasb;",
+      sep = "\n"
+    ),
+    model = paste(
+      "%WITHIN%",
+      "corew ON intw (cwi);",
+      "corew ON actw (cwa);",
+      "corew ON pasw (cwp);",
+      "corew ON dayc tm2 tm3;",
+      "periw ON intw (pwi);",
+      "periw ON actw (pwa);",
+      "periw ON pasw (pwp);",
+      "periw ON dayc tm2 tm3;",
+      "corew WITH periw;",
+      "%BETWEEN%",
+      "coreb ON intb (cbi);",
+      "coreb ON actb (cba);",
+      "coreb ON pasb (cbp);",
+      "perib ON intb (pbi);",
+      "perib ON actb (pba);",
+      "perib ON pasb (pbp);",
+      "coreb WITH perib;",
+      sep = "\n"
+    )
+  ),
+  standardized = list(
+    id = "S3_2_STD",
+    label = "Level-standardized focal model",
+    stem = "s3_2_engagement_core_peripheral_standardized",
+    data = mplus_data_standardized,
+    usevariables = names(standardized_map),
+    variable = paste(
+      "CLUSTER = id;",
+      paste(
+        "WITHIN = corewz periwz intwz actwz paswz",
+        "dayc tm2 tm3;"
+      ),
+      "BETWEEN = corebz peribz intbz actbz pasbz;",
+      sep = "\n"
+    ),
+    model = paste(
+      "%WITHIN%",
+      "corewz ON intwz (cwi);",
+      "corewz ON actwz (cwa);",
+      "corewz ON paswz (cwp);",
+      "corewz ON dayc tm2 tm3;",
+      "periwz ON intwz (pwi);",
+      "periwz ON actwz (pwa);",
+      "periwz ON paswz (pwp);",
+      "periwz ON dayc tm2 tm3;",
+      "corewz WITH periwz;",
+      "%BETWEEN%",
+      "corebz ON intbz (cbi);",
+      "corebz ON actbz (cba);",
+      "corebz ON pasbz (cbp);",
+      "peribz ON intbz (pbi);",
+      "peribz ON actbz (pba);",
+      "peribz ON pasbz (pbp);",
+      "corebz WITH peribz;",
+      sep = "\n"
+    )
+  )
+)
+
+model_constraint <- paste(
+  "NEW(dwi dwa dwp dbi dba dbp);",
+  "dwi = pwi - cwi;",
+  "dwa = pwa - cwa;",
+  "dwp = pwp - cwp;",
+  "dbi = pbi - cbi;",
+  "dba = pba - cba;",
+  "dbp = pbp - cbp;",
+  sep = "\n"
+)
+
+run_mplus_model <- function(specification) {
+  data_path <- file.path(mplus_directory, paste0(specification$stem, ".dat"))
+  input_path <- file.path(mplus_directory, paste0(specification$stem, ".inp"))
+  output_path <- file.path(mplus_directory, paste0(specification$stem, ".out"))
+
+  mplus_object <- MplusAutomation::mplusObject(
+    TITLE = paste(
+      "! Author: Kunru Song",
+      "! Step 3.2 concurrent association; predictor orientation is not causal.",
+      specification$label,
+      sep = "\n"
+    ),
+    VARIABLE = specification$variable,
+    ANALYSIS = paste("TYPE = TWOLEVEL;", "ESTIMATOR = MLR;", sep = "\n"),
+    MODEL = specification$model,
+    MODELCONSTRAINT = model_constraint,
+    OUTPUT = paste(
+      "SAMPSTAT;", "STANDARDIZED(STDYX);", "CINTERVAL;",
+      "RESIDUAL;", "TECH1;", "TECH4;", sep = "\n"
+    ),
+    usevariables = specification$usevariables,
+    rdata = specification$data,
+    autov = FALSE,
+    quiet = TRUE
+  )
+
+  modeler_result <- MplusAutomation::mplusModeler(
+    object = mplus_object,
+    dataout = data_path,
+    modelout = input_path,
+    run = 1L,
+    check = FALSE,
+    varwarnings = TRUE,
+    Mplus_command = mplus_command,
+    writeData = "always",
+    hashfilename = FALSE,
+    killOnFail = TRUE,
+    quiet = TRUE
+  )
+
+  stopifnot(file.exists(data_path), file.exists(input_path), file.exists(output_path))
+  input_lines <- readLines(input_path, warn = FALSE)
+  output_lines <- readLines(output_path, warn = FALSE)
+  parsed <- MplusAutomation::readModels(output_path, what = "all", quiet = TRUE)
+
+  checks <- list(
+    author_present = any(trimws(input_lines) == "! Author: Kunru Song"),
+    missing_declared = any(grepl(
+      "MISSING\\s*=\\s*\\.;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    twolevel_declared = any(grepl(
+      "TYPE\\s*=\\s*TWOLEVEL;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    mlr_declared = any(grepl(
+      "ESTIMATOR\\s*=\\s*MLR;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    cluster_declared = any(grepl(
+      "CLUSTER\\s*=\\s*id;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    constraint_declared = any(grepl(
+      "MODEL CONSTRAINT", input_lines, ignore.case = TRUE, fixed = TRUE
+    )),
+    normal_termination = any(grepl(
+      "THE MODEL ESTIMATION TERMINATED NORMALLY",
+      output_lines, fixed = TRUE
+    ))
+  )
+
+  summary_row <- parsed$summaries[1, , drop = FALSE]
+  checks$mplus_8_7 <- identical(
+    summary_value(summary_row, "Mplus.version", "character"), "8.7"
+  )
+  checks$estimator_mlr <- identical(
+    summary_value(summary_row, "Estimator", "character"), "MLR"
+  )
+  checks$observations_match <-
+    as.integer(summary_value(summary_row, "Observations", "numeric")) ==
+      expected_observations
+  checks$clusters_match <- parse_output_integer(
+    output_path, "Number of clusters"
+  ) == expected_clusters
+
+  stopifnot(all(unlist(checks)))
+
+  list(
+    model_id = specification$id,
+    model_label = specification$label,
+    syntax = list(
+      variable = specification$variable,
+      model = specification$model,
+      constraint = model_constraint
+    ),
+    paths = list(data = data_path, input = input_path, output = output_path),
+    file_md5 = unname(tools::md5sum(c(data_path, input_path, output_path))),
+    checks = checks,
+    parsed = parsed,
+    modeler_result = modeler_result,
+    warnings = flatten_messages(parsed$warnings),
+    errors = flatten_messages(parsed$errors)
+  )
+}
+
+model_runs <- lapply(model_specifications, run_mplus_model)
+```
+
+# Extract model fit, paths, contrasts, and diagnostics
+
+Full warning/error text is kept in the local result object because it can contain
+individual cluster identifiers. The public table retains warning/error flags and
+an aggregate warning description. Fit indices for saturated models (df = 0) are
+not interpreted.
+
+```{r extract-results, eval=!use_saved_results}
+extract_fit <- function(run) {
+  s <- run$parsed$summaries[1, , drop = FALSE]
+  data.frame(
+    model_id = run$model_id,
+    representation = run$model_label,
+    mplus_version = summary_value(s, "Mplus.version", "character"),
+    estimator = summary_value(s, "Estimator", "character"),
+    observations = summary_value(s, "Observations", "numeric"),
+    clusters = parse_output_integer(run$paths$output, "Number of clusters"),
+    free_parameters = summary_value(s, "Parameters", "numeric"),
+    scaled_chi_square = summary_value(s, "ChiSqM_Value", "numeric"),
+    scaling_correction = summary_value(s, "ChiSqM_ScalingCorrection", "numeric"),
+    df = summary_value(s, "ChiSqM_DF", "numeric"),
+    p_value = summary_value(s, "ChiSqM_PValue", "numeric"),
+    cfi = summary_value(s, "CFI", "numeric"),
+    tli = summary_value(s, "TLI", "numeric"),
+    rmsea = summary_value(s, "RMSEA_Estimate", "numeric"),
+    srmr_within = summary_value(
+      s, c("SRMR.Within", "SRMR_Within", "SRMRWithin"), "numeric"
+    ),
+    srmr_between = summary_value(
+      s, c("SRMR.Between", "SRMR_Between", "SRMRBetween"), "numeric"
+    ),
+    loglikelihood = summary_value(s, "LL", "numeric"),
+    aic = summary_value(s, "AIC", "numeric"),
+    bic = summary_value(s, "BIC", "numeric"),
+    adjusted_bic = summary_value(s, "aBIC", "numeric"),
+    stringsAsFactors = FALSE
+  )
+}
+
+outcome_dictionary <- c(
+  COREW = "Core", PERIW = "Peripheral", COREB = "Core", PERIB = "Peripheral",
+  COREWZ = "Core", PERIWZ = "Peripheral",
+  COREBZ = "Core", PERIBZ = "Peripheral"
+)
+predictor_dictionary <- c(
+  INTW = "Interactive/message", ACTW = "Active/posting", PASW = "Passive/browsing",
+  INTB = "Interactive/message", ACTB = "Active/posting", PASB = "Passive/browsing",
+  INTWZ = "Interactive/message", ACTWZ = "Active/posting",
+  PASWZ = "Passive/browsing", INTBZ = "Interactive/message",
+  ACTBZ = "Active/posting", PASBZ = "Passive/browsing"
+)
+
+extract_paths <- function(run) {
+  parameters <- run$parsed$parameters$unstandardized |>
+    dplyr::mutate(dplyr::across(
+      dplyr::any_of(c("est", "se", "est_se", "pval")), mplus_numeric
+    ))
+  ci <- run$parsed$parameters$ci.unstandardized
+  if (!is.null(ci) && nrow(ci)) {
+    ci <- ci |>
+      dplyr::mutate(dplyr::across(
+        dplyr::any_of(c("low2.5", "up2.5")), mplus_numeric
+      )) |>
+      dplyr::select(
+        dplyr::any_of(c(
+          "paramHeader", "param", "BetweenWithin", "low2.5", "up2.5"
+        ))
+      )
+  }
+  paths <- parameters |>
+    dplyr::filter(grepl("\\.ON$", paramHeader)) |>
+    dplyr::mutate(
+      outcome_code = sub("\\.ON$", "", paramHeader),
+      predictor_code = param,
+      outcome = unname(outcome_dictionary[outcome_code]),
+      predictor = unname(predictor_dictionary[predictor_code])
+    ) |>
+    dplyr::filter(!is.na(outcome), !is.na(predictor)) |>
+    dplyr::select(
+      paramHeader, param, BetweenWithin, outcome_code, outcome, predictor,
+      estimate = est, se, z = est_se, p_value = pval
+    )
+  if (!is.null(ci) && nrow(ci)) {
+    paths <- paths |>
+      dplyr::left_join(
+        ci,
+        by = c("paramHeader", "param", "BetweenWithin")
+      ) |>
+      dplyr::rename(ci_lower = low2.5, ci_upper = up2.5)
+  } else {
+    paths$ci_lower <- paths$estimate - 1.96 * paths$se
+    paths$ci_upper <- paths$estimate + 1.96 * paths$se
+  }
+  paths |>
+    dplyr::mutate(
+      model_id = run$model_id,
+      representation = run$model_label,
+      level = ifelse(grepl("B$|BZ$", outcome_code), "Between", "Within"),
+      scale = ifelse(grepl("Z$", outcome_code), "Standardized", "Raw")
+    ) |>
+    dplyr::select(
+      model_id, representation, scale, level, outcome, predictor,
+      estimate, se, z, p_value, ci_lower, ci_upper
+    )
+}
+
+contrast_dictionary <- data.frame(
+  param = c("DWI", "DWA", "DWP", "DBI", "DBA", "DBP"),
+  level = rep(c("Within", "Between"), each = 3),
+  engagement_mode = rep(
+    c("Interactive/message", "Active/posting", "Passive/browsing"), 2
+  ),
+  stringsAsFactors = FALSE
+)
+
+extract_contrasts <- function(run) {
+  parameters <- run$parsed$parameters$unstandardized |>
+    dplyr::mutate(dplyr::across(
+      dplyr::any_of(c("est", "se", "est_se", "pval")), mplus_numeric
+    ))
+  contrasts <- parameters |>
+    dplyr::mutate(param_upper = toupper(param)) |>
+    dplyr::filter(param_upper %in% contrast_dictionary$param) |>
+    dplyr::left_join(
+      contrast_dictionary,
+      by = c("param_upper" = "param")
+    ) |>
+    dplyr::transmute(
+      model_id = run$model_id,
+      representation = run$model_label,
+      scale = ifelse(run$model_id == "S3_2_STD", "Standardized", "Raw"),
+      level, engagement_mode,
+      contrast = "Peripheral slope - Core slope",
+      estimate = est, se, z = est_se, p_value = pval,
+      ci_lower = est - 1.96 * se,
+      ci_upper = est + 1.96 * se
+    )
+  contrasts
+}
+
+extract_r2 <- function(run) {
+  r2 <- run$parsed$parameters$r2
+  if (is.null(r2) || !nrow(r2)) return(data.frame())
+  r2 |>
+    dplyr::mutate(est = mplus_numeric(est)) |>
+    dplyr::filter(toupper(param) %in% names(outcome_dictionary)) |>
+    dplyr::transmute(
+      model_id = run$model_id,
+      representation = run$model_label,
+      level = ifelse(grepl("B$|BZ$", toupper(param)), "Between", "Within"),
+      outcome = unname(outcome_dictionary[toupper(param)]),
+      r_squared = est
+    )
+}
+
+model_fit <- dplyr::bind_rows(lapply(model_runs, extract_fit))
+paths <- dplyr::bind_rows(lapply(model_runs, extract_paths))
+contrasts <- dplyr::bind_rows(lapply(model_runs, extract_contrasts))
+r_squared <- dplyr::bind_rows(lapply(model_runs, extract_r2))
+
+diagnostics <- dplyr::bind_rows(lapply(model_runs, function(run) {
+  residuals <- run$parsed$parameters$unstandardized |>
+    dplyr::mutate(est = mplus_numeric(est)) |>
+    dplyr::filter(paramHeader == "Residual.Variances")
+  data.frame(
+    model_id = run$model_id,
+    representation = run$model_label,
+    normal_termination = run$checks$normal_termination,
+    errors_n = ifelse(nzchar(run$errors), 1L, 0L),
+    warnings_n = ifelse(nzchar(run$warnings), 1L, 0L),
+    minimum_residual_variance = if (nrow(residuals)) min(residuals$est) else NA_real_,
+    residual_variances_positive = if (nrow(residuals)) all(residuals$est > 0) else FALSE,
+    required_paths = sum(paths$model_id == run$model_id),
+    required_contrasts = sum(contrasts$model_id == run$model_id),
+    warning_text = run$warnings,
+    error_text = ifelse(nzchar(run$errors), run$errors, "None"),
+    stringsAsFactors = FALSE
+  )
+})) |>
+  dplyr::mutate(
+    expected_paths_present = required_paths == 12L,
+    expected_contrasts_present = required_contrasts == 6L,
+    technical_pass = normal_termination & errors_n == 0L &
+      residual_variances_positive & expected_paths_present &
+      expected_contrasts_present
+  )
+
+standardized_paths <- paths |>
+  dplyr::filter(model_id == "S3_2_STD")
+raw_paths <- paths |>
+  dplyr::filter(model_id == "S3_2_RAW")
+standardized_contrasts <- contrasts |>
+  dplyr::filter(model_id == "S3_2_STD")
+
+sign_agreement <- raw_paths |>
+  dplyr::select(level, outcome, predictor, raw_estimate = estimate) |>
+  dplyr::left_join(
+    standardized_paths |>
+      dplyr::select(level, outcome, predictor, standardized_estimate = estimate),
+    by = c("level", "outcome", "predictor")
+  ) |>
+  dplyr::mutate(
+    sign_agrees = sign(raw_estimate) == sign(standardized_estimate)
+  )
+
+stopifnot(
+  nrow(model_fit) == 2L,
+  nrow(raw_paths) == 12L,
+  nrow(standardized_paths) == 12L,
+  nrow(contrasts) == 12L,
+  nrow(standardized_contrasts) == 6L,
+  all(diagnostics$technical_pass),
+  all(sign_agreement$sign_agrees),
+  all(r_squared$r_squared >= 0 & r_squared$r_squared <= 1)
+)
+
+```
+
+```{r model-fit-table, echo=FALSE}
+knitr::kable(round_numeric_columns(model_fit), format = "html", row.names = FALSE)
+```
+
+```{r raw-paths-table, echo=FALSE}
+knitr::kable(round_numeric_columns(raw_paths), format = "html", row.names = FALSE)
+```
+
+```{r standardized-paths-table, echo=FALSE}
+knitr::kable(round_numeric_columns(standardized_paths), format = "html", row.names = FALSE)
+```
+
+```{r standardized-contrasts-table, echo=FALSE}
+knitr::kable(round_numeric_columns(standardized_contrasts), format = "html", row.names = FALSE)
+```
+
+```{r r-squared-table, echo=FALSE}
+knitr::kable(round_numeric_columns(r_squared), format = "html", row.names = FALSE)
+```
+
+```{r diagnostics-table, echo=FALSE}
+knitr::kable(round_numeric_columns(public_model_diagnostics(diagnostics)), format = "html", row.names = FALSE)
+```
+
+# Raw-duration diagnostics for interpretation
+
+The distribution, zero-mass, endpoint, VIF, and condition-index diagnostics are
+loaded from S3.1 to assess the suitability of the raw-duration predictors. Binned means are used to check linearity; the raw-minute specification is unchanged.
+
+```{r raw-duration-diagnostics, eval=!use_saved_results}
+duration_diagnostics <- dat_step3_concurrent$diagnostics$duration_descriptives
+vif_diagnostics <- dat_step3_concurrent$diagnostics$vif |>
+  dplyr::filter(model == "S3.2 engagement predictors")
+condition_diagnostics <- dat_step3_concurrent$diagnostics$condition_index |>
+  dplyr::filter(model == "S3.2 engagement predictors")
+
+make_binned_summary <- function(duration, label) {
+  dat_s32 |>
+    dplyr::transmute(
+      duration = .data[[duration]], Core, Peripheral,
+      bin = dplyr::ntile(.data[[duration]], 10L)
+    ) |>
+    dplyr::group_by(bin) |>
+    dplyr::summarise(
+      duration_variable = .env$duration,
+      engagement_mode = .env$label,
+      n = dplyr::n(),
+      mean_minutes = mean(duration),
+      mean_core = mean(Core),
+      mean_peripheral = mean(Peripheral),
+      .groups = "drop"
+    )
+}
+
+binned_linearity <- dplyr::bind_rows(
+  make_binned_summary("InteractiveTime", "Interactive/message"),
+  make_binned_summary("ActiveTime", "Active/posting"),
+  make_binned_summary("PassiveTime", "Passive/browsing")
+)
+
+```
+
+```{r duration-diagnostics-table, echo=FALSE}
+knitr::kable(round_numeric_columns(duration_diagnostics, 3L), format = "html", row.names = FALSE)
+```
+
+```{r vif-diagnostics-table, echo=FALSE}
+knitr::kable(round_numeric_columns(vif_diagnostics, 3L), format = "html", row.names = FALSE)
+```
+
+```{r condition-diagnostics-table, echo=FALSE}
+knitr::kable(round_numeric_columns(condition_diagnostics, 3L), format = "html", row.names = FALSE)
+```
+
+```{r binned-linearity-table, echo=FALSE}
+knitr::kable(round_numeric_columns(binned_linearity, 3L), format = "html", row.names = FALSE)
+```
+
+# Figure
+
+```{r export-results, include=FALSE, eval=!use_saved_results}
+plot_data <- standardized_paths |>
+  dplyr::mutate(
+    predictor = factor(
+      predictor,
+      levels = c("Interactive/message", "Active/posting", "Passive/browsing")
+    ),
+    outcome = factor(outcome, levels = c("Peripheral", "Core"))
+  )
+
+coefficient_plot <- ggplot2::ggplot(
+  plot_data,
+  ggplot2::aes(
+    x = predictor, y = estimate, color = outcome,
+    group = outcome, ymin = ci_lower, ymax = ci_upper
+  )
+) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey60", linewidth = 0.4) +
+  ggplot2::geom_pointrange(
+    position = ggplot2::position_dodge(width = 0.5), linewidth = 0.45
+  ) +
+  ggplot2::facet_wrap(~ level, scales = "free_y") +
+  ggplot2::scale_color_manual(
+    values = c(Peripheral = "#2C7FB8", Core = "#D95F0E")
+  ) +
+  ggplot2::labs(
+    x = "Raw-duration engagement mode (level-standardized for comparison)",
+    y = "Standardized concurrent coefficient",
+    color = "Outcome",
+    title = "Engagement Time associations with Core and Peripheral manifestations",
+    subtitle = "Points are Mplus MLR estimates; intervals are 95% confidence intervals"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    legend.position = "top",
+    panel.grid.minor = ggplot2::element_blank(),
+    plot.title.position = "plot"
+  )
+
+ggplot2::ggsave(
+  filename = figure_file,
+  plot = coefficient_plot,
+  device = svglite::svglite,
+  width = 10,
+  height = 6,
+  bg = "white"
+)
+
+workbook_sheets <- list(
+  Model_Fit = round_numeric_columns(model_fit),
+  Raw_Paths = round_numeric_columns(raw_paths),
+  Standardized_Paths = round_numeric_columns(standardized_paths),
+  Standardized_Contrasts = round_numeric_columns(standardized_contrasts),
+  R_Squared = round_numeric_columns(r_squared),
+  Diagnostics = round_numeric_columns(diagnostics),
+  Duration_Diagnostics = round_numeric_columns(duration_diagnostics),
+  Multicollinearity = round_numeric_columns(dplyr::bind_rows(
+    vif_diagnostics,
+    condition_diagnostics |>
+      dplyr::mutate(variable = "Overall condition index", vif = NA_real_)
+  ))
+)
+
+bruceR::export(workbook_sheets, file = table_file, overwrite = TRUE)
+style_and_sanitize_workbook(table_file, workbook_sheets)
+
+fit_s3_2_engagement_core_peripheral <- list(
+  metadata = list(
+    generated_by = paste0(
+      "Step_3_Concurrent_Multilevel_Associations/",
+      "S3_2_EngagementTimeCorePeripheral.Rmd"
+    ),
+    input_file = "Res_2_Data_for_Analysis/dat_step3_concurrent.rda",
+    input_md5 = unname(tools::md5sum(input_file)),
+    observations = expected_observations,
+    clusters = expected_clusters,
+    estimator = "MLR",
+    mplus_version = unique(model_fit$mplus_version),
+    duration_treatment = "Raw minutes",
+    interpretation = "Concurrent association; not causal"
+  ),
+  model_runs = model_runs,
+  model_fit = model_fit,
+  raw_paths = raw_paths,
+  standardized_paths = standardized_paths,
+  standardized_contrasts = standardized_contrasts,
+  r_squared = r_squared,
+  diagnostics = diagnostics,
+  sign_agreement = sign_agreement,
+  duration_diagnostics = duration_diagnostics,
+  vif_diagnostics = vif_diagnostics,
+  condition_diagnostics = condition_diagnostics,
+  binned_linearity = binned_linearity,
+  variable_map = variable_map,
+  output_files = list(
+    result_rda = "Res_2_Data_for_Analysis/fit_s3_2_engagement_core_peripheral.rda",
+    workbook = "Res_3_Results/Table_S3_2_EngagementTimeCorePeripheral.xlsx",
+    figure = "Res_3_Results/Figure_S3_2_EngagementTimeCorePeripheral.svg"
+  )
+)
+
+save(
+  fit_s3_2_engagement_core_peripheral,
+  file = result_file,
+  compress = "xz",
+  version = 3
+)
+```
+
+```{r result-figure, echo=FALSE}
+knitr::include_graphics(figure_file, rel_path = FALSE)
+```
+
+```{r final-validation, include=FALSE, eval=!use_saved_results}
+verified_result <- load_single_object(
+  result_file, "fit_s3_2_engagement_core_peripheral"
+)
+workbook_sheets_read <- readxl::excel_sheets(table_file)
+svg_text <- readLines(figure_file, warn = FALSE)
+xlsx_entries <- utils::unzip(table_file, list = TRUE)$Name
+xlsx_relationship_entries <- xlsx_entries[grepl("\\.rels$", xlsx_entries)]
+xlsx_relationship_text <- unlist(lapply(xlsx_relationship_entries, function(entry) {
+  readLines(unz(table_file, entry), warn = FALSE)
+}), use.names = FALSE)
+dangling_drawing_relationship <- any(grepl(
+  "relationships/(drawing|vmlDrawing)", xlsx_relationship_text
+))
+
+artifact_audit <- data.frame(
+  artifact = c("Result RDA", "Workbook", "SVG figure"),
+  exists = c(
+    file.exists(result_file), file.exists(table_file), file.exists(figure_file)
+  ),
+  bytes = c(
+    file.info(result_file)$size,
+    file.info(table_file)$size,
+    file.info(figure_file)$size
+  ),
+  md5 = unname(tools::md5sum(c(result_file, table_file, figure_file))),
+  stringsAsFactors = FALSE
+)
+
+validation <- data.frame(
+  gate = c(
+    "Both raw and standardized Mplus models terminated normally",
+    "Mplus 8.7 and MLR verified",
+    "Expected prompts and 209 clusters verified",
+    "Twelve focal paths per model parsed",
+    "Six direct contrasts per model parsed",
+    "Residual variances positive",
+    "R-squared admissible",
+    "Raw and standardized signs agree",
+    "Posting zero mass and endpoints retained",
+    "Workbook sheets verified",
+    "Workbook has no dangling drawing relationships",
+    "SVG is vector output",
+    "Saved result RDA reloaded"
+  ),
+  passed = c(
+    all(diagnostics$normal_termination),
+    all(model_fit$mplus_version == "8.7" & model_fit$estimator == "MLR"),
+    all(model_fit$observations == expected_observations &
+      model_fit$clusters == expected_clusters),
+    all(diagnostics$required_paths == 12L),
+    all(diagnostics$required_contrasts == 6L),
+    all(diagnostics$residual_variances_positive),
+    all(r_squared$r_squared >= 0 & r_squared$r_squared <= 1),
+    all(sign_agreement$sign_agrees),
+    duration_diagnostics$zero_percent[
+      duration_diagnostics$variable == "ActiveTime"
+    ] > 75 &&
+      duration_diagnostics$endpoint_300_count[
+        duration_diagnostics$variable == "ActiveTime"
+      ] == 5L,
+    identical(workbook_sheets_read, names(workbook_sheets)),
+    !dangling_drawing_relationship,
+    any(grepl("<svg", svg_text, fixed = TRUE)) &&
+      !any(grepl("<image", svg_text, fixed = TRUE)),
+    identical(
+      verified_result$metadata$observations,
+      expected_observations
+    )
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(all(artifact_audit$exists), all(validation$passed))
+
+```

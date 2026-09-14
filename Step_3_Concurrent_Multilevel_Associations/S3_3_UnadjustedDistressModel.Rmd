@@ -1,0 +1,1304 @@
+---
+title: "S3.3 Distress model without Engagement Time"
+author: "Kunru Song"
+date: "2026-07-20"
+params:
+  use_saved_results: false
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+
+<style>
+table { display: block; max-width: 100%; overflow-x: auto; }
+th, td { padding: 6px 9px; white-space: nowrap; }
+</style>
+
+This analysis is retained in the public repository for transparency and is not
+reported in the manuscript or supplementary materials.
+
+This report estimates the Step 3 Distress main model without Engagement Time.
+Core and Peripheral strict-complete mean scores enter simultaneously at the
+within-person and between-person levels. Assessment occasion and centered
+linear study day are design-based nuisance adjustments at the within-person
+level. The primary test is the standardized within-person Core-minus-Peripheral
+slope contrast. All paths are concurrent associations, not causal effects.
+
+```{r setup, include=FALSE}
+use_saved_results <- {
+  value <- params$use_saved_results
+  if (!is.logical(value) || length(value) != 1L || is.na(value)) {
+    stop("use_saved_results must be one non-missing logical value")
+  }
+  value
+}
+
+public_model_diagnostics <- function(data) {
+  if ("warning_summary" %in% names(data) && !"warning_text" %in% names(data)) return(data)
+  warning_text <- as.character(data$warning_text)
+  stopifnot(length(warning_text) == nrow(data))
+  output <- data[, setdiff(names(data), c("warning_text", "error_text")), drop = FALSE]
+  output$warning_summary <- ifelse(
+    grepl("following clusters|cluster IDs", warning_text, ignore.case = TRUE),
+    "Includes a within-cluster variation warning; individual details remain private",
+    ifelse(nzchar(warning_text), "Other warning; details retained locally", "None")
+  )
+  output
+}
+
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  collapse = FALSE, comment = NA, dev = "svglite"
+)
+
+required_packages <- c(
+  "bruceR", "dplyr", "ggplot2", "knitr", "MplusAutomation",
+  "openxlsx", "readxl", "rmarkdown", "svglite", "tibble", "tidyr"
+)
+package_available <- vapply(
+  required_packages, requireNamespace, logical(1), quietly = TRUE
+)
+if (!all(package_available)) {
+  stop(
+    "Missing required R packages: ",
+    paste(names(package_available)[!package_available], collapse = ", ")
+  )
+}
+
+locate_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(current)) current <- dirname(current)
+  repeat {
+    if (all(dir.exists(file.path(current, c(
+      "Step_1_Descriptive_and_Reliability",
+      "Step_3_Concurrent_Multilevel_Associations"
+    ))))) return(current)
+    parent <- dirname(current)
+    if (identical(parent, current)) break
+    current <- parent
+  }
+  stop("Could not locate the project from its public Step directories")
+}
+
+load_single_object <- function(path, expected_name) {
+  environment <- new.env(parent = emptyenv())
+  loaded <- load(path, envir = environment)
+  if (!identical(loaded, expected_name)) {
+    stop(
+      "Expected only ", expected_name, " in ", path,
+      "; found: ", paste(loaded, collapse = ", ")
+    )
+  }
+  environment[[expected_name]]
+}
+
+mplus_numeric <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+summary_value <- function(summary_row, candidates, type = c("numeric", "character")) {
+  type <- match.arg(type)
+  hit <- intersect(candidates, names(summary_row))
+  if (!length(hit)) return(if (type == "numeric") NA_real_ else NA_character_)
+  value <- summary_row[[hit[[1L]]]][[1L]]
+  if (type == "numeric") mplus_numeric(value) else as.character(value)
+}
+
+flatten_messages <- function(x) {
+  if (is.null(x) || !length(x)) return("")
+  paste(unlist(x, recursive = TRUE, use.names = FALSE), collapse = " | ")
+}
+
+parse_output_integer <- function(path, label) {
+  lines <- readLines(path, warn = FALSE)
+  hit <- grep(label, lines, ignore.case = TRUE, value = TRUE, fixed = TRUE)
+  if (!length(hit)) return(NA_integer_)
+  numbers <- regmatches(hit[[1L]], gregexpr("[0-9]+", hit[[1L]]))[[1L]]
+  if (!length(numbers)) NA_integer_ else as.integer(tail(numbers, 1L))
+}
+
+round_numeric_columns <- function(data, digits = 4L) {
+  data |>
+    dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, digits)))
+}
+
+vif_table <- function(data, variables, level_label, model_label) {
+  x <- as.data.frame(data[stats::complete.cases(data[variables]), variables, drop = FALSE])
+  dplyr::bind_rows(lapply(variables, function(target) {
+    others <- setdiff(variables, target)
+    fit <- stats::lm(stats::reformulate(others, response = target), data = x)
+    r_squared <- summary(fit)$r.squared
+    data.frame(
+      model = model_label, level = level_label, variable = target,
+      r_squared_from_other_predictors = r_squared,
+      vif = 1 / (1 - r_squared), stringsAsFactors = FALSE
+    )
+  }))
+}
+
+condition_index <- function(data, variables) {
+  x <- data[stats::complete.cases(data[variables]), variables, drop = FALSE]
+  correlation <- stats::cor(x)
+  eigenvalues <- eigen(correlation, symmetric = TRUE, only.values = TRUE)$values
+  sqrt(max(eigenvalues) / min(eigenvalues))
+}
+
+skewness <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3L || stats::sd(x) == 0) return(NA_real_)
+  mean((x - mean(x))^3) / stats::sd(x)^3
+}
+
+excess_kurtosis <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 4L || stats::sd(x) == 0) return(NA_real_)
+  mean((x - mean(x))^4) / stats::sd(x)^4 - 3
+}
+
+style_and_sanitize_workbook <- function(path, sheet_data) {
+  workbook <- openxlsx::loadWorkbook(path)
+  header_style <- openxlsx::createStyle(
+    fontName = "Aptos", fontSize = 10, textDecoration = "bold",
+    fontColour = "#FFFFFF", fgFill = "#1F4E78",
+    halign = "center", valign = "center", wrapText = TRUE,
+    border = "bottom", borderColour = "#163A5C"
+  )
+  body_style <- openxlsx::createStyle(
+    fontName = "Aptos", fontSize = 10, valign = "top", wrapText = TRUE
+  )
+  integer_style <- openxlsx::createStyle(numFmt = "0")
+  decimal_style <- openxlsx::createStyle(numFmt = "0.0000")
+
+  for (sheet_name in names(sheet_data)) {
+    data <- sheet_data[[sheet_name]]
+    row_count <- nrow(data) + 1L
+    column_count <- ncol(data)
+    openxlsx::showGridLines(workbook, sheet = sheet_name, showGridLines = FALSE)
+    openxlsx::freezePane(workbook, sheet = sheet_name, firstRow = TRUE)
+    openxlsx::setRowHeights(workbook, sheet = sheet_name, rows = 1L, heights = 30)
+    openxlsx::addStyle(
+      workbook, sheet = sheet_name, style = header_style,
+      rows = 1L, cols = seq_len(column_count), gridExpand = TRUE, stack = TRUE
+    )
+    if (row_count > 1L) {
+      openxlsx::addStyle(
+        workbook, sheet = sheet_name, style = body_style,
+        rows = 2L:row_count, cols = seq_len(column_count),
+        gridExpand = TRUE, stack = TRUE
+      )
+    }
+    integer_columns <- which(
+      vapply(data, is.integer, logical(1)) |
+        names(data) %in% c(
+          "observations", "clusters", "free_parameters", "df", "errors_n",
+          "warnings_n", "required_paths", "required_contrasts", "n",
+          "rank", "cluster_id", "endpoint_300_count", "n_observed"
+        )
+    )
+    numeric_columns <- setdiff(which(vapply(data, is.numeric, logical(1))), integer_columns)
+    if (row_count > 1L && length(integer_columns)) {
+      openxlsx::addStyle(
+        workbook, sheet = sheet_name, style = integer_style,
+        rows = 2L:row_count, cols = integer_columns,
+        gridExpand = TRUE, stack = TRUE
+      )
+    }
+    if (row_count > 1L && length(numeric_columns)) {
+      openxlsx::addStyle(
+        workbook, sheet = sheet_name, style = decimal_style,
+        rows = 2L:row_count, cols = numeric_columns,
+        gridExpand = TRUE, stack = TRUE
+      )
+    }
+    column_widths <- vapply(seq_len(column_count), function(column_index) {
+      values <- c(names(data)[column_index], as.character(data[[column_index]]))
+      values[is.na(values)] <- ""
+      max_width <- max(nchar(values, type = "width"), na.rm = TRUE) + 2L
+      min(42, max(11, max_width))
+    }, numeric(1))
+    openxlsx::setColWidths(
+      workbook, sheet = sheet_name, cols = seq_len(column_count),
+      widths = column_widths
+    )
+  }
+
+  workbook$worksheets_rels <- lapply(
+    workbook$worksheets_rels,
+    function(x) x[grepl("printerSettings", x, fixed = TRUE)]
+  )
+  workbook$Content_Types <- workbook$Content_Types[
+    !grepl("/xl/drawings/", workbook$Content_Types, fixed = TRUE)
+  ]
+  openxlsx::saveWorkbook(workbook, path, overwrite = TRUE)
+  invisible(path)
+}
+
+report_file <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(
+  if (length(report_file) == 1L && file.exists(report_file)) report_file else getwd()
+)
+knitr::opts_knit$set(root.dir = project_root)
+
+input_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "dat_step3_concurrent.rda"
+)
+result_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "fit_s3_3_unadjusted_distress.rda"
+)
+table_file <- file.path(
+  project_root, "Res_3_Results", "Table_S3_3_UnadjustedDistress.xlsx"
+)
+figure_file <- file.path(
+  project_root, "Res_3_Results", "Figure_S3_3_UnadjustedDistress.svg"
+)
+mplus_directory <- file.path(
+  project_root, "Step_3_Concurrent_Multilevel_Associations", "mplus", "s3_3"
+)
+mplus_command <- Sys.getenv("MPLUS_COMMAND", unset = "D:/Program Files/Mplus/Mplus.exe")
+
+stopifnot(file.exists(input_file))
+if (!use_saved_results) {
+  stopifnot(file.exists(mplus_command))
+  dir.create(dirname(result_file), recursive = TRUE, showWarnings = FALSE)
+  dir.create(dirname(table_file), recursive = TRUE, showWarnings = FALSE)
+  dir.create(dirname(figure_file), recursive = TRUE, showWarnings = FALSE)
+  dir.create(mplus_directory, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+
+```{r load-saved-results, include=FALSE, eval=use_saved_results}
+load_saved_display <- function(path, input_path) {
+  saved <- load_single_object(path, "fit_s3_3_unadjusted_distress")
+  stopifnot(is.list(saved), is.list(saved$metadata))
+  metadata <- saved$metadata
+  stopifnot(
+    identical(metadata$input_md5, unname(tools::md5sum(input_path))),
+    isTRUE(metadata$observations == 17755L), isTRUE(metadata$clusters == 209L),
+    identical(metadata$estimator, "MLR"),
+    length(metadata$mplus_version) == 1L,
+    metadata$mplus_version %in% c("8.7", "9")
+  )
+  fields <- c("variable_map", "model_fit", "raw_paths", "standardized_paths", "standardized_contrasts", "r_squared", "diagnostics", "predictor_correlations", "linearity_bins", "residual_diagnostics", "duration_context", "diagnostic_flags")
+  stopifnot(all(fields %in% names(saved)))
+  tables <- saved[fields]
+  predictor <- saved$predictor_diagnostics
+  stopifnot(is.data.frame(predictor), all(c("model", "level", "diagnostic_type",
+    "variable", "r_squared_from_other_predictors", "vif", "condition_index") %in% names(predictor)))
+  tables$vif_diagnostics <- predictor[predictor$diagnostic_type == "VIF",
+    c("model", "level", "variable", "r_squared_from_other_predictors", "vif"), drop = FALSE]
+  tables$condition_diagnostics <- predictor[predictor$diagnostic_type == "Condition index",
+    c("model", "level", "condition_index"), drop = FALSE]
+  influence <- saved$influence_diagnostics
+  stopifnot(is.data.frame(influence),
+    all(c("level", "maximum_absolute_change") %in% names(influence)),
+    all(is.finite(influence$maximum_absolute_change)))
+  tables$influence_public_summary <- influence |>
+    dplyr::group_by(level) |>
+    dplyr::summarise(maximum_absolute_change = max(maximum_absolute_change), .groups = "drop")
+  # Raw message text can contain individual cluster identifiers.
+  tables$diagnostics <- public_model_diagnostics(tables$diagnostics)
+  expected_rows <- c(variable_map = 20L, model_fit = 2L, raw_paths = 4L, standardized_paths = 4L, standardized_contrasts = 2L, r_squared = 4L, diagnostics = 2L, predictor_correlations = 11L, linearity_bins = 20L, residual_diagnostics = 2L, duration_context = 3L, diagnostic_flags = 5L, vif_diagnostics = 9L, condition_diagnostics = 3L, influence_public_summary = 2L)
+  stopifnot(setequal(names(tables), names(expected_rows)))
+  required_columns <- list(
+    variable_map = c("representation", "mplus_variable", "project_variable"),
+    model_fit = c("model_id", "representation", "mplus_version", "estimator", "observations", "clusters", "free_parameters", "scaled_chi_square", "scaling_correction", "df", "p_value", "cfi", "tli", "rmsea", "srmr_within", "srmr_between", "loglikelihood", "aic", "bic", "adjusted_bic"),
+    raw_paths = c("model_id", "representation", "scale", "level", "outcome", "predictor", "estimate", "se", "z", "p_value", "ci_lower", "ci_upper"),
+    standardized_paths = c("model_id", "representation", "scale", "level", "outcome", "predictor", "estimate", "se", "z", "p_value", "ci_lower", "ci_upper"),
+    standardized_contrasts = c("model_id", "representation", "scale", "level", "contrast", "estimate", "se", "z", "p_value", "ci_lower", "ci_upper"),
+    r_squared = c("model_id", "representation", "level", "outcome", "r_squared"),
+    diagnostics = c("model_id", "representation", "normal_termination", "errors_n", "warnings_n", "minimum_residual_variance", "residual_variances_positive", "required_paths", "required_contrasts", "expected_paths_present", "expected_contrasts_present", "technical_pass", "warning_summary"),
+    predictor_correlations = c("model", "level", "variable_1", "variable_2", "correlation"),
+    linearity_bins = c("bin", "level", "predictor", "n", "mean_partial_predictor", "mean_partial_distress"),
+    residual_diagnostics = c("level", "n", "mean", "sd", "rmse", "skewness", "excess_kurtosis", "minimum", "maximum", "maximum_absolute"),
+    duration_context = c("variable", "behavior", "n_observed", "mean_minutes", "sd_minutes", "median_minutes", "minimum", "maximum", "zero_percent", "endpoint_300_count", "skewness", "excess_kurtosis"),
+    diagnostic_flags = c("diagnostic", "flagged"),
+    vif_diagnostics = c("model", "level", "variable", "r_squared_from_other_predictors", "vif"),
+    condition_diagnostics = c("model", "level", "condition_index"),
+    influence_public_summary = c("level", "maximum_absolute_change")
+  )
+  for (name in names(tables)) {
+    table <- tables[[name]]
+    stopifnot(is.data.frame(table), nrow(table) == expected_rows[[name]],
+      identical(names(table), required_columns[[name]]),
+      !anyDuplicated(names(table)),
+      !any(grepl("^(Name_ID|Data_ID|cluster_id|rank|warning_text|error_text)$",
+                 names(table), ignore.case = TRUE)))
+  }
+  stopifnot(
+    nrow(tables$model_fit) == 2L,
+    all(tables$model_fit$observations == metadata$observations),
+    all(tables$model_fit$clusters == metadata$clusters),
+    all(tables$model_fit$estimator == metadata$estimator),
+    all(tables$model_fit$mplus_version == metadata$mplus_version),
+    length(tables$diagnostics$technical_pass) == 2L,
+    all(tables$diagnostics$technical_pass),
+    all(tables$r_squared$r_squared >= 0 & tables$r_squared$r_squared <= 1),
+    file.exists(figure_file)
+  )
+  tables
+}
+saved_display <- load_saved_display(result_file, input_file)
+list2env(saved_display, envir = environment())
+```
+
+```{r saved-mode-note, echo=FALSE, results='asis', eval=use_saved_results}
+cat("This report displays accepted saved estimates and the existing SVG. ",
+    "No model, diagnostic regression, bootstrap or result export was rerun. ",
+    "The fit table retains the original Mplus version; the current reproduction code uses 8.7.\n\n", sep = "")
+```
+
+# Load and validate the fixed S3.3/S3.4 sample
+
+```{r load-and-validate-input, eval=!use_saved_results}
+dat_step3_concurrent <- load_single_object(input_file, "dat_step3_concurrent")
+stopifnot(
+  identical(
+    names(dat_step3_concurrent),
+    c(
+      "prompt", "person", "variable_map", "standardization",
+      "sample_audit", "diagnostics", "provenance"
+    )
+  ),
+  nrow(dat_step3_concurrent$prompt) == 18810L,
+  nrow(dat_step3_concurrent$person) == 209L,
+  identical(
+    dat_step3_concurrent$provenance$duration_treatment,
+    "Raw minutes; no log1p in Step 3"
+  )
+)
+
+dat_s33 <- dat_step3_concurrent$prompt |>
+  dplyr::filter(s33_s34_sample) |>
+  dplyr::arrange(Name_ID, Day, Time) |>
+  as.data.frame()
+
+expected_observations <- dat_step3_concurrent$sample_audit$prompts[
+  dat_step3_concurrent$sample_audit$sample == "S3.3/S3.4 common Distress sample"
+]
+expected_clusters <- 209L
+required_complete <- c(
+  "Core", "Peripheral", "Distress",
+  "InteractiveTime", "ActiveTime", "PassiveTime"
+)
+stopifnot(
+  nrow(dat_s33) == expected_observations,
+  expected_observations == 17755L,
+  dplyr::n_distinct(dat_s33$Name_ID) == expected_clusters,
+  !anyNA(dat_s33[required_complete]),
+  !anyDuplicated(dat_s33[c("Name_ID", "Day", "Time")])
+)
+
+input_audit <- data.frame(
+  scheduled_rows = nrow(dat_step3_concurrent$prompt),
+  analyzed_rows = nrow(dat_s33),
+  clusters = dplyr::n_distinct(dat_s33$Name_ID),
+  person_days = dplyr::n_distinct(interaction(
+    dat_s33$Name_ID, dat_s33$Day, drop = TRUE
+  )),
+  common_sample_for_s3_3_s3_4 = TRUE,
+  step3_rda_md5 = unname(tools::md5sum(input_file)),
+  stringsAsFactors = FALSE
+)
+```
+
+# Construct raw and level-standardized Mplus data
+
+The raw representation preserves the 1--5 mean-score units. The companion
+representation uses the S3.1 level-specific z scores so that the
+Core-minus-Peripheral contrast is directly interpretable on a common scale.
+
+```{r prepare-mplus-data, eval=!use_saved_results}
+raw_map <- c(
+  id = "Name_ID", dayc = "Day_c", tm2 = "Time_2", tm3 = "Time_3",
+  disw = "Distress_W", corew = "Core_W", periw = "Peripheral_W",
+  disb = "Distress_B", coreb = "Core_B", perib = "Peripheral_B"
+)
+standardized_map <- c(
+  id = "Name_ID", dayc = "Day_c", tm2 = "Time_2", tm3 = "Time_3",
+  diswz = "Distress_W_Z", corewz = "Core_W_Z", periwz = "Peripheral_W_Z",
+  disbz = "Distress_B_Z", corebz = "Core_B_Z", peribz = "Peripheral_B_Z"
+)
+
+make_mplus_data <- function(map) {
+  output <- dat_s33[unname(map)]
+  names(output) <- names(map)
+  output$id <- as.integer(factor(output$id, levels = sort(unique(output$id))))
+  stopifnot(!anyNA(output), nrow(output) == expected_observations)
+  as.data.frame(output)
+}
+
+mplus_data_raw <- make_mplus_data(raw_map)
+mplus_data_standardized <- make_mplus_data(standardized_map)
+variable_map <- dplyr::bind_rows(
+  data.frame(
+    representation = "Raw", mplus_variable = names(raw_map),
+    project_variable = unname(raw_map), stringsAsFactors = FALSE
+  ),
+  data.frame(
+    representation = "Level-standardized",
+    mplus_variable = names(standardized_map),
+    project_variable = unname(standardized_map), stringsAsFactors = FALSE
+  )
+)
+```
+
+```{r variable-map-table, echo=FALSE}
+knitr::kable(variable_map, format = "html", row.names = FALSE)
+```
+
+# Define and run the Mplus models
+
+```{r run-mplus-models, eval=!use_saved_results}
+model_specifications <- list(
+  raw = list(
+    id = "S3_3_RAW",
+    label = "Raw strict-complete mean scores",
+    stem = "s3_3_unadjusted_distress_raw",
+    data = mplus_data_raw,
+    usevariables = names(raw_map),
+    variable = paste(
+      "CLUSTER = id;",
+      "WITHIN = disw corew periw dayc tm2 tm3;",
+      "BETWEEN = disb coreb perib;",
+      sep = "\n"
+    ),
+    model = paste(
+      "%WITHIN%",
+      "disw ON corew (wc);",
+      "disw ON periw (wp);",
+      "disw ON dayc;",
+      "disw ON tm2;",
+      "disw ON tm3;",
+      "%BETWEEN%",
+      "disb ON coreb (bc);",
+      "disb ON perib (bp);",
+      sep = "\n"
+    )
+  ),
+  standardized = list(
+    id = "S3_3_STD",
+    label = "Level-standardized focal model",
+    stem = "s3_3_unadjusted_distress_standardized",
+    data = mplus_data_standardized,
+    usevariables = names(standardized_map),
+    variable = paste(
+      "CLUSTER = id;",
+      "WITHIN = diswz corewz periwz dayc tm2 tm3;",
+      "BETWEEN = disbz corebz peribz;",
+      sep = "\n"
+    ),
+    model = paste(
+      "%WITHIN%",
+      "diswz ON corewz (wc);",
+      "diswz ON periwz (wp);",
+      "diswz ON dayc;",
+      "diswz ON tm2;",
+      "diswz ON tm3;",
+      "%BETWEEN%",
+      "disbz ON corebz (bc);",
+      "disbz ON peribz (bp);",
+      sep = "\n"
+    )
+  )
+)
+
+model_constraint <- paste(
+  "NEW(wdiff bdiff);",
+  "wdiff = wc - wp;",
+  "bdiff = bc - bp;",
+  sep = "\n"
+)
+
+run_mplus_model <- function(specification) {
+  data_path <- file.path(mplus_directory, paste0(specification$stem, ".dat"))
+  input_path <- file.path(mplus_directory, paste0(specification$stem, ".inp"))
+  output_path <- file.path(mplus_directory, paste0(specification$stem, ".out"))
+
+  mplus_object <- MplusAutomation::mplusObject(
+    TITLE = paste(
+      "! Author: Kunru Song",
+      "! Step 3.3 Distress model without Engagement Time.",
+      "! Concurrent association; Time and Day are within-level design controls.",
+      specification$label,
+      sep = "\n"
+    ),
+    VARIABLE = specification$variable,
+    ANALYSIS = paste("TYPE = TWOLEVEL;", "ESTIMATOR = MLR;", sep = "\n"),
+    MODEL = specification$model,
+    MODELCONSTRAINT = model_constraint,
+    OUTPUT = paste(
+      "SAMPSTAT;", "STANDARDIZED(STDYX);", "CINTERVAL;",
+      "RESIDUAL;", "TECH1;", "TECH4;", sep = "\n"
+    ),
+    usevariables = specification$usevariables,
+    rdata = specification$data,
+    autov = FALSE,
+    quiet = TRUE
+  )
+
+  modeler_result <- MplusAutomation::mplusModeler(
+    object = mplus_object,
+    dataout = data_path,
+    modelout = input_path,
+    run = 1L,
+    check = FALSE,
+    varwarnings = TRUE,
+    Mplus_command = mplus_command,
+    writeData = "always",
+    hashfilename = FALSE,
+    killOnFail = TRUE,
+    quiet = TRUE
+  )
+
+  stopifnot(file.exists(data_path), file.exists(input_path), file.exists(output_path))
+  input_lines <- readLines(input_path, warn = FALSE)
+  output_lines <- readLines(output_path, warn = FALSE)
+  parsed <- MplusAutomation::readModels(output_path, what = "all", quiet = TRUE)
+  checks <- list(
+    author_present = any(trimws(input_lines) == "! Author: Kunru Song"),
+    missing_declared = any(grepl(
+      "MISSING\\s*=\\s*\\.;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    twolevel_declared = any(grepl(
+      "TYPE\\s*=\\s*TWOLEVEL;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    mlr_declared = any(grepl(
+      "ESTIMATOR\\s*=\\s*MLR;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    cluster_declared = any(grepl(
+      "CLUSTER\\s*=\\s*id;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    constraint_declared = any(grepl(
+      "MODEL CONSTRAINT", input_lines, ignore.case = TRUE, fixed = TRUE
+    )),
+    normal_termination = any(grepl(
+      "THE MODEL ESTIMATION TERMINATED NORMALLY", output_lines, fixed = TRUE
+    )),
+    no_engagement_variables = !any(grepl(
+      "intw|actw|pasw|intb|actb|pasb", input_lines,
+      ignore.case = TRUE, perl = TRUE
+    ))
+  )
+  summary_row <- parsed$summaries[1, , drop = FALSE]
+  checks$mplus_8_7 <- identical(
+    summary_value(summary_row, "Mplus.version", "character"), "8.7"
+  )
+  checks$estimator_mlr <- identical(
+    summary_value(summary_row, "Estimator", "character"), "MLR"
+  )
+  checks$observations_match <-
+    as.integer(summary_value(summary_row, "Observations", "numeric")) ==
+      expected_observations
+  checks$clusters_match <-
+    parse_output_integer(output_path, "Number of clusters") == expected_clusters
+  stopifnot(all(unlist(checks)))
+
+  list(
+    model_id = specification$id,
+    model_label = specification$label,
+    syntax = list(
+      variable = specification$variable,
+      model = specification$model,
+      constraint = model_constraint
+    ),
+    paths = list(data = data_path, input = input_path, output = output_path),
+    file_md5 = unname(tools::md5sum(c(data_path, input_path, output_path))),
+    checks = checks,
+    parsed = parsed,
+    modeler_result = modeler_result,
+    warnings = flatten_messages(parsed$warnings),
+    errors = flatten_messages(parsed$errors)
+  )
+}
+
+model_runs <- lapply(model_specifications, run_mplus_model)
+```
+
+# Extract fit, focal paths, direct contrasts, and R-squared
+
+Full warning/error text is kept in the local result object because it can contain
+individual cluster identifiers. The public table retains warning/error flags and
+an aggregate warning description. Fit indices for saturated models (df = 0) are
+not interpreted.
+
+```{r extract-results, eval=!use_saved_results}
+extract_fit <- function(run) {
+  s <- run$parsed$summaries[1, , drop = FALSE]
+  data.frame(
+    model_id = run$model_id,
+    representation = run$model_label,
+    mplus_version = summary_value(s, "Mplus.version", "character"),
+    estimator = summary_value(s, "Estimator", "character"),
+    observations = summary_value(s, "Observations", "numeric"),
+    clusters = parse_output_integer(run$paths$output, "Number of clusters"),
+    free_parameters = summary_value(s, "Parameters", "numeric"),
+    scaled_chi_square = summary_value(s, "ChiSqM_Value", "numeric"),
+    scaling_correction = summary_value(s, "ChiSqM_ScalingCorrection", "numeric"),
+    df = summary_value(s, "ChiSqM_DF", "numeric"),
+    p_value = summary_value(s, "ChiSqM_PValue", "numeric"),
+    cfi = summary_value(s, "CFI", "numeric"),
+    tli = summary_value(s, "TLI", "numeric"),
+    rmsea = summary_value(s, "RMSEA_Estimate", "numeric"),
+    srmr_within = summary_value(
+      s, c("SRMR.Within", "SRMR_Within", "SRMRWithin"), "numeric"
+    ),
+    srmr_between = summary_value(
+      s, c("SRMR.Between", "SRMR_Between", "SRMRBetween"), "numeric"
+    ),
+    loglikelihood = summary_value(s, "LL", "numeric"),
+    aic = summary_value(s, "AIC", "numeric"),
+    bic = summary_value(s, "BIC", "numeric"),
+    adjusted_bic = summary_value(s, "aBIC", "numeric"),
+    stringsAsFactors = FALSE
+  )
+}
+
+outcome_dictionary <- c(
+  DISW = "Distress", DISB = "Distress",
+  DISWZ = "Distress", DISBZ = "Distress"
+)
+predictor_dictionary <- c(
+  COREW = "Core", PERIW = "Peripheral", COREB = "Core", PERIB = "Peripheral",
+  COREWZ = "Core", PERIWZ = "Peripheral",
+  COREBZ = "Core", PERIBZ = "Peripheral"
+)
+
+extract_paths <- function(run) {
+  parameters <- run$parsed$parameters$unstandardized |>
+    dplyr::mutate(dplyr::across(
+      dplyr::any_of(c("est", "se", "est_se", "pval")), mplus_numeric
+    ))
+  ci <- run$parsed$parameters$ci.unstandardized
+  if (!is.null(ci) && nrow(ci)) {
+    ci <- ci |>
+      dplyr::mutate(dplyr::across(
+        dplyr::any_of(c("low2.5", "up2.5")), mplus_numeric
+      )) |>
+      dplyr::select(dplyr::any_of(c(
+        "paramHeader", "param", "BetweenWithin", "low2.5", "up2.5"
+      )))
+  }
+  paths <- parameters |>
+    dplyr::filter(grepl("\\.ON$", paramHeader)) |>
+    dplyr::mutate(
+      outcome_code = sub("\\.ON$", "", paramHeader),
+      predictor_code = param,
+      outcome = unname(outcome_dictionary[outcome_code]),
+      predictor = unname(predictor_dictionary[predictor_code])
+    ) |>
+    dplyr::filter(!is.na(outcome), !is.na(predictor)) |>
+    dplyr::select(
+      paramHeader, param, BetweenWithin, outcome_code, outcome, predictor,
+      estimate = est, se, z = est_se, p_value = pval
+    )
+  if (!is.null(ci) && nrow(ci)) {
+    paths <- paths |>
+      dplyr::left_join(ci, by = c("paramHeader", "param", "BetweenWithin")) |>
+      dplyr::rename(ci_lower = low2.5, ci_upper = up2.5)
+  } else {
+    paths$ci_lower <- paths$estimate - 1.96 * paths$se
+    paths$ci_upper <- paths$estimate + 1.96 * paths$se
+  }
+  paths |>
+    dplyr::mutate(
+      model_id = run$model_id,
+      representation = run$model_label,
+      level = ifelse(grepl("B$|BZ$", outcome_code), "Between", "Within"),
+      scale = ifelse(grepl("Z$", outcome_code), "Standardized", "Raw")
+    ) |>
+    dplyr::select(
+      model_id, representation, scale, level, outcome, predictor,
+      estimate, se, z, p_value, ci_lower, ci_upper
+    )
+}
+
+contrast_dictionary <- data.frame(
+  param = c("WDIFF", "BDIFF"),
+  level = c("Within", "Between"), stringsAsFactors = FALSE
+)
+
+extract_contrasts <- function(run) {
+  run$parsed$parameters$unstandardized |>
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::any_of(c("est", "se", "est_se", "pval")), mplus_numeric
+      ),
+      param_upper = toupper(param)
+    ) |>
+    dplyr::filter(param_upper %in% contrast_dictionary$param) |>
+    dplyr::left_join(contrast_dictionary, by = c("param_upper" = "param")) |>
+    dplyr::transmute(
+      model_id = run$model_id,
+      representation = run$model_label,
+      scale = ifelse(run$model_id == "S3_3_STD", "Standardized", "Raw"),
+      level,
+      contrast = "Core slope - Peripheral slope",
+      estimate = est, se, z = est_se, p_value = pval,
+      ci_lower = est - 1.96 * se,
+      ci_upper = est + 1.96 * se
+    )
+}
+
+extract_r2 <- function(run) {
+  r2 <- run$parsed$parameters$r2
+  if (is.null(r2) || !nrow(r2)) return(data.frame())
+  r2 |>
+    dplyr::mutate(est = mplus_numeric(est), param_upper = toupper(param)) |>
+    dplyr::filter(param_upper %in% names(outcome_dictionary)) |>
+    dplyr::transmute(
+      model_id = run$model_id,
+      representation = run$model_label,
+      level = ifelse(grepl("B$|BZ$", param_upper), "Between", "Within"),
+      outcome = "Distress", r_squared = est
+    )
+}
+
+model_fit <- dplyr::bind_rows(lapply(model_runs, extract_fit))
+paths <- dplyr::bind_rows(lapply(model_runs, extract_paths))
+contrasts <- dplyr::bind_rows(lapply(model_runs, extract_contrasts))
+r_squared <- dplyr::bind_rows(lapply(model_runs, extract_r2))
+
+diagnostics <- dplyr::bind_rows(lapply(model_runs, function(run) {
+  residuals <- run$parsed$parameters$unstandardized |>
+    dplyr::mutate(est = mplus_numeric(est)) |>
+    dplyr::filter(paramHeader == "Residual.Variances")
+  data.frame(
+    model_id = run$model_id,
+    representation = run$model_label,
+    normal_termination = run$checks$normal_termination,
+    errors_n = ifelse(nzchar(run$errors), 1L, 0L),
+    warnings_n = ifelse(nzchar(run$warnings), 1L, 0L),
+    minimum_residual_variance = if (nrow(residuals)) min(residuals$est) else NA_real_,
+    residual_variances_positive = if (nrow(residuals)) all(residuals$est > 0) else FALSE,
+    required_paths = sum(paths$model_id == run$model_id),
+    required_contrasts = sum(contrasts$model_id == run$model_id),
+    warning_text = run$warnings,
+    error_text = ifelse(nzchar(run$errors), run$errors, "None"),
+    stringsAsFactors = FALSE
+  )
+})) |>
+  dplyr::mutate(
+    expected_paths_present = required_paths == 4L,
+    expected_contrasts_present = required_contrasts == 2L,
+    technical_pass = normal_termination & errors_n == 0L &
+      residual_variances_positive & expected_paths_present &
+      expected_contrasts_present
+  )
+
+raw_paths <- paths |> dplyr::filter(model_id == "S3_3_RAW")
+standardized_paths <- paths |> dplyr::filter(model_id == "S3_3_STD")
+standardized_contrasts <- contrasts |> dplyr::filter(model_id == "S3_3_STD")
+sign_agreement <- raw_paths |>
+  dplyr::select(level, predictor, raw_estimate = estimate) |>
+  dplyr::left_join(
+    standardized_paths |>
+      dplyr::select(level, predictor, standardized_estimate = estimate),
+    by = c("level", "predictor")
+  ) |>
+  dplyr::mutate(sign_agrees = sign(raw_estimate) == sign(standardized_estimate))
+
+stopifnot(
+  nrow(model_fit) == 2L,
+  nrow(raw_paths) == 4L,
+  nrow(standardized_paths) == 4L,
+  nrow(contrasts) == 4L,
+  nrow(standardized_contrasts) == 2L,
+  all(diagnostics$technical_pass),
+  all(sign_agreement$sign_agrees),
+  nrow(r_squared) == 4L,
+  all(r_squared$r_squared >= 0 & r_squared$r_squared <= 1)
+)
+
+```
+
+```{r model-fit-table, echo=FALSE}
+knitr::kable(round_numeric_columns(model_fit), format = "html", row.names = FALSE)
+```
+
+```{r raw-paths-table, echo=FALSE}
+knitr::kable(round_numeric_columns(raw_paths), format = "html", row.names = FALSE)
+```
+
+```{r standardized-paths-table, echo=FALSE}
+knitr::kable(round_numeric_columns(standardized_paths), format = "html", row.names = FALSE)
+```
+
+```{r standardized-contrasts-table, echo=FALSE}
+knitr::kable(round_numeric_columns(standardized_contrasts), format = "html", row.names = FALSE)
+```
+
+```{r r-squared-table, echo=FALSE}
+knitr::kable(round_numeric_columns(r_squared), format = "html", row.names = FALSE)
+```
+
+```{r diagnostics-table, echo=FALSE}
+knitr::kable(round_numeric_columns(public_model_diagnostics(diagnostics)), format = "html", row.names = FALSE)
+```
+
+# Predictor, linearity, residual, and influence diagnostics
+
+The diagnostic regressions below are R screening companions to the canonical
+Mplus estimates. They use the identical fixed sample and structural predictors
+to inspect multicollinearity, partial linearity, residual shape, and sensitivity
+to individual clusters. They do not replace Mplus inference and do not delete
+participants automatically.
+
+Cluster-specific influence records remain in the local result object and
+workbook. The public report shows only the largest absolute Core/Peripheral
+coefficient change at each level, without participant identifiers or rankings.
+
+```{r diagnostic-audit, eval=!use_saved_results}
+between_data <- dat_s33 |>
+  dplyr::select(Name_ID, Distress_B, Core_B, Peripheral_B,
+    Distress_B_Z, Core_B_Z, Peripheral_B_Z) |>
+  dplyr::distinct() |>
+  as.data.frame()
+stopifnot(nrow(between_data) == expected_clusters)
+
+within_focus <- c("Core_W", "Peripheral_W")
+within_design <- c("Core_W", "Peripheral_W", "Day_c", "Time_2", "Time_3")
+between_focus <- c("Core_B", "Peripheral_B")
+
+vif_diagnostics <- dplyr::bind_rows(
+  vif_table(dat_s33, within_focus, "Within", "S3.3 focal predictors"),
+  vif_table(dat_s33, within_design, "Within", "S3.3 including Time/Day"),
+  vif_table(between_data, between_focus, "Between", "S3.3 focal predictors")
+)
+condition_diagnostics <- data.frame(
+  model = c(
+    "S3.3 focal predictors", "S3.3 including Time/Day",
+    "S3.3 focal predictors"
+  ),
+  level = c("Within", "Within", "Between"),
+  condition_index = c(
+    condition_index(dat_s33, within_focus),
+    condition_index(dat_s33, within_design),
+    condition_index(between_data, between_focus)
+  ),
+  stringsAsFactors = FALSE
+)
+
+correlation_pairs <- function(data, variables, level_label, model_label) {
+  matrix <- stats::cor(data[variables], use = "pairwise.complete.obs")
+  indices <- which(upper.tri(matrix), arr.ind = TRUE)
+  data.frame(
+    model = model_label, level = level_label,
+    variable_1 = rownames(matrix)[indices[, 1]],
+    variable_2 = colnames(matrix)[indices[, 2]],
+    correlation = matrix[indices], stringsAsFactors = FALSE
+  )
+}
+predictor_correlations <- dplyr::bind_rows(
+  correlation_pairs(dat_s33, within_design, "Within", "S3.3 including Time/Day"),
+  correlation_pairs(between_data, between_focus, "Between", "S3.3 focal predictors")
+)
+
+partial_binned_summary <- function(data, focal, adjustment, label, level_label) {
+  outcome_residual <- stats::resid(stats::lm(
+    stats::reformulate(adjustment, response = "Distress_W_Z"), data = data
+  ))
+  predictor_residual <- stats::resid(stats::lm(
+    stats::reformulate(adjustment, response = focal), data = data
+  ))
+  data.frame(
+    partial_predictor = predictor_residual,
+    partial_distress = outcome_residual
+  ) |>
+    dplyr::mutate(bin = dplyr::ntile(partial_predictor, 10L)) |>
+    dplyr::group_by(bin) |>
+    dplyr::summarise(
+      level = .env$level_label,
+      predictor = .env$label,
+      n = dplyr::n(),
+      mean_partial_predictor = mean(partial_predictor),
+      mean_partial_distress = mean(partial_distress),
+      .groups = "drop"
+    )
+}
+linearity_bins <- dplyr::bind_rows(
+  partial_binned_summary(
+    dat_s33, "Core_W_Z",
+    c("Peripheral_W_Z", "Day_c", "Time_2", "Time_3"),
+    "Core", "Within"
+  ),
+  partial_binned_summary(
+    dat_s33, "Peripheral_W_Z",
+    c("Core_W_Z", "Day_c", "Time_2", "Time_3"),
+    "Peripheral", "Within"
+  )
+)
+
+within_screen <- stats::lm(
+  Distress_W ~ Core_W + Peripheral_W + Day_c + Time_2 + Time_3,
+  data = dat_s33
+)
+between_screen <- stats::lm(
+  Distress_B ~ Core_B + Peripheral_B, data = between_data
+)
+residual_diagnostics <- dplyr::bind_rows(lapply(
+  list(Within = stats::resid(within_screen), Between = stats::resid(between_screen)),
+  function(residual) {
+    data.frame(
+      n = length(residual), mean = mean(residual), sd = stats::sd(residual),
+      rmse = sqrt(mean(residual^2)), skewness = skewness(residual),
+      excess_kurtosis = excess_kurtosis(residual),
+      minimum = min(residual), maximum = max(residual),
+      maximum_absolute = max(abs(residual)), stringsAsFactors = FALSE
+    )
+  }
+), .id = "level")
+
+within_screen_z <- stats::lm(
+  Distress_W_Z ~ Core_W_Z + Peripheral_W_Z + Day_c + Time_2 + Time_3,
+  data = dat_s33
+)
+between_screen_z <- stats::lm(
+  Distress_B_Z ~ Core_B_Z + Peripheral_B_Z, data = between_data
+)
+within_reference <- stats::coef(within_screen_z)[c("Core_W_Z", "Peripheral_W_Z")]
+between_reference <- stats::coef(between_screen_z)[c("Core_B_Z", "Peripheral_B_Z")]
+
+within_leave_one_cluster <- dplyr::bind_rows(lapply(unique(dat_s33$Name_ID), function(id) {
+  fit <- stats::lm(
+    Distress_W_Z ~ Core_W_Z + Peripheral_W_Z + Day_c + Time_2 + Time_3,
+    data = dat_s33[dat_s33$Name_ID != id, ]
+  )
+  coefficient <- stats::coef(fit)[c("Core_W_Z", "Peripheral_W_Z")]
+  data.frame(
+    level = "Within", cluster_id = as.character(id),
+    core_change = coefficient[[1L]] - within_reference[[1L]],
+    peripheral_change = coefficient[[2L]] - within_reference[[2L]],
+    stringsAsFactors = FALSE
+  )
+}))
+between_leave_one_cluster <- dplyr::bind_rows(lapply(unique(between_data$Name_ID), function(id) {
+  fit <- stats::lm(
+    Distress_B_Z ~ Core_B_Z + Peripheral_B_Z,
+    data = between_data[between_data$Name_ID != id, ]
+  )
+  coefficient <- stats::coef(fit)[c("Core_B_Z", "Peripheral_B_Z")]
+  data.frame(
+    level = "Between", cluster_id = as.character(id),
+    core_change = coefficient[[1L]] - between_reference[[1L]],
+    peripheral_change = coefficient[[2L]] - between_reference[[2L]],
+    stringsAsFactors = FALSE
+  )
+}))
+influence_diagnostics <- dplyr::bind_rows(
+  within_leave_one_cluster, between_leave_one_cluster
+) |>
+  dplyr::mutate(
+    maximum_absolute_change = pmax(abs(core_change), abs(peripheral_change))
+  ) |>
+  dplyr::group_by(level) |>
+  dplyr::arrange(dplyr::desc(maximum_absolute_change), .by_group = TRUE) |>
+  dplyr::mutate(rank = dplyr::row_number()) |>
+  dplyr::filter(rank <= 10L) |>
+  dplyr::ungroup() |>
+  dplyr::select(
+    level, rank, cluster_id, core_change,
+    peripheral_change, maximum_absolute_change
+  )
+
+duration_context <- dplyr::bind_rows(lapply(
+  names(c(
+    InteractiveTime = "Interactive/message",
+    ActiveTime = "Active/posting",
+    PassiveTime = "Passive/browsing"
+  )),
+  function(variable) {
+    label <- c(
+      InteractiveTime = "Interactive/message",
+      ActiveTime = "Active/posting",
+      PassiveTime = "Passive/browsing"
+    )[[variable]]
+    x <- dat_s33[[variable]]
+    data.frame(
+      variable = variable, behavior = label, n_observed = length(x),
+      mean_minutes = mean(x), sd_minutes = stats::sd(x),
+      median_minutes = stats::median(x), minimum = min(x), maximum = max(x),
+      zero_percent = mean(x == 0) * 100,
+      endpoint_300_count = sum(x == 300),
+      skewness = skewness(x), excess_kurtosis = excess_kurtosis(x),
+      stringsAsFactors = FALSE
+    )
+  }
+))
+
+diagnostic_flags <- data.frame(
+  diagnostic = c(
+    "Maximum VIF exceeds 5",
+    "Maximum condition index exceeds 30",
+    "Posting zero percentage differs materially from verified context",
+    "Duration value outside 0-300",
+    "Influence diagnostic contains non-finite change"
+  ),
+  flagged = c(
+    max(vif_diagnostics$vif) > 5,
+    max(condition_diagnostics$condition_index) > 30,
+    abs(duration_context$zero_percent[duration_context$variable == "ActiveTime"] -
+      75.13) > 0.10,
+    any(duration_context$minimum < 0 | duration_context$maximum > 300),
+    any(!is.finite(influence_diagnostics$maximum_absolute_change))
+  ),
+  stringsAsFactors = FALSE
+)
+stopifnot(!any(diagnostic_flags$flagged))
+
+influence_public_summary <- influence_diagnostics |>
+  dplyr::group_by(level) |>
+  dplyr::summarise(
+    maximum_absolute_change = max(maximum_absolute_change), .groups = "drop"
+  )
+```
+
+```{r vif-diagnostics-table, echo=FALSE}
+knitr::kable(round_numeric_columns(vif_diagnostics, 3L), format = "html", row.names = FALSE)
+```
+
+```{r condition-diagnostics-table, echo=FALSE}
+knitr::kable(round_numeric_columns(condition_diagnostics, 3L), format = "html", row.names = FALSE)
+```
+
+```{r predictor-correlations-table, echo=FALSE}
+knitr::kable(round_numeric_columns(predictor_correlations, 3L), format = "html", row.names = FALSE)
+```
+
+```{r linearity-bins-table, echo=FALSE}
+knitr::kable(round_numeric_columns(linearity_bins, 3L), format = "html", row.names = FALSE)
+```
+
+```{r residual-diagnostics-table, echo=FALSE}
+knitr::kable(round_numeric_columns(residual_diagnostics, 3L), format = "html", row.names = FALSE)
+```
+
+```{r influence-public-summary-table, echo=FALSE}
+knitr::kable(round_numeric_columns(influence_public_summary, 4L), format = "html", row.names = FALSE)
+```
+
+```{r duration-context-table, echo=FALSE}
+knitr::kable(round_numeric_columns(duration_context, 3L), format = "html", row.names = FALSE)
+```
+
+```{r diagnostic-flags-table, echo=FALSE}
+knitr::kable(diagnostic_flags, format = "html", row.names = FALSE)
+```
+
+# Figure
+
+```{r export-results, include=FALSE, eval=!use_saved_results}
+plot_data <- dplyr::bind_rows(
+  standardized_paths |>
+    dplyr::transmute(
+      level, term = predictor, estimate, se, p_value, ci_lower, ci_upper,
+      estimate_type = "Simultaneous path"
+    ),
+  standardized_contrasts |>
+    dplyr::transmute(
+      level, term = "Core - Peripheral", estimate, se, p_value,
+      ci_lower, ci_upper, estimate_type = "Direct contrast"
+    )
+) |>
+  dplyr::mutate(
+    term = factor(term, levels = c("Core", "Peripheral", "Core - Peripheral")),
+    level = factor(level, levels = c("Within", "Between"))
+  )
+
+coefficient_plot <- ggplot2::ggplot(
+  plot_data,
+  ggplot2::aes(
+    x = term, y = estimate, ymin = ci_lower, ymax = ci_upper,
+    color = estimate_type
+  )
+) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey60", linewidth = 0.4) +
+  ggplot2::geom_pointrange(linewidth = 0.45) +
+  ggplot2::facet_wrap(~ level, scales = "free_y") +
+  ggplot2::scale_color_manual(
+    values = c("Simultaneous path" = "#2C7FB8", "Direct contrast" = "#D95F0E")
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = "Standardized concurrent coefficient",
+    color = NULL,
+    title = "Core and Peripheral associations with Distress",
+    subtitle = paste(
+      "S3.3 model without Engagement Time; points are Mplus MLR estimates",
+      "with 95% confidence intervals"
+    )
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    legend.position = "top", panel.grid.minor = ggplot2::element_blank(),
+    plot.title.position = "plot"
+  )
+
+ggplot2::ggsave(
+  filename = figure_file, plot = coefficient_plot,
+  device = svglite::svglite, width = 9, height = 5.5, bg = "white"
+)
+
+predictor_diagnostics <- dplyr::bind_rows(
+  vif_diagnostics |>
+    dplyr::mutate(condition_index = NA_real_, diagnostic_type = "VIF"),
+  condition_diagnostics |>
+    dplyr::mutate(
+      variable = "Overall condition index",
+      r_squared_from_other_predictors = NA_real_, vif = NA_real_,
+      diagnostic_type = "Condition index"
+    )
+) |>
+  dplyr::select(
+    model, level, diagnostic_type, variable,
+    r_squared_from_other_predictors, vif, condition_index
+  )
+
+workbook_sheets <- list(
+  Model_Fit = round_numeric_columns(model_fit),
+  Raw_Paths = round_numeric_columns(raw_paths),
+  Standardized_Paths = round_numeric_columns(standardized_paths),
+  Standardized_Contrasts = round_numeric_columns(standardized_contrasts),
+  R_Squared = round_numeric_columns(r_squared),
+  Model_Diagnostics = round_numeric_columns(diagnostics),
+  Predictor_Diagnostics = round_numeric_columns(predictor_diagnostics),
+  Predictor_Correlations = round_numeric_columns(predictor_correlations),
+  Linearity_Bins = round_numeric_columns(linearity_bins),
+  Residual_Diagnostics = round_numeric_columns(residual_diagnostics),
+  Influence_Diagnostics = round_numeric_columns(influence_diagnostics),
+  Duration_Context = round_numeric_columns(duration_context)
+)
+
+bruceR::export(workbook_sheets, file = table_file, overwrite = TRUE)
+style_and_sanitize_workbook(table_file, workbook_sheets)
+
+fit_s3_3_unadjusted_distress <- list(
+  metadata = list(
+    generated_by = paste0(
+      "Step_3_Concurrent_Multilevel_Associations/",
+      "S3_3_UnadjustedDistressModel.Rmd"
+    ),
+    input_file = "Res_2_Data_for_Analysis/dat_step3_concurrent.rda",
+    input_md5 = unname(tools::md5sum(input_file)),
+    observations = expected_observations,
+    clusters = expected_clusters,
+    sample_flag = "s33_s34_sample",
+    estimator = "MLR",
+    mplus_version = unique(model_fit$mplus_version),
+    engagement_in_model = FALSE,
+    nuisance_adjustment = "Within-person Day_c, Time_2, and Time_3",
+    interpretation = "Concurrent association; not causal"
+  ),
+  model_runs = model_runs,
+  model_fit = model_fit,
+  raw_paths = raw_paths,
+  standardized_paths = standardized_paths,
+  standardized_contrasts = standardized_contrasts,
+  r_squared = r_squared,
+  diagnostics = diagnostics,
+  sign_agreement = sign_agreement,
+  predictor_diagnostics = predictor_diagnostics,
+  predictor_correlations = predictor_correlations,
+  linearity_bins = linearity_bins,
+  residual_diagnostics = residual_diagnostics,
+  influence_diagnostics = influence_diagnostics,
+  duration_context = duration_context,
+  diagnostic_flags = diagnostic_flags,
+  variable_map = variable_map,
+  output_files = list(
+    result_rda = "Res_2_Data_for_Analysis/fit_s3_3_unadjusted_distress.rda",
+    workbook = "Res_3_Results/Table_S3_3_UnadjustedDistress.xlsx",
+    figure = "Res_3_Results/Figure_S3_3_UnadjustedDistress.svg"
+  )
+)
+save(
+  fit_s3_3_unadjusted_distress, file = result_file,
+  compress = "xz", version = 3
+)
+```
+
+```{r result-figure, echo=FALSE}
+knitr::include_graphics(figure_file, rel_path = FALSE)
+```
+
+```{r final-validation, include=FALSE, eval=!use_saved_results}
+verified_result <- load_single_object(
+  result_file, "fit_s3_3_unadjusted_distress"
+)
+workbook_sheets_read <- readxl::excel_sheets(table_file)
+svg_text <- readLines(figure_file, warn = FALSE)
+xlsx_entries <- utils::unzip(table_file, list = TRUE)$Name
+xlsx_relationship_entries <- xlsx_entries[grepl("\\.rels$", xlsx_entries)]
+xlsx_relationship_text <- unlist(lapply(xlsx_relationship_entries, function(entry) {
+  readLines(unz(table_file, entry), warn = FALSE)
+}), use.names = FALSE)
+dangling_drawing_relationship <- any(grepl(
+  "relationships/(drawing|vmlDrawing)", xlsx_relationship_text
+))
+
+artifact_audit <- data.frame(
+  artifact = c("Result RDA", "Workbook", "SVG figure"),
+  exists = c(
+    file.exists(result_file), file.exists(table_file), file.exists(figure_file)
+  ),
+  bytes = c(
+    file.info(result_file)$size,
+    file.info(table_file)$size,
+    file.info(figure_file)$size
+  ),
+  md5 = unname(tools::md5sum(c(result_file, table_file, figure_file))),
+  stringsAsFactors = FALSE
+)
+
+validation <- data.frame(
+  gate = c(
+    "Both raw and standardized Mplus models terminated normally",
+    "Mplus 8.7 and MLR verified",
+    "Common S3.3/S3.4 sample and 209 clusters verified",
+    "Engagement Time absent from S3.3 model syntax",
+    "Four focal paths per representation parsed",
+    "Two direct contrasts per representation parsed",
+    "Residual variances positive",
+    "R-squared admissible",
+    "Raw and standardized signs agree",
+    "Multicollinearity thresholds passed",
+    "Residual and influence diagnostics finite",
+    "Raw-duration context retained for later comparison",
+    "Workbook sheets verified",
+    "Workbook has no dangling drawing relationships",
+    "SVG is vector output",
+    "Saved result RDA reloaded"
+  ),
+  passed = c(
+    all(diagnostics$normal_termination),
+    all(model_fit$mplus_version == "8.7" & model_fit$estimator == "MLR"),
+    all(model_fit$observations == expected_observations &
+      model_fit$clusters == expected_clusters),
+    all(vapply(model_runs, function(run) run$checks$no_engagement_variables, logical(1))),
+    all(diagnostics$required_paths == 4L),
+    all(diagnostics$required_contrasts == 2L),
+    all(diagnostics$residual_variances_positive),
+    all(r_squared$r_squared >= 0 & r_squared$r_squared <= 1),
+    all(sign_agreement$sign_agrees),
+    max(vif_diagnostics$vif) < 5 &&
+      max(condition_diagnostics$condition_index) < 30,
+    all(is.finite(residual_diagnostics$rmse)) &&
+      all(is.finite(influence_diagnostics$maximum_absolute_change)),
+    duration_context$zero_percent[duration_context$variable == "ActiveTime"] > 75 &&
+      duration_context$endpoint_300_count[duration_context$variable == "ActiveTime"] == 5L,
+    identical(workbook_sheets_read, names(workbook_sheets)),
+    !dangling_drawing_relationship,
+    any(grepl("<svg", svg_text, fixed = TRUE)) &&
+      !any(grepl("<image", svg_text, fixed = TRUE)),
+    identical(verified_result$metadata$observations, expected_observations)
+  ),
+  stringsAsFactors = FALSE
+)
+stopifnot(all(artifact_audit$exists), all(validation$passed))
+
+```
+
+S3.4 uses the identical sample for the adjusted-versus-unadjusted coefficient
+comparison.

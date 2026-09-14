@@ -1,0 +1,792 @@
+---
+title: "S1.5 Missing value analysis"
+author: "Kunru Song"
+date: "2026-07-18 00:09:49 +08:00"
+params:
+  write_artifacts: true
+output:
+  html_document:
+    md_extensions: "-markdown_in_html_blocks"
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+<!-- Report date: earliest retained HTML CreationTime; not a verified analysis-start log. Keep fixed on re-render. -->
+
+<style>
+/* Keep wide audit/correlation tables within the report column. */
+.main-container table.table { display: block; max-width: 100%; overflow-x: auto; }
+.main-container table.table th, .main-container table.table td { padding: 6px 9px; }
+.main-container table.table td { white-space: nowrap; }
+.main-container table.table th:first-child, .main-container table.table td:first-child { min-width: 140px; }
+.main-container table.item-description-table td:nth-child(3) { white-space: normal; min-width: 320px; max-width: 320px; }
+.main-container table.table caption { text-align: left; font-weight: 600; color: #333; }
+</style>
+
+This report audits missing values in the canonical analysis-entry file
+`Res_2_Data_for_Analysis/dat_focal_analysis.rda`. Baseline variables are first
+checked at the participant level. Because the selected baseline demographics
+and psychological items contain no missing values, the substantive missing-
+value analysis focuses on prompt-level EMA data.
+
+The corresponding Excel result is
+`Res_3_Results/Table_S1_5_MVA_Report.xlsx`. No CSV output is created.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA
+)
+
+required_packages <- c("dplyr", "knitr", "openxlsx", "psych", "rmarkdown", "tidyr", "xml2", "zip")
+package_available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(package_available)) {
+  stop("Missing required R packages: ", paste(names(package_available)[!package_available], collapse = ", "))
+}
+
+locate_project_root <- function(start = getwd()) {
+  candidate <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(candidate)) candidate <- dirname(candidate)
+  repeat {
+    if (all(dir.exists(file.path(candidate, c(
+      "Step_1_Descriptive_and_Reliability", "Step_2_Measurement_Models"
+    ))))) return(candidate)
+    parent <- dirname(candidate)
+    if (identical(parent, candidate)) break
+    candidate <- parent
+  }
+  stop("Could not identify the project root from the public Step folders")
+}
+
+input_context <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(
+  if (length(input_context) == 1L && !is.na(input_context) && nzchar(input_context)) {
+    input_context
+  } else getwd()
+)
+knitr::opts_knit$set(root.dir = project_root)
+
+input_file <- file.path(project_root, "Res_2_Data_for_Analysis", "dat_focal_analysis.rda")
+excel_output <- file.path(project_root, "Res_3_Results", "Table_S1_5_MVA_Report.xlsx")
+if (!file.exists(input_file)) stop("Missing canonical analysis-entry RDA: ", input_file)
+```
+
+# Load and validate data
+
+```{r load-and-validate}
+input_environment <- new.env(parent = emptyenv())
+loaded_objects <- load(input_file, envir = input_environment)
+if (!identical(loaded_objects, "dat_focal_analysis")) {
+  stop("The analysis-entry RDA must contain only dat_focal_analysis.")
+}
+dat_focal_analysis <- input_environment$dat_focal_analysis
+
+stopifnot(
+  nrow(dat_focal_analysis) == 18810L,
+  dplyr::n_distinct(dat_focal_analysis$Name_ID) == 209L,
+  anyDuplicated(dat_focal_analysis[c("Name_ID", "Day", "Time")]) == 0L,
+  !anyNA(dat_focal_analysis[c("Name_ID", "Day", "Time")])
+)
+
+data.frame(
+  prompt_rows = nrow(dat_focal_analysis),
+  participants = dplyr::n_distinct(dat_focal_analysis$Name_ID),
+  prompts_per_participant = nrow(dat_focal_analysis) /
+    dplyr::n_distinct(dat_focal_analysis$Name_ID),
+  stringsAsFactors = FALSE
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "Load and validate",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Helper functions
+
+```{r helpers}
+correlation_display <- function(r, p) {
+  stars <- ifelse(p < .001, "***", ifelse(p < .01, "**", ifelse(p <= .05, "*", "")))
+  matrix(sprintf("%.3f%s", r, stars), nrow = nrow(r), dimnames = dimnames(r))
+}
+
+cross_correlation <- function(data, x_variables, y_variables, x_labels, y_labels) {
+  x <- data[x_variables]
+  y <- data[y_variables]
+  names(x) <- unname(x_labels[x_variables])
+  names(y) <- unname(y_labels[y_variables])
+
+  result <- psych::corr.test(
+    x,
+    y,
+    use = "complete",
+    method = "pearson",
+    adjust = "none",
+    ci = FALSE
+  )
+
+  list(
+    r = result$r,
+    p = result$p,
+    n = min(result$n),
+    display = correlation_display(result$r, result$p)
+  )
+}
+
+correlation_long <- function(result, analysis) {
+  indices <- expand.grid(
+    missingness_variable = rownames(result$r),
+    outcome = colnames(result$r),
+    stringsAsFactors = FALSE
+  )
+  indices$r <- as.vector(result$r)
+  indices$p <- as.vector(result$p)
+  indices$stars <- ifelse(
+    indices$p < .001, "***",
+    ifelse(indices$p < .01, "**", ifelse(indices$p <= .05, "*", ""))
+  )
+  indices$analysis <- analysis
+  indices$n <- result$n
+  indices[, c("analysis", "missingness_variable", "outcome", "n", "r", "p", "stars")]
+}
+
+descriptive_summary <- function(data, variables, labels) {
+  dplyr::bind_rows(lapply(variables, function(variable) {
+    x <- data[[variable]]
+    data.frame(
+      variable = variable,
+      label = unname(labels[[variable]]),
+      n = length(x),
+      mean = mean(x),
+      sd = stats::sd(x),
+      median = stats::median(x),
+      q1 = unname(stats::quantile(x, .25)),
+      q3 = unname(stats::quantile(x, .75)),
+      minimum = min(x),
+      maximum = max(x),
+      stringsAsFactors = FALSE
+    )
+  }))
+}
+```
+
+# Baseline missing-value audit
+
+The audit covers the eight sample-description variables and all four baseline
+psychological item sets. Baseline fields are first verified to be constant
+within each participant and then reduced to one row per `Name_ID`.
+
+```{r baseline-audit}
+baseline_demographic_vars <- c(
+  "AgeInYears", "Gender", "Grade", "FamilyResidence",
+  "ParentsMaritalStatus", "ParentsHighestEdu",
+  "TotalFamilyIncome", "SiblingStructure"
+)
+baseline_item_vars <- c(
+  paste0("V_BSMAS_", 1:18),
+  paste0("K_CESD_", 1:7),
+  paste0("L_DASS_", 1:7),
+  paste0("M_PSS_", 1:10)
+)
+baseline_audit_vars <- c(baseline_demographic_vars, baseline_item_vars)
+
+baseline_constancy <- vapply(
+  baseline_audit_vars,
+  function(variable) {
+    max(vapply(
+      split(dat_focal_analysis[[variable]], dat_focal_analysis$Name_ID),
+      function(x) dplyr::n_distinct(x, na.rm = TRUE),
+      integer(1)
+    ))
+  },
+  integer(1)
+)
+if (any(baseline_constancy > 1L)) {
+  stop("Baseline fields vary within person: ", paste(names(baseline_constancy)[baseline_constancy > 1L], collapse = ", "))
+}
+
+dat_baseline <- dat_focal_analysis |>
+  dplyr::distinct(Name_ID, .keep_all = TRUE) |>
+  dplyr::select(Name_ID, dplyr::all_of(baseline_audit_vars)) |>
+  dplyr::arrange(Name_ID)
+
+baseline_missing_by_variable <- data.frame(
+  variable = baseline_audit_vars,
+  missing_n = vapply(dat_baseline[baseline_audit_vars], function(x) sum(is.na(x)), integer(1)),
+  missing_proportion = vapply(dat_baseline[baseline_audit_vars], function(x) mean(is.na(x)), numeric(1)),
+  stringsAsFactors = FALSE
+)
+
+baseline_audit_summary <- data.frame(
+  participants = nrow(dat_baseline),
+  variables_audited = length(baseline_audit_vars),
+  missing_cells = sum(baseline_missing_by_variable$missing_n),
+  participants_with_any_missing = sum(!stats::complete.cases(dat_baseline)),
+  conclusion = if (sum(baseline_missing_by_variable$missing_n) == 0L) {
+    "No missing baseline values; subsequent MVA focuses on EMA."
+  } else {
+    "Baseline missing values detected; inspect variable-level audit."
+  },
+  stringsAsFactors = FALSE
+)
+
+baseline_audit_summary |>
+  knitr::kable(
+    format = "html",
+    caption = "Baseline audit",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+stopifnot(sum(baseline_missing_by_variable$missing_n) == 0L)
+```
+
+# EMA missingness
+
+## Source-variable missing proportions
+
+```{r ema-source-missingness}
+ema_source_vars <- c(
+  paste0("PMU", 1:6),
+  paste0("DASS", 1:6),
+  paste0("mu_time", 1:3),
+  paste0("mu_frequency", 1:3)
+)
+
+ema_source_labels <- c(
+  setNames(paste("Momentary PSMU item", 1:6), paste0("PMU", 1:6)),
+  setNames(paste("Momentary distress item", 1:6), paste0("DASS", 1:6)),
+  mu_time1 = "Messaging time", mu_time2 = "Posting time", mu_time3 = "Browsing time",
+  mu_frequency1 = "Messaging frequency", mu_frequency2 = "Posting frequency",
+  mu_frequency3 = "Browsing frequency"
+)
+
+ema_source_missingness <- data.frame(
+  variable = ema_source_vars,
+  label = unname(ema_source_labels[ema_source_vars]),
+  prompt_rows = nrow(dat_focal_analysis),
+  observed_n = vapply(dat_focal_analysis[ema_source_vars], function(x) sum(!is.na(x)), integer(1)),
+  missing_n = vapply(dat_focal_analysis[ema_source_vars], function(x) sum(is.na(x)), integer(1)),
+  missing_proportion = vapply(dat_focal_analysis[ema_source_vars], function(x) mean(is.na(x)), numeric(1)),
+  stringsAsFactors = FALSE
+)
+
+ema_source_missingness |>
+  dplyr::mutate(missing_proportion = round(missing_proportion, 4)) |>
+  knitr::kable(
+    format = "html",
+    caption = "Ema source missingness",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+## Focal-measure missing proportions
+
+A prompt-level focal measure is considered observed only when every item needed
+for that measure is observed. The six engagement variables remain single-item
+measures. Person means below use all available complete prompts for that
+specific focal measure; no participant has an entirely missing focal measure.
+
+```{r ema-focal-missingness}
+ema_measure_items <- list(
+  Momentary_PSMU = paste0("PMU", 1:6),
+  Momentary_Stress = paste0("DASS", 1:2),
+  Momentary_Anxiety = paste0("DASS", 3:4),
+  Momentary_Depression = paste0("DASS", 5:6),
+  Messaging_Time = "mu_time1",
+  Posting_Time = "mu_time2",
+  Browsing_Time = "mu_time3",
+  Messaging_Frequency = "mu_frequency1",
+  Posting_Frequency = "mu_frequency2",
+  Browsing_Frequency = "mu_frequency3"
+)
+ema_measure_labels <- c(
+  Momentary_PSMU = "Momentary PSMU",
+  Momentary_Stress = "Momentary stress",
+  Momentary_Anxiety = "Momentary anxiety",
+  Momentary_Depression = "Momentary depression",
+  Messaging_Time = "Messaging time",
+  Posting_Time = "Posting time",
+  Browsing_Time = "Browsing time",
+  Messaging_Frequency = "Messaging frequency",
+  Posting_Frequency = "Posting frequency",
+  Browsing_Frequency = "Browsing frequency"
+)
+
+ema_scored <- dat_focal_analysis
+for (measure in names(ema_measure_items)) {
+  items <- ema_measure_items[[measure]]
+  complete <- stats::complete.cases(ema_scored[items])
+  ema_scored[[paste0("Complete_", measure)]] <- complete
+  ema_scored[[paste0("Score_", measure)]] <- ifelse(
+    complete,
+    rowMeans(ema_scored[items]),
+    NA_real_
+  )
+}
+
+ema_measure_missingness <- data.frame(
+  measure = names(ema_measure_items),
+  label = unname(ema_measure_labels[names(ema_measure_items)]),
+  required_items = vapply(ema_measure_items, length, integer(1)),
+  prompt_rows = nrow(ema_scored),
+  observed_n = vapply(
+    names(ema_measure_items),
+    function(x) sum(ema_scored[[paste0("Complete_", x)]]),
+    integer(1)
+  ),
+  missing_n = vapply(
+    names(ema_measure_items),
+    function(x) sum(!ema_scored[[paste0("Complete_", x)]]),
+    integer(1)
+  ),
+  missing_proportion = vapply(
+    names(ema_measure_items),
+    function(x) mean(!ema_scored[[paste0("Complete_", x)]]),
+    numeric(1)
+  ),
+  stringsAsFactors = FALSE
+)
+
+ema_measure_missingness |>
+  dplyr::mutate(missing_proportion = round(missing_proportion, 4)) |>
+  knitr::kable(
+    format = "html",
+    caption = "Ema focal missingness",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# EMA response compliance
+
+The canonical data contain all 90 scheduled prompt rows per participant. Two
+compliance definitions are reported:
+
+- any-response compliance: at least one of the 18 EMA source variables was
+  observed at the scheduled prompt;
+- complete-focal compliance: all 18 EMA source variables were observed.
+
+```{r ema-compliance}
+ema_scored <- ema_scored |>
+  dplyr::mutate(
+    Any_Response = rowSums(!is.na(dplyr::across(dplyr::all_of(ema_source_vars)))) > 0,
+    Complete_Focal_Response = stats::complete.cases(dplyr::across(dplyr::all_of(ema_source_vars)))
+  )
+
+person_compliance <- ema_scored |>
+  dplyr::group_by(Name_ID) |>
+  dplyr::summarise(
+    scheduled_days = dplyr::n_distinct(Day),
+    expected_prompts = dplyr::n(),
+    any_response_n = sum(Any_Response),
+    any_response_compliance = mean(Any_Response),
+    complete_focal_n = sum(Complete_Focal_Response),
+    complete_focal_compliance = mean(Complete_Focal_Response),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(Name_ID)
+
+stopifnot(
+  all(person_compliance$scheduled_days == 30L),
+  all(person_compliance$expected_prompts == 90L)
+)
+
+complete_focal_prompt_total <- sum(ema_scored$Complete_Focal_Response)
+overall_complete_focal_compliance <- mean(ema_scored$Complete_Focal_Response)
+person_complete_focal_mean <- mean(person_compliance$complete_focal_compliance)
+person_complete_focal_sd <- stats::sd(person_compliance$complete_focal_compliance)
+person_complete_focal_min <- min(person_compliance$complete_focal_compliance)
+person_complete_focal_max <- max(person_compliance$complete_focal_compliance)
+
+compliance_labels <- c(
+  any_response_n = "Any-response prompts",
+  any_response_compliance = "Any-response compliance",
+  complete_focal_n = "Complete-focal prompts",
+  complete_focal_compliance = "Complete-focal compliance"
+)
+compliance_summary <- descriptive_summary(
+  person_compliance,
+  names(compliance_labels),
+  compliance_labels
+)
+
+compliance_summary |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 4))) |>
+  knitr::kable(
+    format = "html",
+    caption = "Ema compliance",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+Across all `r format(nrow(ema_scored), big.mark = ",", scientific = FALSE)`
+scheduled EMA prompts,
+`r format(complete_focal_prompt_total, big.mark = ",", scientific = FALSE)`
+prompts contained complete data on all EMA focal variables, corresponding to
+an overall compliance rate of
+`r sprintf("%.2f%%", 100 * overall_complete_focal_compliance)`. At the person
+level, the mean complete-focal compliance rate was
+`r sprintf("%.2f%%", 100 * person_complete_focal_mean)`
+(SD = `r sprintf("%.2f%%", 100 * person_complete_focal_sd)`). Individual
+person-level compliance rates ranged from
+`r sprintf("%.2f%%", 100 * person_complete_focal_min)` to
+`r sprintf("%.2f%%", 100 * person_complete_focal_max)`.
+
+# Person-level missingness associations
+
+## Construct person-level missingness and focal means
+
+```{r person-level-data}
+person_measure_data <- ema_scored |>
+  dplyr::group_by(Name_ID) |>
+  dplyr::summarise(
+    dplyr::across(
+      dplyr::starts_with("Complete_"),
+      ~ mean(!.x),
+      .names = "Missing_{sub('Complete_', '', .col)}"
+    ),
+    dplyr::across(
+      dplyr::starts_with("Score_"),
+      ~ mean(.x, na.rm = TRUE),
+      .names = "Mean_{sub('Score_', '', .col)}"
+    ),
+    .groups = "drop"
+  )
+
+missing_rate_vars <- paste0("Missing_", names(ema_measure_items))
+person_mean_vars <- paste0("Mean_", names(ema_measure_items))
+
+stopifnot(
+  !anyNA(person_measure_data[missing_rate_vars]),
+  !anyNA(person_measure_data[person_mean_vars]),
+  all(vapply(person_measure_data[missing_rate_vars], stats::sd, numeric(1)) > 0)
+)
+
+missing_rate_labels <- setNames(
+  paste("Missing rate:", unname(ema_measure_labels[names(ema_measure_items)])),
+  missing_rate_vars
+)
+person_mean_labels <- setNames(
+  paste("Person mean:", unname(ema_measure_labels[names(ema_measure_items)])),
+  person_mean_vars
+)
+```
+
+## Baseline outcomes
+
+Baseline scale totals use the same scoring as S1.4: baseline anxiety items are
+shifted from 1-4 to 0-3 using `x - 1`, and `M_PSS_4`, `M_PSS_5`, `M_PSS_7`,
+and `M_PSS_8` are reverse-scored using `6 - x`. Gender is coded female = 1,
+male = 0.
+
+```{r baseline-outcomes}
+pss_items <- paste0("M_PSS_", 1:10)
+pss_reverse_items <- paste0("M_PSS_", c(4, 5, 7, 8))
+baseline_scored <- dat_baseline
+baseline_scored[pss_reverse_items] <- lapply(
+  baseline_scored[pss_reverse_items],
+  function(x) 6 - x
+)
+
+baseline_scored <- baseline_scored |>
+  dplyr::mutate(
+    Trait_PSMU_Total = rowSums(dplyr::across(dplyr::all_of(paste0("V_BSMAS_", 1:18)))),
+    Depression_Total = rowSums(dplyr::across(dplyr::all_of(paste0("K_CESD_", 1:7)))),
+    Anxiety_Total = rowSums(dplyr::across(dplyr::all_of(paste0("L_DASS_", 1:7)), ~ .x - 1)),
+    Perceived_Stress_Total = rowSums(dplyr::across(dplyr::all_of(pss_items))),
+    Gender_Female = dplyr::case_when(
+      as.character(Gender) == "F" ~ 1,
+      as.character(Gender) == "M" ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+baseline_outcome_vars <- c(
+  "Trait_PSMU_Total", "Depression_Total", "Anxiety_Total",
+  "Perceived_Stress_Total", "AgeInYears", "Gender_Female"
+)
+baseline_outcome_labels <- c(
+  Trait_PSMU_Total = "Baseline trait PSMU",
+  Depression_Total = "Baseline depression",
+  Anxiety_Total = "Baseline anxiety",
+  Perceived_Stress_Total = "Baseline perceived stress",
+  AgeInYears = "Age",
+  Gender_Female = "Gender (female=1)"
+)
+
+person_mva_data <- person_measure_data |>
+  dplyr::left_join(
+    baseline_scored |>
+      dplyr::select(Name_ID, dplyr::all_of(baseline_outcome_vars)),
+    by = "Name_ID"
+  )
+
+stopifnot(nrow(person_mva_data) == 209L, !anyNA(person_mva_data))
+```
+
+## Correlations with EMA focal person means
+
+All person-level correlations are Pearson correlations with two-sided,
+unadjusted p values. Results use no star for `p > .05`, `*` for
+`.01 <= p <= .05`, `**` for `.001 <= p < .01`, and `***` for `p < .001`.
+
+```{r missingness-ema-correlations}
+missingness_ema_correlation <- cross_correlation(
+  person_mva_data,
+  missing_rate_vars,
+  person_mean_vars,
+  missing_rate_labels,
+  person_mean_labels
+)
+
+missingness_ema_correlation$display |>
+  knitr::kable(
+    format = "html",
+    caption = "Missingness ema correlations",
+    row.names = TRUE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+## Correlations with baseline psychological totals, age, and gender
+
+```{r missingness-baseline-correlations}
+missingness_baseline_correlation <- cross_correlation(
+  person_mva_data,
+  missing_rate_vars,
+  baseline_outcome_vars,
+  missing_rate_labels,
+  baseline_outcome_labels
+)
+
+missingness_baseline_correlation$display |>
+  knitr::kable(
+    format = "html",
+    caption = "Missingness baseline correlations",
+    row.names = TRUE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+## Significant associations summary
+
+The following table summarizes the exploratory associations. Because multiple tests are performed, the unadjusted p values should be interpreted as diagnostics of
+possible selective missingness rather than definitive hypothesis tests.
+
+```{r significant-associations}
+missingness_correlation_long <- dplyr::bind_rows(
+  correlation_long(missingness_ema_correlation, "EMA missing rate vs EMA person mean"),
+  correlation_long(missingness_baseline_correlation, "EMA missing rate vs baseline/demographic")
+)
+
+significant_missingness_associations <- missingness_correlation_long |>
+  dplyr::filter(p <= .05) |>
+  dplyr::arrange(analysis, p, missingness_variable, outcome)
+
+data.frame(
+  total_tests = nrow(missingness_correlation_long),
+  significant_at_05_unadjusted = nrow(significant_missingness_associations),
+  stringsAsFactors = FALSE
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "Significant associations",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+
+significant_missingness_associations |>
+  dplyr::mutate(r = round(r, 3), p = signif(p, 3)) |>
+  knitr::kable(
+    format = "html",
+    caption = "Significant associations (2)",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Excel results
+
+`Res_3_Results/Table_S1_5_MVA_Report.xlsx` contains `Missingness`, `Compliance`,
+and `Correlations`. The compliance sheet includes participant-level records
+and must remain with the private results, not in the public repository.
+Correlation displays retain their unadjusted significance stars; numerical
+summaries retain full available precision. `write_artifacts: false` disables
+only file writes, not the analyses earlier in this report.
+
+```{r export-excel}
+if (isTRUE(params$write_artifacts)) {
+  wb <- openxlsx::createWorkbook(creator = "Kunru Song")
+  header_style <- openxlsx::createStyle(textDecoration = "bold", wrapText = TRUE)
+  decimal_style <- openxlsx::createStyle(numFmt = "0.0000")
+  integer_style <- openxlsx::createStyle(numFmt = "0")
+
+  normalize_openxml_relationships <- function(path) {
+    # Remove only worksheet drawing/VML relationships whose internal targets
+    # are absent. Preserve valid drawings, external links and all other parts.
+    unpack_dir <- tempfile("s1_5_xlsx_")
+    dir.create(unpack_dir, recursive = TRUE)
+    on.exit(unlink(unpack_dir, recursive = TRUE, force = TRUE), add = TRUE)
+
+    members <- utils::unzip(path, list = TRUE)$Name
+    unsafe_member <- function(member) {
+      parts <- strsplit(gsub("\\\\", "/", member), "/", fixed = TRUE)[[1L]]
+      grepl("^[/\\\\]|^[A-Za-z]:", member) || any(parts == "..")
+    }
+    stopifnot(length(members) > 0L, !anyDuplicated(members),
+              !any(vapply(members, unsafe_member, logical(1))))
+    utils::unzip(path, exdir = unpack_dir)
+    relationship_files <- list.files(
+      file.path(unpack_dir, "xl", "worksheets", "_rels"),
+      pattern = "[.]rels$", full.names = TRUE
+    )
+    if (!length(relationship_files)) return(invisible(path))
+
+    resolve_member <- function(target) {
+      target <- gsub("\\\\", "/", utils::URLdecode(target))
+      if (!nzchar(target) || grepl("^[A-Za-z][A-Za-z0-9+.-]*:", target)) {
+        stop("Invalid internal drawing target")
+      }
+      parts <- strsplit(target, "/", fixed = TRUE)[[1L]]
+      result <- if (startsWith(target, "/")) character() else c("xl", "worksheets")
+      for (part in parts) {
+        if (!nzchar(part) || part == ".") next
+        if (part == "..") {
+          if (!length(result)) stop("Drawing target escapes the workbook package")
+          result <- head(result, -1L)
+        } else result <- c(result, part)
+      }
+      paste(result, collapse = "/")
+    }
+    drawing_types <- paste0(
+      "http://schemas.openxmlformats.org/officeDocument/2006/relationships/",
+      c("drawing", "vmlDrawing")
+    )
+    removed_relationships <- 0L
+    for (relationship_file in relationship_files) {
+      document <- xml2::read_xml(relationship_file, options = "NONET")
+      relationships <- xml2::xml_find_all(
+        document, "/*[local-name()='Relationships']/*[local-name()='Relationship']"
+      )
+      changed <- FALSE
+      for (relationship in relationships) {
+        type <- xml2::xml_attr(relationship, "Type")
+        external <- identical(xml2::xml_attr(relationship, "TargetMode"), "External")
+        if (!type %in% drawing_types || external) next
+        target <- xml2::xml_attr(relationship, "Target")
+        if (is.na(target)) stop("Drawing relationship is missing its Target")
+        if (!resolve_member(target) %in% members) {
+          xml2::xml_remove(relationship)
+          removed_relationships <- removed_relationships + 1L
+          changed <- TRUE
+        }
+      }
+      if (changed) xml2::write_xml(document, relationship_file)
+    }
+    if (removed_relationships == 0L) return(invisible(path))
+
+    normalized_file <- tempfile(fileext = ".xlsx")
+    on.exit(unlink(normalized_file, force = TRUE), add = TRUE)
+    zip::zipr(
+      normalized_file,
+      files = list.files(unpack_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE),
+      root = unpack_dir,
+      include_directories = FALSE,
+      mode = "mirror"
+    )
+    if (!file.copy(normalized_file, path, overwrite = TRUE)) {
+      stop("Could not replace the workbook with its normalized OpenXML package.")
+    }
+    unlink(normalized_file, force = TRUE)
+    invisible(path)
+  }
+
+  write_result_section <- function(sheet, title, data, headers, start_row,
+                                   integer_columns = integer()) {
+    stopifnot(is.data.frame(data), ncol(data) == length(headers))
+    openxlsx::writeData(wb, sheet, title, startRow = start_row, colNames = FALSE)
+    names(data) <- headers
+    openxlsx::writeData(wb, sheet, data, startRow = start_row + 1L,
+                        rowNames = FALSE, headerStyle = header_style, keepNA = TRUE)
+    if (nrow(data)) {
+      rows <- seq.int(start_row + 2L, length.out = nrow(data))
+      numeric_columns <- which(vapply(data, is.numeric, logical(1)))
+      for (column in numeric_columns) {
+        openxlsx::addStyle(wb, sheet,
+          if (column %in% integer_columns) integer_style else decimal_style,
+          rows = rows, cols = column, gridExpand = TRUE, stack = TRUE)
+      }
+    }
+    start_row + nrow(data) + 4L
+  }
+
+  for (sheet in c("Missingness", "Compliance", "Correlations")) {
+    openxlsx::addWorksheet(wb, sheet, gridLines = FALSE)
+    openxlsx::freezePane(wb, sheet, firstActiveRow = 3L)
+  }
+  next_row <- write_result_section("Missingness", "Baseline missingness",
+    baseline_audit_summary,
+    c("Participants", "Variables audited", "Missing cells",
+      "Participants with any missing", "Conclusion"), 1L, 1:4)
+  next_row <- write_result_section("Missingness", "EMA source-variable missingness",
+    ema_source_missingness,
+    c("Variable", "Label", "Prompt rows", "Observed N", "Missing N", "Missing proportion"),
+    next_row, 3:5)
+  write_result_section("Missingness", "EMA focal-measure missingness",
+    ema_measure_missingness,
+    c("Measure", "Label", "Required items", "Prompt rows", "Observed N", "Missing N",
+      "Missing proportion"), next_row, 3:6)
+
+  next_row <- write_result_section("Compliance", "Participant compliance summary",
+    compliance_summary,
+    c("Variable", "Label", "N", "Mean", "SD", "Median", "Q1", "Q3", "Minimum", "Maximum"),
+    1L, 3L)
+  compliance_detail <- dplyr::left_join(
+    person_compliance[c("Name_ID", "scheduled_days", "expected_prompts", "any_response_n",
+      "any_response_compliance", "complete_focal_n", "complete_focal_compliance")],
+    person_measure_data[c("Name_ID", missing_rate_vars)], by = "Name_ID")
+  write_result_section("Compliance", "Participant compliance and missing proportions",
+    compliance_detail, names(compliance_detail), next_row, c(1:4, 6L))
+
+  next_row <- write_result_section("Correlations", "Exploratory unadjusted tests",
+    data.frame(total_tests = nrow(missingness_correlation_long),
+      significant_at_05_unadjusted = nrow(significant_missingness_associations)),
+    c("Total tests", "Significant at p <= .05 (unadjusted)"), 1L, 1:2)
+  for (result in list(missingness_ema_correlation, missingness_baseline_correlation)) {
+    display_table <- data.frame(Variable = rownames(result$display),
+      result$display, check.names = FALSE, row.names = NULL)
+    next_row <- write_result_section("Correlations",
+      if (identical(colnames(result$display), colnames(missingness_ema_correlation$display))) {
+        "Missing proportions versus EMA focal person means"
+      } else "Missing proportions versus baseline totals, age and gender",
+      display_table, names(display_table), next_row)
+  }
+  write_result_section("Correlations", "Associations significant at unadjusted p <= .05",
+    significant_missingness_associations,
+    c("Analysis", "Missingness variable", "Outcome", "N", "r", "p", "Stars"), next_row, 4L)
+  for (sheet in c("Missingness", "Compliance", "Correlations")) {
+    openxlsx::setColWidths(wb, sheet, cols = 1:17, widths = 24)
+    openxlsx::setColWidths(wb, sheet, cols = 1:2, widths = 42)
+  }
+  dir.create(dirname(excel_output), recursive = TRUE, showWarnings = FALSE)
+  openxlsx::saveWorkbook(wb, excel_output, overwrite = TRUE)
+  normalize_openxml_relationships(excel_output)
+}
+```

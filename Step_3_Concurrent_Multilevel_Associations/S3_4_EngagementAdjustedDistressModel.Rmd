@@ -1,0 +1,1708 @@
+---
+title: "S3.4 Engagement-adjusted Distress model"
+author: "Kunru Song"
+date: "2026-07-20"
+params:
+  use_saved_results: false
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+
+<style>
+table { display: block; max-width: 100%; overflow-x: auto; }
+th, td { padding: 6px 9px; white-space: nowrap; }
+</style>
+
+This analysis is retained in the public repository for transparency and is not
+reported in the manuscript or supplementary materials.
+
+This report estimates the complete Step 3 Distress model. Core, Peripheral,
+and the three raw-minute Engagement Time modes enter simultaneously at the
+within-person and between-person levels. The model uses the exact 17,755-prompt
+sample used in S3.3. Coefficient-pattern comparisons therefore reflect
+engagement adjustment rather than changing rows. A same-variable-set model with
+all six duration paths fixed to zero supplies the nested MLR test. Adjustment is
+not interpreted as causal mediation.
+
+```{r setup, include=FALSE}
+use_saved_results <- {
+  value <- params$use_saved_results
+  if (!is.logical(value) || length(value) != 1L || is.na(value)) {
+    stop("use_saved_results must be one non-missing logical value")
+  }
+  value
+}
+
+public_model_diagnostics <- function(data) {
+  if ("warning_summary" %in% names(data) && !"warning_text" %in% names(data)) return(data)
+  warning_text <- as.character(data$warning_text)
+  stopifnot(length(warning_text) == nrow(data))
+  output <- data[, setdiff(names(data), c("warning_text", "error_text")), drop = FALSE]
+  output$warning_summary <- ifelse(
+    grepl("following clusters|cluster IDs", warning_text, ignore.case = TRUE),
+    "Includes a within-cluster variation warning; individual details remain private",
+    ifelse(nzchar(warning_text), "Other warning; details retained locally", "None")
+  )
+  output
+}
+
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  collapse = FALSE, comment = NA, dev = "svglite"
+)
+
+required_packages <- c(
+  "bruceR", "dplyr", "ggplot2", "knitr", "MplusAutomation",
+  "openxlsx", "readxl", "rmarkdown", "svglite", "tibble", "tidyr"
+)
+package_available <- vapply(
+  required_packages, requireNamespace, logical(1), quietly = TRUE
+)
+if (!all(package_available)) {
+  stop(
+    "Missing required R packages: ",
+    paste(names(package_available)[!package_available], collapse = ", ")
+  )
+}
+
+locate_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(current)) current <- dirname(current)
+  repeat {
+    if (all(dir.exists(file.path(current, c(
+      "Step_1_Descriptive_and_Reliability",
+      "Step_3_Concurrent_Multilevel_Associations"
+    ))))) return(current)
+    parent <- dirname(current)
+    if (identical(parent, current)) break
+    current <- parent
+  }
+  stop("Could not locate the project from its public Step directories")
+}
+
+load_single_object <- function(path, expected_name) {
+  environment <- new.env(parent = emptyenv())
+  loaded <- load(path, envir = environment)
+  if (!identical(loaded, expected_name)) {
+    stop(
+      "Expected only ", expected_name, " in ", path,
+      "; found: ", paste(loaded, collapse = ", ")
+    )
+  }
+  environment[[expected_name]]
+}
+
+mplus_numeric <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+summary_value <- function(summary_row, candidates, type = c("numeric", "character")) {
+  type <- match.arg(type)
+  hit <- intersect(candidates, names(summary_row))
+  if (!length(hit)) return(if (type == "numeric") NA_real_ else NA_character_)
+  value <- summary_row[[hit[[1L]]]][[1L]]
+  if (type == "numeric") mplus_numeric(value) else as.character(value)
+}
+
+flatten_messages <- function(x) {
+  if (is.null(x) || !length(x)) return("")
+  paste(unlist(x, recursive = TRUE, use.names = FALSE), collapse = " | ")
+}
+
+parse_output_integer <- function(path, label) {
+  lines <- readLines(path, warn = FALSE)
+  hit <- grep(label, lines, ignore.case = TRUE, value = TRUE, fixed = TRUE)
+  if (!length(hit)) return(NA_integer_)
+  numbers <- regmatches(hit[[1L]], gregexpr("[0-9]+", hit[[1L]]))[[1L]]
+  if (!length(numbers)) NA_integer_ else as.integer(tail(numbers, 1L))
+}
+
+round_numeric_columns <- function(data, digits = 4L) {
+  data |>
+    dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, digits)))
+}
+
+vif_table <- function(data, variables, level_label, model_label) {
+  x <- as.data.frame(data[stats::complete.cases(data[variables]), variables, drop = FALSE])
+  dplyr::bind_rows(lapply(variables, function(target) {
+    others <- setdiff(variables, target)
+    fit <- stats::lm(stats::reformulate(others, response = target), data = x)
+    r_squared <- summary(fit)$r.squared
+    data.frame(
+      model = model_label, level = level_label, variable = target,
+      r_squared_from_other_predictors = r_squared,
+      vif = 1 / (1 - r_squared), stringsAsFactors = FALSE
+    )
+  }))
+}
+
+condition_index <- function(data, variables) {
+  x <- data[stats::complete.cases(data[variables]), variables, drop = FALSE]
+  correlation <- stats::cor(x)
+  eigenvalues <- eigen(correlation, symmetric = TRUE, only.values = TRUE)$values
+  sqrt(max(eigenvalues) / min(eigenvalues))
+}
+
+skewness <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3L || stats::sd(x) == 0) return(NA_real_)
+  mean((x - mean(x))^3) / stats::sd(x)^3
+}
+
+excess_kurtosis <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 4L || stats::sd(x) == 0) return(NA_real_)
+  mean((x - mean(x))^4) / stats::sd(x)^4 - 3
+}
+
+style_and_sanitize_workbook <- function(path, sheet_data) {
+  workbook <- openxlsx::loadWorkbook(path)
+  header_style <- openxlsx::createStyle(
+    fontName = "Aptos", fontSize = 10, textDecoration = "bold",
+    fontColour = "#FFFFFF", fgFill = "#1F4E78",
+    halign = "center", valign = "center", wrapText = TRUE,
+    border = "bottom", borderColour = "#163A5C"
+  )
+  body_style <- openxlsx::createStyle(
+    fontName = "Aptos", fontSize = 10, valign = "top", wrapText = TRUE
+  )
+  integer_style <- openxlsx::createStyle(numFmt = "0")
+  decimal_style <- openxlsx::createStyle(numFmt = "0.0000")
+
+  for (sheet_name in names(sheet_data)) {
+    data <- sheet_data[[sheet_name]]
+    row_count <- nrow(data) + 1L
+    column_count <- ncol(data)
+    openxlsx::showGridLines(workbook, sheet = sheet_name, showGridLines = FALSE)
+    openxlsx::freezePane(workbook, sheet = sheet_name, firstRow = TRUE)
+    openxlsx::setRowHeights(workbook, sheet = sheet_name, rows = 1L, heights = 30)
+    openxlsx::addStyle(
+      workbook, sheet = sheet_name, style = header_style,
+      rows = 1L, cols = seq_len(column_count), gridExpand = TRUE, stack = TRUE
+    )
+    if (row_count > 1L) {
+      openxlsx::addStyle(
+        workbook, sheet = sheet_name, style = body_style,
+        rows = 2L:row_count, cols = seq_len(column_count),
+        gridExpand = TRUE, stack = TRUE
+      )
+    }
+    integer_columns <- which(
+      vapply(data, is.integer, logical(1)) |
+        names(data) %in% c(
+          "observations", "clusters", "free_parameters", "df", "df_difference",
+          "errors_n", "warnings_n", "required_focal_paths",
+          "required_duration_paths", "required_contrasts", "n", "rank",
+          "endpoint_300_count", "n_observed"
+        )
+    )
+    numeric_columns <- setdiff(which(vapply(data, is.numeric, logical(1))), integer_columns)
+    if (row_count > 1L && length(integer_columns)) {
+      openxlsx::addStyle(
+        workbook, sheet = sheet_name, style = integer_style,
+        rows = 2L:row_count, cols = integer_columns,
+        gridExpand = TRUE, stack = TRUE
+      )
+    }
+    if (row_count > 1L && length(numeric_columns)) {
+      openxlsx::addStyle(
+        workbook, sheet = sheet_name, style = decimal_style,
+        rows = 2L:row_count, cols = numeric_columns,
+        gridExpand = TRUE, stack = TRUE
+      )
+    }
+    column_widths <- vapply(seq_len(column_count), function(column_index) {
+      values <- c(names(data)[column_index], as.character(data[[column_index]]))
+      values[is.na(values)] <- ""
+      max_width <- max(nchar(values, type = "width"), na.rm = TRUE) + 2L
+      min(42, max(11, max_width))
+    }, numeric(1))
+    openxlsx::setColWidths(
+      workbook, sheet = sheet_name, cols = seq_len(column_count),
+      widths = column_widths
+    )
+  }
+
+  workbook$worksheets_rels <- lapply(
+    workbook$worksheets_rels,
+    function(x) x[grepl("printerSettings", x, fixed = TRUE)]
+  )
+  workbook$Content_Types <- workbook$Content_Types[
+    !grepl("/xl/drawings/", workbook$Content_Types, fixed = TRUE)
+  ]
+  openxlsx::saveWorkbook(workbook, path, overwrite = TRUE)
+  invisible(path)
+}
+
+report_file <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(
+  if (length(report_file) == 1L && file.exists(report_file)) report_file else getwd()
+)
+knitr::opts_knit$set(root.dir = project_root)
+
+input_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "dat_step3_concurrent.rda"
+)
+s3_3_result_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "fit_s3_3_unadjusted_distress.rda"
+)
+result_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "fit_s3_4_adjusted_distress.rda"
+)
+table_file <- file.path(
+  project_root, "Res_3_Results", "Table_S3_4_EngagementAdjustedDistress.xlsx"
+)
+figure_file <- file.path(
+  project_root, "Res_3_Results", "Figure_S3_4_EngagementAdjustedDistress.svg"
+)
+mplus_directory <- file.path(
+  project_root, "Step_3_Concurrent_Multilevel_Associations", "mplus", "s3_4"
+)
+mplus_command <- Sys.getenv("MPLUS_COMMAND", unset = "D:/Program Files/Mplus/Mplus.exe")
+
+stopifnot(
+  file.exists(input_file), file.exists(s3_3_result_file))
+if (!use_saved_results) {
+  stopifnot(file.exists(mplus_command))
+  dir.create(dirname(result_file), recursive = TRUE, showWarnings = FALSE)
+  dir.create(dirname(table_file), recursive = TRUE, showWarnings = FALSE)
+  dir.create(dirname(figure_file), recursive = TRUE, showWarnings = FALSE)
+  dir.create(mplus_directory, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+
+```{r load-saved-results, include=FALSE, eval=use_saved_results}
+load_saved_display <- function(path, input_path) {
+  saved <- load_single_object(path, "fit_s3_4_adjusted_distress")
+  stopifnot(is.list(saved), is.list(saved$metadata))
+  metadata <- saved$metadata
+  stopifnot(
+    identical(metadata$input_md5, unname(tools::md5sum(input_path))),
+    isTRUE(metadata$observations == 17755L), isTRUE(metadata$clusters == 209L),
+    identical(metadata$estimator, "MLR"),
+    length(metadata$mplus_version) == 1L,
+    metadata$mplus_version %in% c("8.7", "9")
+  )
+  stopifnot(identical(metadata$upstream_s3_3_md5,
+                      unname(tools::md5sum(s3_3_result_file))))
+  fields <- c("variable_map", "model_fit", "raw_full_paths", "standardized_full_paths", "standardized_contrasts", "r_squared", "mlr_model_comparison", "coefficient_comparison", "r2_comparison", "diagnostics", "predictor_correlations", "duration_linearity", "residual_diagnostics", "duration_context", "diagnostic_flags")
+  stopifnot(all(fields %in% names(saved)))
+  tables <- saved[fields]
+  predictor <- saved$predictor_diagnostics
+  stopifnot(is.data.frame(predictor), all(c("model", "level", "diagnostic_type",
+    "variable", "r_squared_from_other_predictors", "vif", "condition_index") %in% names(predictor)))
+  tables$vif_diagnostics <- predictor[predictor$diagnostic_type == "VIF",
+    c("model", "level", "variable", "r_squared_from_other_predictors", "vif"), drop = FALSE]
+  tables$condition_diagnostics <- predictor[predictor$diagnostic_type == "Condition index",
+    c("model", "level", "condition_index"), drop = FALSE]
+  influence <- saved$influence_diagnostics
+  stopifnot(is.data.frame(influence),
+    all(c("level", "maximum_absolute_change") %in% names(influence)),
+    all(is.finite(influence$maximum_absolute_change)))
+  tables$influence_public_summary <- influence |>
+    dplyr::group_by(level) |>
+    dplyr::summarise(maximum_absolute_change = max(maximum_absolute_change), .groups = "drop")
+  # Raw message text can contain individual cluster identifiers.
+  tables$diagnostics <- public_model_diagnostics(tables$diagnostics)
+  expected_rows <- c(variable_map = 32L, model_fit = 3L, raw_full_paths = 10L, standardized_full_paths = 10L, standardized_contrasts = 2L, r_squared = 6L, mlr_model_comparison = 1L, coefficient_comparison = 6L, r2_comparison = 2L, diagnostics = 3L, predictor_correlations = 20L, duration_linearity = 60L, residual_diagnostics = 2L, duration_context = 3L, diagnostic_flags = 6L, vif_diagnostics = 18L, condition_diagnostics = 3L, influence_public_summary = 2L)
+  stopifnot(setequal(names(tables), names(expected_rows)))
+  required_columns <- list(
+    variable_map = c("representation", "mplus_variable", "project_variable"),
+    model_fit = c("model_id", "representation", "restricted", "standardized", "mplus_version", "estimator", "observations", "clusters", "free_parameters", "scaled_chi_square", "scaling_correction", "df", "p_value", "cfi", "tli", "rmsea", "srmr_within", "srmr_between", "loglikelihood", "aic", "bic", "adjusted_bic"),
+    raw_full_paths = c("model_id", "representation", "scale", "level", "outcome", "predictor", "path_type", "estimate", "se", "z", "p_value", "ci_lower", "ci_upper"),
+    standardized_full_paths = c("model_id", "representation", "scale", "level", "outcome", "predictor", "path_type", "estimate", "se", "z", "p_value", "ci_lower", "ci_upper"),
+    standardized_contrasts = c("model_id", "representation", "scale", "level", "contrast", "estimate", "se", "z", "p_value", "ci_lower", "ci_upper"),
+    r_squared = c("model_id", "representation", "level", "outcome", "r_squared"),
+    mlr_model_comparison = c("comparison", "restricted_model", "full_model", "restricted_df", "full_df", "df_difference", "restricted_scaling_correction", "full_scaling_correction", "difference_scaling_correction", "scaled_lr_statistic", "p_value", "free_parameter_difference", "interpretation"),
+    coefficient_comparison = c("level", "term", "unadjusted_estimate", "unadjusted_se", "unadjusted_p_value", "unadjusted_ci_lower", "unadjusted_ci_upper", "adjusted_estimate", "adjusted_se", "adjusted_p_value", "adjusted_ci_lower", "adjusted_ci_upper", "absolute_change", "change_in_absolute_magnitude", "percent_change", "percentage_interpretable", "pattern", "note"),
+    r2_comparison = c("level", "unadjusted_r_squared", "adjusted_r_squared", "absolute_r_squared_change", "relative_r_squared_change_percent"),
+    diagnostics = c("model_id", "representation", "normal_termination", "errors_n", "warnings_n", "minimum_residual_variance", "residual_variances_positive", "required_focal_paths", "required_duration_paths", "required_contrasts", "restriction_verified", "restricted_duration_estimates_zero", "expected_focal_paths_present", "expected_duration_paths_present", "expected_contrasts_present", "technical_pass", "warning_summary"),
+    predictor_correlations = c("level", "variable_1", "variable_2", "correlation"),
+    duration_linearity = c("bin", "level", "engagement_mode", "n", "mean_partial_predictor", "mean_partial_distress"),
+    residual_diagnostics = c("level", "n", "mean", "sd", "rmse", "skewness", "excess_kurtosis", "minimum", "maximum", "maximum_absolute"),
+    duration_context = c("variable", "behavior", "n_observed", "mean_minutes", "sd_minutes", "median_minutes", "minimum", "maximum", "zero_percent", "endpoint_300_count", "skewness", "excess_kurtosis"),
+    diagnostic_flags = c("diagnostic", "flagged"),
+    vif_diagnostics = c("model", "level", "variable", "r_squared_from_other_predictors", "vif"),
+    condition_diagnostics = c("model", "level", "condition_index"),
+    influence_public_summary = c("level", "maximum_absolute_change")
+  )
+  for (name in names(tables)) {
+    table <- tables[[name]]
+    stopifnot(is.data.frame(table), nrow(table) == expected_rows[[name]],
+      identical(names(table), required_columns[[name]]),
+      !anyDuplicated(names(table)),
+      !any(grepl("^(Name_ID|Data_ID|cluster_id|rank|warning_text|error_text)$",
+                 names(table), ignore.case = TRUE)))
+  }
+  stopifnot(
+    nrow(tables$model_fit) == 3L,
+    all(tables$model_fit$observations == metadata$observations),
+    all(tables$model_fit$clusters == metadata$clusters),
+    all(tables$model_fit$estimator == metadata$estimator),
+    all(tables$model_fit$mplus_version == metadata$mplus_version),
+    length(tables$diagnostics$technical_pass) == 3L,
+    all(tables$diagnostics$technical_pass),
+    all(tables$r_squared$r_squared >= 0 & tables$r_squared$r_squared <= 1),
+    file.exists(figure_file)
+  )
+  tables
+}
+saved_display <- load_saved_display(result_file, input_file)
+list2env(saved_display, envir = environment())
+```
+
+```{r saved-mode-note, echo=FALSE, results='asis', eval=use_saved_results}
+cat("This report displays accepted saved estimates and the existing SVG. ",
+    "No model, diagnostic regression, bootstrap or result export was rerun. ",
+    "The fit table retains the original Mplus version; the current reproduction code uses 8.7.\n\n", sep = "")
+```
+
+# Load the fixed sample and verified S3.3 comparison result
+
+```{r load-and-validate-input, eval=!use_saved_results}
+dat_step3_concurrent <- load_single_object(input_file, "dat_step3_concurrent")
+fit_s3_3_unadjusted_distress <- load_single_object(
+  s3_3_result_file, "fit_s3_3_unadjusted_distress"
+)
+
+dat_s34 <- dat_step3_concurrent$prompt |>
+  dplyr::filter(s33_s34_sample) |>
+  dplyr::arrange(Name_ID, Day, Time) |>
+  as.data.frame()
+expected_observations <- dat_step3_concurrent$sample_audit$prompts[
+  dat_step3_concurrent$sample_audit$sample == "S3.3/S3.4 common Distress sample"
+]
+expected_clusters <- 209L
+required_complete <- c(
+  "Core", "Peripheral", "Distress",
+  "InteractiveTime", "ActiveTime", "PassiveTime"
+)
+stopifnot(
+  nrow(dat_s34) == 17755L,
+  expected_observations == 17755L,
+  dplyr::n_distinct(dat_s34$Name_ID) == expected_clusters,
+  !anyNA(dat_s34[required_complete]),
+  !anyDuplicated(dat_s34[c("Name_ID", "Day", "Time")]),
+  fit_s3_3_unadjusted_distress$metadata$observations == expected_observations,
+  fit_s3_3_unadjusted_distress$metadata$clusters == expected_clusters,
+  identical(fit_s3_3_unadjusted_distress$metadata$sample_flag, "s33_s34_sample"),
+  identical(
+    fit_s3_3_unadjusted_distress$metadata$input_md5,
+    unname(tools::md5sum(input_file))
+  )
+)
+
+input_audit <- data.frame(
+  scheduled_rows = nrow(dat_step3_concurrent$prompt),
+  analyzed_rows = nrow(dat_s34),
+  clusters = dplyr::n_distinct(dat_s34$Name_ID),
+  person_days = dplyr::n_distinct(interaction(
+    dat_s34$Name_ID, dat_s34$Day, drop = TRUE
+  )),
+  same_rows_as_s3_3 =
+    fit_s3_3_unadjusted_distress$metadata$observations == nrow(dat_s34),
+  step3_rda_md5 = unname(tools::md5sum(input_file)),
+  s3_3_result_md5 = unname(tools::md5sum(s3_3_result_file)),
+  duration_treatment = "Raw minutes; no log1p in Step 3",
+  stringsAsFactors = FALSE
+)
+```
+
+# Construct raw and level-standardized Mplus data
+
+```{r prepare-mplus-data, eval=!use_saved_results}
+raw_map <- c(
+  id = "Name_ID", dayc = "Day_c", tm2 = "Time_2", tm3 = "Time_3",
+  disw = "Distress_W", corew = "Core_W", periw = "Peripheral_W",
+  intw = "InteractiveTime_W", actw = "ActiveTime_W", pasw = "PassiveTime_W",
+  disb = "Distress_B", coreb = "Core_B", perib = "Peripheral_B",
+  intb = "InteractiveTime_B", actb = "ActiveTime_B", pasb = "PassiveTime_B"
+)
+standardized_map <- c(
+  id = "Name_ID", dayc = "Day_c", tm2 = "Time_2", tm3 = "Time_3",
+  diswz = "Distress_W_Z", corewz = "Core_W_Z", periwz = "Peripheral_W_Z",
+  intwz = "InteractiveTime_W_Z", actwz = "ActiveTime_W_Z",
+  paswz = "PassiveTime_W_Z", disbz = "Distress_B_Z",
+  corebz = "Core_B_Z", peribz = "Peripheral_B_Z",
+  intbz = "InteractiveTime_B_Z", actbz = "ActiveTime_B_Z",
+  pasbz = "PassiveTime_B_Z"
+)
+
+make_mplus_data <- function(map) {
+  output <- dat_s34[unname(map)]
+  names(output) <- names(map)
+  output$id <- as.integer(factor(output$id, levels = sort(unique(output$id))))
+  stopifnot(!anyNA(output), nrow(output) == expected_observations)
+  as.data.frame(output)
+}
+mplus_data_raw <- make_mplus_data(raw_map)
+mplus_data_standardized <- make_mplus_data(standardized_map)
+
+variable_map <- dplyr::bind_rows(
+  data.frame(
+    representation = "Raw", mplus_variable = names(raw_map),
+    project_variable = unname(raw_map), stringsAsFactors = FALSE
+  ),
+  data.frame(
+    representation = "Level-standardized",
+    mplus_variable = names(standardized_map),
+    project_variable = unname(standardized_map), stringsAsFactors = FALSE
+  )
+)
+```
+
+```{r variable-map-table, echo=FALSE}
+knitr::kable(variable_map, format = "html", row.names = FALSE)
+```
+
+# Define and run restricted, raw-full, and standardized-full Mplus models
+
+```{r run-mplus-models, eval=!use_saved_results}
+raw_variable_block <- paste(
+  "CLUSTER = id;",
+  "WITHIN = disw corew periw intw actw pasw dayc tm2 tm3;",
+  "BETWEEN = disb coreb perib intb actb pasb;",
+  sep = "\n"
+)
+standardized_variable_block <- paste(
+  "CLUSTER = id;",
+  paste(
+    "WITHIN = diswz corewz periwz intwz actwz paswz",
+    "dayc tm2 tm3;"
+  ),
+  "BETWEEN = disbz corebz peribz intbz actbz pasbz;",
+  sep = "\n"
+)
+
+raw_restricted_model <- paste(
+  "%WITHIN%",
+  "disw ON corew (wc);",
+  "disw ON periw (wp);",
+  "disw ON intw@0;",
+  "disw ON actw@0;",
+  "disw ON pasw@0;",
+  "disw ON dayc;",
+  "disw ON tm2;",
+  "disw ON tm3;",
+  "%BETWEEN%",
+  "disb ON coreb (bc);",
+  "disb ON perib (bp);",
+  "disb ON intb@0;",
+  "disb ON actb@0;",
+  "disb ON pasb@0;",
+  sep = "\n"
+)
+raw_full_model <- paste(
+  "%WITHIN%",
+  "disw ON corew (wc);",
+  "disw ON periw (wp);",
+  "disw ON intw (wi);",
+  "disw ON actw (wa);",
+  "disw ON pasw (wb);",
+  "disw ON dayc;",
+  "disw ON tm2;",
+  "disw ON tm3;",
+  "%BETWEEN%",
+  "disb ON coreb (bc);",
+  "disb ON perib (bp);",
+  "disb ON intb (bi);",
+  "disb ON actb (ba);",
+  "disb ON pasb (bb);",
+  sep = "\n"
+)
+standardized_full_model <- paste(
+  "%WITHIN%",
+  "diswz ON corewz (wc);",
+  "diswz ON periwz (wp);",
+  "diswz ON intwz (wi);",
+  "diswz ON actwz (wa);",
+  "diswz ON paswz (wb);",
+  "diswz ON dayc;",
+  "diswz ON tm2;",
+  "diswz ON tm3;",
+  "%BETWEEN%",
+  "disbz ON corebz (bc);",
+  "disbz ON peribz (bp);",
+  "disbz ON intbz (bi);",
+  "disbz ON actbz (ba);",
+  "disbz ON pasbz (bb);",
+  sep = "\n"
+)
+
+model_specifications <- list(
+  restricted_raw = list(
+    id = "S3_4_RESTRICTED_RAW",
+    label = "Raw same-variable-set duration paths fixed to zero",
+    stem = "s3_4_distress_restricted_raw",
+    data = mplus_data_raw,
+    usevariables = names(raw_map),
+    variable = raw_variable_block,
+    model = raw_restricted_model,
+    restricted = TRUE,
+    standardized = FALSE
+  ),
+  full_raw = list(
+    id = "S3_4_FULL_RAW",
+    label = "Raw full engagement-adjusted model",
+    stem = "s3_4_distress_full_raw",
+    data = mplus_data_raw,
+    usevariables = names(raw_map),
+    variable = raw_variable_block,
+    model = raw_full_model,
+    restricted = FALSE,
+    standardized = FALSE
+  ),
+  full_standardized = list(
+    id = "S3_4_FULL_STD",
+    label = "Level-standardized full focal model",
+    stem = "s3_4_distress_full_standardized",
+    data = mplus_data_standardized,
+    usevariables = names(standardized_map),
+    variable = standardized_variable_block,
+    model = standardized_full_model,
+    restricted = FALSE,
+    standardized = TRUE
+  )
+)
+
+model_constraint <- paste(
+  "NEW(wdiff bdiff);",
+  "wdiff = wc - wp;",
+  "bdiff = bc - bp;",
+  sep = "\n"
+)
+
+run_mplus_model <- function(specification) {
+  data_path <- file.path(mplus_directory, paste0(specification$stem, ".dat"))
+  input_path <- file.path(mplus_directory, paste0(specification$stem, ".inp"))
+  output_path <- file.path(mplus_directory, paste0(specification$stem, ".out"))
+
+  mplus_object <- MplusAutomation::mplusObject(
+    TITLE = paste(
+      "! Author: Kunru Song",
+      "! Step 3.4 complete Distress model with raw-minute Engagement Time.",
+      "! Concurrent association; engagement adjustment is not mediation.",
+      specification$label,
+      sep = "\n"
+    ),
+    VARIABLE = specification$variable,
+    ANALYSIS = paste("TYPE = TWOLEVEL;", "ESTIMATOR = MLR;", sep = "\n"),
+    MODEL = specification$model,
+    MODELCONSTRAINT = model_constraint,
+    OUTPUT = paste(
+      "SAMPSTAT;", "STANDARDIZED(STDYX);", "CINTERVAL;",
+      "RESIDUAL;", "TECH1;", "TECH4;", sep = "\n"
+    ),
+    usevariables = specification$usevariables,
+    rdata = specification$data,
+    autov = FALSE,
+    quiet = TRUE
+  )
+
+  modeler_result <- MplusAutomation::mplusModeler(
+    object = mplus_object,
+    dataout = data_path,
+    modelout = input_path,
+    run = 1L,
+    check = FALSE,
+    varwarnings = TRUE,
+    Mplus_command = mplus_command,
+    writeData = "always",
+    hashfilename = FALSE,
+    killOnFail = TRUE,
+    quiet = TRUE
+  )
+
+  stopifnot(file.exists(data_path), file.exists(input_path), file.exists(output_path))
+  input_lines <- readLines(input_path, warn = FALSE)
+  output_lines <- readLines(output_path, warn = FALSE)
+  parsed <- MplusAutomation::readModels(output_path, what = "all", quiet = TRUE)
+  fixed_zero_patterns <- c("intw@0", "actw@0", "pasw@0", "intb@0", "actb@0", "pasb@0")
+  checks <- list(
+    author_present = any(trimws(input_lines) == "! Author: Kunru Song"),
+    missing_declared = any(grepl(
+      "MISSING\\s*=\\s*\\.;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    twolevel_declared = any(grepl(
+      "TYPE\\s*=\\s*TWOLEVEL;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    mlr_declared = any(grepl(
+      "ESTIMATOR\\s*=\\s*MLR;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    cluster_declared = any(grepl(
+      "CLUSTER\\s*=\\s*id;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    constraint_declared = any(grepl(
+      "MODEL CONSTRAINT", input_lines, ignore.case = TRUE, fixed = TRUE
+    )),
+    normal_termination = any(grepl(
+      "THE MODEL ESTIMATION TERMINATED NORMALLY", output_lines, fixed = TRUE
+    )),
+    restriction_matches_specification = if (specification$restricted) {
+      all(vapply(fixed_zero_patterns, function(pattern) {
+        any(grepl(pattern, input_lines, ignore.case = TRUE, fixed = TRUE))
+      }, logical(1)))
+    } else {
+      !any(vapply(fixed_zero_patterns, function(pattern) {
+        any(grepl(pattern, input_lines, ignore.case = TRUE, fixed = TRUE))
+      }, logical(1)))
+    }
+  )
+  summary_row <- parsed$summaries[1, , drop = FALSE]
+  checks$mplus_8_7 <- identical(
+    summary_value(summary_row, "Mplus.version", "character"), "8.7"
+  )
+  checks$estimator_mlr <- identical(
+    summary_value(summary_row, "Estimator", "character"), "MLR"
+  )
+  checks$observations_match <-
+    as.integer(summary_value(summary_row, "Observations", "numeric")) ==
+      expected_observations
+  checks$clusters_match <-
+    parse_output_integer(output_path, "Number of clusters") == expected_clusters
+  stopifnot(all(unlist(checks)))
+
+  list(
+    model_id = specification$id,
+    model_label = specification$label,
+    restricted = specification$restricted,
+    standardized = specification$standardized,
+    syntax = list(
+      variable = specification$variable,
+      model = specification$model,
+      constraint = model_constraint
+    ),
+    paths = list(data = data_path, input = input_path, output = output_path),
+    file_md5 = unname(tools::md5sum(c(data_path, input_path, output_path))),
+    checks = checks,
+    parsed = parsed,
+    modeler_result = modeler_result,
+    warnings = flatten_messages(parsed$warnings),
+    errors = flatten_messages(parsed$errors)
+  )
+}
+
+model_runs <- lapply(model_specifications, run_mplus_model)
+```
+
+# Extract paths, contrasts, fit, R-squared, and the scaled MLR comparison
+
+Full warning/error text is kept in the local result object because it can contain
+individual cluster identifiers. The public table retains warning/error flags and
+an aggregate warning description. Fit indices for saturated models (df = 0) are
+not interpreted.
+
+```{r extract-results, eval=!use_saved_results}
+extract_fit <- function(run) {
+  s <- run$parsed$summaries[1, , drop = FALSE]
+  data.frame(
+    model_id = run$model_id,
+    representation = run$model_label,
+    restricted = run$restricted,
+    standardized = run$standardized,
+    mplus_version = summary_value(s, "Mplus.version", "character"),
+    estimator = summary_value(s, "Estimator", "character"),
+    observations = summary_value(s, "Observations", "numeric"),
+    clusters = parse_output_integer(run$paths$output, "Number of clusters"),
+    free_parameters = summary_value(s, "Parameters", "numeric"),
+    scaled_chi_square = summary_value(s, "ChiSqM_Value", "numeric"),
+    scaling_correction = summary_value(s, "ChiSqM_ScalingCorrection", "numeric"),
+    df = summary_value(s, "ChiSqM_DF", "numeric"),
+    p_value = summary_value(s, "ChiSqM_PValue", "numeric"),
+    cfi = summary_value(s, "CFI", "numeric"),
+    tli = summary_value(s, "TLI", "numeric"),
+    rmsea = summary_value(s, "RMSEA_Estimate", "numeric"),
+    srmr_within = summary_value(
+      s, c("SRMR.Within", "SRMR_Within", "SRMRWithin"), "numeric"
+    ),
+    srmr_between = summary_value(
+      s, c("SRMR.Between", "SRMR_Between", "SRMRBetween"), "numeric"
+    ),
+    loglikelihood = summary_value(s, "LL", "numeric"),
+    aic = summary_value(s, "AIC", "numeric"),
+    bic = summary_value(s, "BIC", "numeric"),
+    adjusted_bic = summary_value(s, "aBIC", "numeric"),
+    stringsAsFactors = FALSE
+  )
+}
+
+outcome_dictionary <- c(
+  DISW = "Distress", DISB = "Distress",
+  DISWZ = "Distress", DISBZ = "Distress"
+)
+predictor_dictionary <- c(
+  COREW = "Core", PERIW = "Peripheral",
+  INTW = "Interactive/message", ACTW = "Active/posting", PASW = "Passive/browsing",
+  COREB = "Core", PERIB = "Peripheral",
+  INTB = "Interactive/message", ACTB = "Active/posting", PASB = "Passive/browsing",
+  COREWZ = "Core", PERIWZ = "Peripheral",
+  INTWZ = "Interactive/message", ACTWZ = "Active/posting", PASWZ = "Passive/browsing",
+  COREBZ = "Core", PERIBZ = "Peripheral",
+  INTBZ = "Interactive/message", ACTBZ = "Active/posting", PASBZ = "Passive/browsing"
+)
+path_type_dictionary <- c(
+  COREW = "Core/Peripheral", PERIW = "Core/Peripheral",
+  COREB = "Core/Peripheral", PERIB = "Core/Peripheral",
+  COREWZ = "Core/Peripheral", PERIWZ = "Core/Peripheral",
+  COREBZ = "Core/Peripheral", PERIBZ = "Core/Peripheral",
+  INTW = "Engagement Time", ACTW = "Engagement Time", PASW = "Engagement Time",
+  INTB = "Engagement Time", ACTB = "Engagement Time", PASB = "Engagement Time",
+  INTWZ = "Engagement Time", ACTWZ = "Engagement Time", PASWZ = "Engagement Time",
+  INTBZ = "Engagement Time", ACTBZ = "Engagement Time", PASBZ = "Engagement Time"
+)
+
+extract_paths <- function(run) {
+  parameters <- run$parsed$parameters$unstandardized |>
+    dplyr::mutate(dplyr::across(
+      dplyr::any_of(c("est", "se", "est_se", "pval")), mplus_numeric
+    ))
+  ci <- run$parsed$parameters$ci.unstandardized
+  if (!is.null(ci) && nrow(ci)) {
+    ci <- ci |>
+      dplyr::mutate(dplyr::across(
+        dplyr::any_of(c("low2.5", "up2.5")), mplus_numeric
+      )) |>
+      dplyr::select(dplyr::any_of(c(
+        "paramHeader", "param", "BetweenWithin", "low2.5", "up2.5"
+      )))
+  }
+  paths <- parameters |>
+    dplyr::filter(grepl("\\.ON$", paramHeader)) |>
+    dplyr::mutate(
+      outcome_code = sub("\\.ON$", "", paramHeader),
+      predictor_code = param,
+      outcome = unname(outcome_dictionary[outcome_code]),
+      predictor = unname(predictor_dictionary[predictor_code]),
+      path_type = unname(path_type_dictionary[predictor_code])
+    ) |>
+    dplyr::filter(!is.na(outcome), !is.na(predictor)) |>
+    dplyr::select(
+      paramHeader, param, BetweenWithin, outcome_code, outcome,
+      predictor, path_type, estimate = est, se, z = est_se, p_value = pval
+    )
+  if (!is.null(ci) && nrow(ci)) {
+    paths <- paths |>
+      dplyr::left_join(ci, by = c("paramHeader", "param", "BetweenWithin")) |>
+      dplyr::rename(ci_lower = low2.5, ci_upper = up2.5)
+  } else {
+    paths$ci_lower <- paths$estimate - 1.96 * paths$se
+    paths$ci_upper <- paths$estimate + 1.96 * paths$se
+  }
+  paths |>
+    dplyr::mutate(
+      model_id = run$model_id,
+      representation = run$model_label,
+      level = ifelse(grepl("B$|BZ$", outcome_code), "Between", "Within"),
+      scale = ifelse(grepl("Z$", outcome_code), "Standardized", "Raw")
+    ) |>
+    dplyr::select(
+      model_id, representation, scale, level, outcome, predictor, path_type,
+      estimate, se, z, p_value, ci_lower, ci_upper
+    )
+}
+
+contrast_dictionary <- data.frame(
+  param = c("WDIFF", "BDIFF"), level = c("Within", "Between"),
+  stringsAsFactors = FALSE
+)
+extract_contrasts <- function(run) {
+  run$parsed$parameters$unstandardized |>
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::any_of(c("est", "se", "est_se", "pval")), mplus_numeric
+      ),
+      param_upper = toupper(param)
+    ) |>
+    dplyr::filter(param_upper %in% contrast_dictionary$param) |>
+    dplyr::left_join(contrast_dictionary, by = c("param_upper" = "param")) |>
+    dplyr::transmute(
+      model_id = run$model_id,
+      representation = run$model_label,
+      scale = ifelse(run$standardized, "Standardized", "Raw"),
+      level,
+      contrast = "Core slope - Peripheral slope",
+      estimate = est, se, z = est_se, p_value = pval,
+      ci_lower = est - 1.96 * se,
+      ci_upper = est + 1.96 * se
+    )
+}
+
+extract_r2 <- function(run) {
+  r2 <- run$parsed$parameters$r2
+  if (is.null(r2) || !nrow(r2)) return(data.frame())
+  r2 |>
+    dplyr::mutate(est = mplus_numeric(est), param_upper = toupper(param)) |>
+    dplyr::filter(param_upper %in% names(outcome_dictionary)) |>
+    dplyr::transmute(
+      model_id = run$model_id,
+      representation = run$model_label,
+      level = ifelse(grepl("B$|BZ$", param_upper), "Between", "Within"),
+      outcome = "Distress", r_squared = est
+    )
+}
+
+model_fit <- dplyr::bind_rows(lapply(model_runs, extract_fit))
+paths <- dplyr::bind_rows(lapply(model_runs, extract_paths))
+contrasts <- dplyr::bind_rows(lapply(model_runs, extract_contrasts))
+r_squared <- dplyr::bind_rows(lapply(model_runs, extract_r2))
+
+diagnostics <- dplyr::bind_rows(lapply(model_runs, function(run) {
+  residuals <- run$parsed$parameters$unstandardized |>
+    dplyr::mutate(est = mplus_numeric(est)) |>
+    dplyr::filter(paramHeader == "Residual.Variances")
+  data.frame(
+    model_id = run$model_id,
+    representation = run$model_label,
+    normal_termination = run$checks$normal_termination,
+    errors_n = ifelse(nzchar(run$errors), 1L, 0L),
+    warnings_n = ifelse(nzchar(run$warnings), 1L, 0L),
+    minimum_residual_variance = if (nrow(residuals)) min(residuals$est) else NA_real_,
+    residual_variances_positive = if (nrow(residuals)) all(residuals$est > 0) else FALSE,
+    required_focal_paths = sum(
+      paths$model_id == run$model_id & paths$path_type == "Core/Peripheral"
+    ),
+    required_duration_paths = sum(
+      paths$model_id == run$model_id & paths$path_type == "Engagement Time"
+    ),
+    required_contrasts = sum(contrasts$model_id == run$model_id),
+    restriction_verified = run$checks$restriction_matches_specification,
+    restricted_duration_estimates_zero = if (run$restricted) {
+      duration_estimates <- paths |>
+        dplyr::filter(
+          model_id == run$model_id, path_type == "Engagement Time"
+        ) |>
+        dplyr::pull(estimate)
+      length(duration_estimates) == 6L && all(duration_estimates == 0)
+    } else {
+      TRUE
+    },
+    warning_text = run$warnings,
+    error_text = ifelse(nzchar(run$errors), run$errors, "None"),
+    stringsAsFactors = FALSE
+  )
+})) |>
+  dplyr::mutate(
+    expected_focal_paths_present = required_focal_paths == 4L,
+    expected_duration_paths_present =
+      ifelse(model_id == "S3_4_RESTRICTED_RAW", TRUE, required_duration_paths == 6L),
+    expected_contrasts_present = required_contrasts == 2L,
+    technical_pass = normal_termination & errors_n == 0L &
+      residual_variances_positive & expected_focal_paths_present &
+      expected_duration_paths_present & expected_contrasts_present &
+      restriction_verified & restricted_duration_estimates_zero
+  )
+
+raw_full_paths <- paths |> dplyr::filter(model_id == "S3_4_FULL_RAW")
+standardized_full_paths <- paths |> dplyr::filter(model_id == "S3_4_FULL_STD")
+standardized_contrasts <- contrasts |> dplyr::filter(model_id == "S3_4_FULL_STD")
+sign_agreement <- raw_full_paths |>
+  dplyr::select(
+    level, predictor, path_type, raw_estimate = estimate, raw_z = z
+  ) |>
+  dplyr::left_join(
+    standardized_full_paths |>
+      dplyr::select(
+        level, predictor, path_type,
+        standardized_estimate = estimate, standardized_z = z
+      ),
+    by = c("level", "predictor", "path_type")
+  ) |>
+  dplyr::mutate(
+    # Mplus prints very small raw-minute slopes as 0.000; z retains their sign.
+    sign_agrees = sign(raw_z) == sign(standardized_z)
+  )
+
+standardization_constants <- dat_step3_concurrent$standardization
+predictor_variable_map <- c(
+  Core = "Core", Peripheral = "Peripheral",
+  `Interactive/message` = "InteractiveTime",
+  `Active/posting` = "ActiveTime",
+  `Passive/browsing` = "PassiveTime"
+)
+raw_scale_interpretation <- standardized_full_paths |>
+  dplyr::mutate(
+    outcome_sd = ifelse(
+      level == "Within",
+      standardization_constants$within_sd[
+        standardization_constants$variable == "Distress"
+      ],
+      standardization_constants$between_sd[
+        standardization_constants$variable == "Distress"
+      ]
+    ),
+    predictor_variable = unname(predictor_variable_map[predictor]),
+    predictor_sd = vapply(seq_len(dplyr::n()), function(row) {
+      variable <- predictor_variable[[row]]
+      if (level[[row]] == "Within") {
+        standardization_constants$within_sd[
+          standardization_constants$variable == variable
+        ]
+      } else {
+        standardization_constants$between_sd[
+          standardization_constants$variable == variable
+        ]
+      }
+    }, numeric(1)),
+    raw_scale_multiplier = outcome_sd / predictor_sd,
+    estimate_per_raw_unit = estimate * raw_scale_multiplier,
+    se_per_raw_unit = se * raw_scale_multiplier,
+    ci_lower_per_raw_unit = ci_lower * raw_scale_multiplier,
+    ci_upper_per_raw_unit = ci_upper * raw_scale_multiplier,
+    raw_unit = ifelse(
+      path_type == "Engagement Time", "Per 1 raw minute", "Per 1 mean-score point"
+    ),
+    estimate_per_10_minutes = ifelse(
+      path_type == "Engagement Time", estimate_per_raw_unit * 10, NA_real_
+    ),
+    ci_lower_per_10_minutes = ifelse(
+      path_type == "Engagement Time", ci_lower_per_raw_unit * 10, NA_real_
+    ),
+    ci_upper_per_10_minutes = ifelse(
+      path_type == "Engagement Time", ci_upper_per_raw_unit * 10, NA_real_
+    )
+  ) |>
+  dplyr::select(
+    level, predictor, path_type, raw_unit,
+    estimate_per_raw_unit, se_per_raw_unit,
+    ci_lower_per_raw_unit, ci_upper_per_raw_unit,
+    estimate_per_10_minutes, ci_lower_per_10_minutes,
+    ci_upper_per_10_minutes
+  ) |>
+  dplyr::left_join(
+    raw_full_paths |>
+      dplyr::select(
+        level, predictor, path_type, mplus_printed_raw_estimate = estimate
+      ),
+    by = c("level", "predictor", "path_type")
+  ) |>
+  dplyr::mutate(
+    reconstruction_minus_mplus_printed =
+      estimate_per_raw_unit - mplus_printed_raw_estimate,
+    reconstruction_note = paste(
+      "Reconstructed from the level-standardized Mplus path and S3.1 SDs;",
+      "used because Mplus prints raw slopes to three decimals"
+    )
+  )
+
+restricted_fit <- model_fit |>
+  dplyr::filter(model_id == "S3_4_RESTRICTED_RAW")
+full_fit <- model_fit |>
+  dplyr::filter(model_id == "S3_4_FULL_RAW")
+df_difference <- restricted_fit$df - full_fit$df
+difference_scaling_correction <- (
+  restricted_fit$df * restricted_fit$scaling_correction -
+    full_fit$df * full_fit$scaling_correction
+) / df_difference
+scaled_lr_statistic <- (
+  restricted_fit$scaled_chi_square * restricted_fit$scaling_correction -
+    full_fit$scaled_chi_square * full_fit$scaling_correction
+) / difference_scaling_correction
+mlr_model_comparison <- data.frame(
+  comparison = "Six Engagement Time paths jointly fixed to zero vs freely estimated",
+  restricted_model = restricted_fit$model_id,
+  full_model = full_fit$model_id,
+  restricted_df = restricted_fit$df,
+  full_df = full_fit$df,
+  df_difference = df_difference,
+  restricted_scaling_correction = restricted_fit$scaling_correction,
+  full_scaling_correction = full_fit$scaling_correction,
+  difference_scaling_correction = difference_scaling_correction,
+  scaled_lr_statistic = scaled_lr_statistic,
+  p_value = stats::pchisq(
+    scaled_lr_statistic, df = df_difference, lower.tail = FALSE
+  ),
+  free_parameter_difference =
+    full_fit$free_parameters - restricted_fit$free_parameters,
+  interpretation = paste(
+    "Joint test of three within-person and three between-person duration paths;",
+    "not a mediation test"
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  nrow(model_fit) == 3L,
+  nrow(raw_full_paths) == 10L,
+  nrow(standardized_full_paths) == 10L,
+  nrow(standardized_contrasts) == 2L,
+  nrow(r_squared) == 6L,
+  all(diagnostics$technical_pass),
+  all(sign_agreement$sign_agrees),
+  all(r_squared$r_squared >= 0 & r_squared$r_squared <= 1),
+  mlr_model_comparison$df_difference == 6L,
+  mlr_model_comparison$free_parameter_difference == 6L,
+  mlr_model_comparison$difference_scaling_correction > 0,
+  mlr_model_comparison$scaled_lr_statistic >= 0
+)
+
+```
+
+```{r model-fit-table, echo=FALSE}
+knitr::kable(round_numeric_columns(model_fit), format = "html", row.names = FALSE)
+```
+
+```{r raw-full-paths-table, echo=FALSE}
+knitr::kable(round_numeric_columns(raw_full_paths), format = "html", row.names = FALSE)
+```
+
+```{r standardized-full-paths-table, echo=FALSE}
+knitr::kable(round_numeric_columns(standardized_full_paths), format = "html", row.names = FALSE)
+```
+
+```{r standardized-contrasts-table, echo=FALSE}
+knitr::kable(round_numeric_columns(standardized_contrasts), format = "html", row.names = FALSE)
+```
+
+```{r r-squared-table, echo=FALSE}
+knitr::kable(round_numeric_columns(r_squared), format = "html", row.names = FALSE)
+```
+
+```{r mlr-model-comparison-table, echo=FALSE}
+knitr::kable(round_numeric_columns(mlr_model_comparison), format = "html", row.names = FALSE)
+```
+
+```{r diagnostics-table, echo=FALSE}
+knitr::kable(round_numeric_columns(public_model_diagnostics(diagnostics)), format = "html", row.names = FALSE)
+```
+
+# Same-sample S3.3 versus S3.4 coefficient and R-squared comparison
+
+```{r compare-unadjusted-adjusted, eval=!use_saved_results}
+s3_3_terms <- dplyr::bind_rows(
+  fit_s3_3_unadjusted_distress$standardized_paths |>
+    dplyr::transmute(
+      level, term = predictor, unadjusted_estimate = estimate,
+      unadjusted_se = se, unadjusted_p_value = p_value,
+      unadjusted_ci_lower = ci_lower, unadjusted_ci_upper = ci_upper
+    ),
+  fit_s3_3_unadjusted_distress$standardized_contrasts |>
+    dplyr::transmute(
+      level, term = "Core - Peripheral", unadjusted_estimate = estimate,
+      unadjusted_se = se, unadjusted_p_value = p_value,
+      unadjusted_ci_lower = ci_lower, unadjusted_ci_upper = ci_upper
+    )
+)
+s3_4_terms <- dplyr::bind_rows(
+  standardized_full_paths |>
+    dplyr::filter(path_type == "Core/Peripheral") |>
+    dplyr::transmute(
+      level, term = predictor, adjusted_estimate = estimate,
+      adjusted_se = se, adjusted_p_value = p_value,
+      adjusted_ci_lower = ci_lower, adjusted_ci_upper = ci_upper
+    ),
+  standardized_contrasts |>
+    dplyr::transmute(
+      level, term = "Core - Peripheral", adjusted_estimate = estimate,
+      adjusted_se = se, adjusted_p_value = p_value,
+      adjusted_ci_lower = ci_lower, adjusted_ci_upper = ci_upper
+    )
+)
+
+coefficient_comparison <- s3_3_terms |>
+  dplyr::left_join(s3_4_terms, by = c("level", "term")) |>
+  dplyr::mutate(
+    absolute_change = adjusted_estimate - unadjusted_estimate,
+    change_in_absolute_magnitude =
+      abs(adjusted_estimate) - abs(unadjusted_estimate),
+    percent_change = 100 * absolute_change / abs(unadjusted_estimate),
+    percentage_interpretable = abs(unadjusted_estimate) >= 0.05,
+    pattern = dplyr::case_when(
+      abs(absolute_change) < 0.005 ~ "Essentially unchanged (<0.005)",
+      abs(adjusted_estimate) < abs(unadjusted_estimate) ~ "Attenuated",
+      abs(adjusted_estimate) > abs(unadjusted_estimate) ~ "Strengthened",
+      TRUE ~ "Unchanged"
+    ),
+    note = ifelse(
+      percentage_interpretable,
+      "Percentage change shown",
+      "Small unadjusted denominator; prioritize absolute change"
+    )
+  ) |>
+  dplyr::arrange(
+    factor(level, levels = c("Within", "Between")),
+    factor(term, levels = c("Core", "Peripheral", "Core - Peripheral"))
+  )
+
+s3_3_r2 <- fit_s3_3_unadjusted_distress$r_squared |>
+  dplyr::filter(model_id == "S3_3_STD") |>
+  dplyr::select(level, unadjusted_r_squared = r_squared)
+s3_4_r2 <- r_squared |>
+  dplyr::filter(model_id == "S3_4_FULL_STD") |>
+  dplyr::select(level, adjusted_r_squared = r_squared)
+r2_comparison <- s3_3_r2 |>
+  dplyr::left_join(s3_4_r2, by = "level") |>
+  dplyr::mutate(
+    absolute_r_squared_change = adjusted_r_squared - unadjusted_r_squared,
+    relative_r_squared_change_percent =
+      100 * absolute_r_squared_change / unadjusted_r_squared
+  )
+
+stopifnot(
+  nrow(coefficient_comparison) == 6L,
+  !anyNA(coefficient_comparison[c("unadjusted_estimate", "adjusted_estimate")]),
+  nrow(r2_comparison) == 2L
+)
+```
+
+```{r coefficient-comparison-table, echo=FALSE}
+knitr::kable(round_numeric_columns(coefficient_comparison), format = "html", row.names = FALSE)
+```
+
+```{r r2-comparison-table, echo=FALSE}
+knitr::kable(round_numeric_columns(r2_comparison), format = "html", row.names = FALSE)
+```
+
+# Full-model predictor, linearity, residual, and influence diagnostics
+
+The following R regressions are diagnostic companions on the identical fixed
+sample. Canonical estimates and inference come from the Mplus MLR models;
+current reproduction uses Mplus 8.7. Cluster-specific influence records remain
+in the local result object and workbook. The public report shows only the
+largest absolute Core, Peripheral or contrast change at each level, without
+participant identifiers or rankings.
+
+```{r diagnostic-audit, eval=!use_saved_results}
+between_data <- dat_s34 |>
+  dplyr::select(
+    Name_ID, Distress_B, Core_B, Peripheral_B,
+    InteractiveTime_B, ActiveTime_B, PassiveTime_B,
+    Distress_B_Z, Core_B_Z, Peripheral_B_Z,
+    InteractiveTime_B_Z, ActiveTime_B_Z, PassiveTime_B_Z
+  ) |>
+  dplyr::distinct() |>
+  as.data.frame()
+stopifnot(nrow(between_data) == expected_clusters)
+
+within_full <- c(
+  "Core_W", "Peripheral_W", "InteractiveTime_W",
+  "ActiveTime_W", "PassiveTime_W"
+)
+within_full_design <- c(within_full, "Day_c", "Time_2", "Time_3")
+between_full <- c(
+  "Core_B", "Peripheral_B", "InteractiveTime_B",
+  "ActiveTime_B", "PassiveTime_B"
+)
+vif_diagnostics <- dplyr::bind_rows(
+  vif_table(dat_s34, within_full, "Within", "S3.4 full predictors"),
+  vif_table(dat_s34, within_full_design, "Within", "S3.4 including Time/Day"),
+  vif_table(between_data, between_full, "Between", "S3.4 full predictors")
+)
+condition_diagnostics <- data.frame(
+  model = c(
+    "S3.4 full predictors", "S3.4 including Time/Day",
+    "S3.4 full predictors"
+  ),
+  level = c("Within", "Within", "Between"),
+  condition_index = c(
+    condition_index(dat_s34, within_full),
+    condition_index(dat_s34, within_full_design),
+    condition_index(between_data, between_full)
+  ),
+  stringsAsFactors = FALSE
+)
+
+correlation_pairs <- function(data, variables, level_label) {
+  matrix <- stats::cor(data[variables], use = "pairwise.complete.obs")
+  indices <- which(upper.tri(matrix), arr.ind = TRUE)
+  data.frame(
+    level = level_label,
+    variable_1 = rownames(matrix)[indices[, 1]],
+    variable_2 = colnames(matrix)[indices[, 2]],
+    correlation = matrix[indices], stringsAsFactors = FALSE
+  )
+}
+predictor_correlations <- dplyr::bind_rows(
+  correlation_pairs(dat_s34, within_full, "Within"),
+  correlation_pairs(between_data, between_full, "Between")
+)
+
+partial_binned_summary <- function(
+  data, outcome, focal, adjustment, label, level_label
+) {
+  outcome_residual <- stats::resid(stats::lm(
+    stats::reformulate(adjustment, response = outcome), data = data
+  ))
+  predictor_residual <- stats::resid(stats::lm(
+    stats::reformulate(adjustment, response = focal), data = data
+  ))
+  data.frame(
+    partial_predictor = predictor_residual,
+    partial_distress = outcome_residual
+  ) |>
+    dplyr::mutate(bin = dplyr::ntile(partial_predictor, 10L)) |>
+    dplyr::group_by(bin) |>
+    dplyr::summarise(
+      level = .env$level_label,
+      engagement_mode = .env$label,
+      n = dplyr::n(),
+      mean_partial_predictor = mean(partial_predictor),
+      mean_partial_distress = mean(partial_distress),
+      .groups = "drop"
+    )
+}
+
+within_standardized_predictors <- c(
+  "Core_W_Z", "Peripheral_W_Z", "InteractiveTime_W_Z",
+  "ActiveTime_W_Z", "PassiveTime_W_Z"
+)
+between_standardized_predictors <- c(
+  "Core_B_Z", "Peripheral_B_Z", "InteractiveTime_B_Z",
+  "ActiveTime_B_Z", "PassiveTime_B_Z"
+)
+duration_linearity <- dplyr::bind_rows(
+  dplyr::bind_rows(lapply(
+    names(c(
+      InteractiveTime_W_Z = "Interactive/message",
+      ActiveTime_W_Z = "Active/posting",
+      PassiveTime_W_Z = "Passive/browsing"
+    )),
+    function(focal) {
+      labels <- c(
+        InteractiveTime_W_Z = "Interactive/message",
+        ActiveTime_W_Z = "Active/posting",
+        PassiveTime_W_Z = "Passive/browsing"
+      )
+      partial_binned_summary(
+        dat_s34, "Distress_W_Z", focal,
+        c(setdiff(within_standardized_predictors, focal), "Day_c", "Time_2", "Time_3"),
+        labels[[focal]], "Within"
+      )
+    }
+  )),
+  dplyr::bind_rows(lapply(
+    names(c(
+      InteractiveTime_B_Z = "Interactive/message",
+      ActiveTime_B_Z = "Active/posting",
+      PassiveTime_B_Z = "Passive/browsing"
+    )),
+    function(focal) {
+      labels <- c(
+        InteractiveTime_B_Z = "Interactive/message",
+        ActiveTime_B_Z = "Active/posting",
+        PassiveTime_B_Z = "Passive/browsing"
+      )
+      partial_binned_summary(
+        between_data, "Distress_B_Z", focal,
+        setdiff(between_standardized_predictors, focal),
+        labels[[focal]], "Between"
+      )
+    }
+  ))
+)
+
+within_screen <- stats::lm(
+  Distress_W ~ Core_W + Peripheral_W + InteractiveTime_W +
+    ActiveTime_W + PassiveTime_W + Day_c + Time_2 + Time_3,
+  data = dat_s34
+)
+between_screen <- stats::lm(
+  Distress_B ~ Core_B + Peripheral_B + InteractiveTime_B +
+    ActiveTime_B + PassiveTime_B,
+  data = between_data
+)
+residual_diagnostics <- dplyr::bind_rows(lapply(
+  list(Within = stats::resid(within_screen), Between = stats::resid(between_screen)),
+  function(residual) {
+    data.frame(
+      n = length(residual), mean = mean(residual), sd = stats::sd(residual),
+      rmse = sqrt(mean(residual^2)), skewness = skewness(residual),
+      excess_kurtosis = excess_kurtosis(residual),
+      minimum = min(residual), maximum = max(residual),
+      maximum_absolute = max(abs(residual)), stringsAsFactors = FALSE
+    )
+  }
+), .id = "level")
+
+within_screen_z <- stats::lm(
+  Distress_W_Z ~ Core_W_Z + Peripheral_W_Z + InteractiveTime_W_Z +
+    ActiveTime_W_Z + PassiveTime_W_Z + Day_c + Time_2 + Time_3,
+  data = dat_s34
+)
+between_screen_z <- stats::lm(
+  Distress_B_Z ~ Core_B_Z + Peripheral_B_Z + InteractiveTime_B_Z +
+    ActiveTime_B_Z + PassiveTime_B_Z,
+  data = between_data
+)
+within_reference <- stats::coef(within_screen_z)[c("Core_W_Z", "Peripheral_W_Z")]
+between_reference <- stats::coef(between_screen_z)[c("Core_B_Z", "Peripheral_B_Z")]
+
+within_leave_one_cluster <- dplyr::bind_rows(lapply(unique(dat_s34$Name_ID), function(id) {
+  fit <- stats::lm(
+    Distress_W_Z ~ Core_W_Z + Peripheral_W_Z + InteractiveTime_W_Z +
+      ActiveTime_W_Z + PassiveTime_W_Z + Day_c + Time_2 + Time_3,
+    data = dat_s34[dat_s34$Name_ID != id, ]
+  )
+  coefficient <- stats::coef(fit)[c("Core_W_Z", "Peripheral_W_Z")]
+  data.frame(
+    level = "Within", cluster_id = as.character(id),
+    core_change = coefficient[[1L]] - within_reference[[1L]],
+    peripheral_change = coefficient[[2L]] - within_reference[[2L]],
+    stringsAsFactors = FALSE
+  )
+}))
+between_leave_one_cluster <- dplyr::bind_rows(lapply(unique(between_data$Name_ID), function(id) {
+  fit <- stats::lm(
+    Distress_B_Z ~ Core_B_Z + Peripheral_B_Z + InteractiveTime_B_Z +
+      ActiveTime_B_Z + PassiveTime_B_Z,
+    data = between_data[between_data$Name_ID != id, ]
+  )
+  coefficient <- stats::coef(fit)[c("Core_B_Z", "Peripheral_B_Z")]
+  data.frame(
+    level = "Between", cluster_id = as.character(id),
+    core_change = coefficient[[1L]] - between_reference[[1L]],
+    peripheral_change = coefficient[[2L]] - between_reference[[2L]],
+    stringsAsFactors = FALSE
+  )
+}))
+influence_diagnostics <- dplyr::bind_rows(
+  within_leave_one_cluster, between_leave_one_cluster
+) |>
+  dplyr::mutate(
+    contrast_change = core_change - peripheral_change,
+    maximum_absolute_change = pmax(
+      abs(core_change), abs(peripheral_change), abs(contrast_change)
+    )
+  ) |>
+  dplyr::group_by(level) |>
+  dplyr::arrange(dplyr::desc(maximum_absolute_change), .by_group = TRUE) |>
+  dplyr::mutate(rank = dplyr::row_number()) |>
+  dplyr::filter(rank <= 10L) |>
+  dplyr::ungroup() |>
+  dplyr::select(
+    level, rank, cluster_id, core_change, peripheral_change,
+    contrast_change, maximum_absolute_change
+  )
+
+duration_labels <- c(
+  InteractiveTime = "Interactive/message",
+  ActiveTime = "Active/posting",
+  PassiveTime = "Passive/browsing"
+)
+duration_context <- dplyr::bind_rows(lapply(names(duration_labels), function(variable) {
+  x <- dat_s34[[variable]]
+  data.frame(
+    variable = variable, behavior = duration_labels[[variable]],
+    n_observed = length(x), mean_minutes = mean(x),
+    sd_minutes = stats::sd(x), median_minutes = stats::median(x),
+    minimum = min(x), maximum = max(x), zero_percent = mean(x == 0) * 100,
+    endpoint_300_count = sum(x == 300), skewness = skewness(x),
+    excess_kurtosis = excess_kurtosis(x), stringsAsFactors = FALSE
+  )
+}))
+
+diagnostic_flags <- data.frame(
+  diagnostic = c(
+    "Maximum VIF exceeds 5",
+    "Maximum condition index exceeds 30",
+    "Posting zero percentage differs materially from verified context",
+    "Duration value outside 0-300",
+    "Influence diagnostic contains non-finite change",
+    "Raw and standardized full-model path signs disagree"
+  ),
+  flagged = c(
+    max(vif_diagnostics$vif) > 5,
+    max(condition_diagnostics$condition_index) > 30,
+    abs(duration_context$zero_percent[duration_context$variable == "ActiveTime"] -
+      75.13) > 0.10,
+    any(duration_context$minimum < 0 | duration_context$maximum > 300),
+    any(!is.finite(influence_diagnostics$maximum_absolute_change)),
+    any(!sign_agreement$sign_agrees)
+  ),
+  stringsAsFactors = FALSE
+)
+stopifnot(!any(diagnostic_flags$flagged))
+
+influence_public_summary <- influence_diagnostics |>
+  dplyr::group_by(level) |>
+  dplyr::summarise(
+    maximum_absolute_change = max(maximum_absolute_change), .groups = "drop"
+  )
+```
+
+```{r vif-diagnostics-table, echo=FALSE}
+knitr::kable(round_numeric_columns(vif_diagnostics, 3L), format = "html", row.names = FALSE)
+```
+
+```{r condition-diagnostics-table, echo=FALSE}
+knitr::kable(round_numeric_columns(condition_diagnostics, 3L), format = "html", row.names = FALSE)
+```
+
+```{r predictor-correlations-table, echo=FALSE}
+knitr::kable(round_numeric_columns(predictor_correlations, 3L), format = "html", row.names = FALSE)
+```
+
+```{r duration-linearity-table, echo=FALSE}
+knitr::kable(round_numeric_columns(duration_linearity, 3L), format = "html", row.names = FALSE)
+```
+
+```{r residual-diagnostics-table, echo=FALSE}
+knitr::kable(round_numeric_columns(residual_diagnostics, 3L), format = "html", row.names = FALSE)
+```
+
+```{r influence-public-summary-table, echo=FALSE}
+knitr::kable(round_numeric_columns(influence_public_summary, 4L), format = "html", row.names = FALSE)
+```
+
+```{r duration-context-table, echo=FALSE}
+knitr::kable(round_numeric_columns(duration_context, 3L), format = "html", row.names = FALSE)
+```
+
+```{r diagnostic-flags-table, echo=FALSE}
+knitr::kable(diagnostic_flags, format = "html", row.names = FALSE)
+```
+
+# Figure
+
+```{r export-results, include=FALSE, eval=!use_saved_results}
+plot_data <- dplyr::bind_rows(
+  coefficient_comparison |>
+    dplyr::transmute(
+      level, term, model = "S3.3 without Engagement Time",
+      estimate = unadjusted_estimate, se = unadjusted_se,
+      p_value = unadjusted_p_value,
+      ci_lower = unadjusted_ci_lower, ci_upper = unadjusted_ci_upper
+    ),
+  coefficient_comparison |>
+    dplyr::transmute(
+      level, term, model = "S3.4 with Engagement Time",
+      estimate = adjusted_estimate, se = adjusted_se,
+      p_value = adjusted_p_value,
+      ci_lower = adjusted_ci_lower, ci_upper = adjusted_ci_upper
+    )
+) |>
+  dplyr::mutate(
+    term = factor(term, levels = c("Core", "Peripheral", "Core - Peripheral")),
+    level = factor(level, levels = c("Within", "Between")),
+    model = factor(
+      model,
+      levels = c(
+        "S3.3 without Engagement Time", "S3.4 with Engagement Time"
+      )
+    )
+  )
+
+comparison_plot <- ggplot2::ggplot(
+  plot_data,
+  ggplot2::aes(
+    x = term, y = estimate, ymin = ci_lower, ymax = ci_upper,
+    color = model, group = model
+  )
+) +
+  ggplot2::geom_hline(yintercept = 0, color = "grey60", linewidth = 0.4) +
+  ggplot2::geom_pointrange(
+    position = ggplot2::position_dodge(width = 0.42), linewidth = 0.45
+  ) +
+  ggplot2::facet_wrap(~ level, scales = "free_y") +
+  ggplot2::scale_color_manual(values = c(
+    "S3.3 without Engagement Time" = "#2C7FB8",
+    "S3.4 with Engagement Time" = "#D95F0E"
+  )) +
+  ggplot2::labs(
+    x = NULL, y = "Standardized concurrent coefficient", color = NULL,
+    title = "Distress coefficients before and after Engagement Time adjustment",
+    subtitle = paste(
+      "Identical 17,755-prompt sample; points are Mplus MLR estimates",
+      "with 95% confidence intervals"
+    )
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    legend.position = "top", panel.grid.minor = ggplot2::element_blank(),
+    plot.title.position = "plot"
+  )
+
+ggplot2::ggsave(
+  filename = figure_file, plot = comparison_plot,
+  device = svglite::svglite, width = 10, height = 5.8, bg = "white"
+)
+
+predictor_diagnostics <- dplyr::bind_rows(
+  vif_diagnostics |>
+    dplyr::mutate(condition_index = NA_real_, diagnostic_type = "VIF"),
+  condition_diagnostics |>
+    dplyr::mutate(
+      variable = "Overall condition index",
+      r_squared_from_other_predictors = NA_real_, vif = NA_real_,
+      diagnostic_type = "Condition index"
+    )
+) |>
+  dplyr::select(
+    model, level, diagnostic_type, variable,
+    r_squared_from_other_predictors, vif, condition_index
+  )
+
+workbook_sheets <- list(
+  Model_Fit = round_numeric_columns(model_fit),
+  MLR_Model_Comparison = round_numeric_columns(mlr_model_comparison),
+  Raw_Full_Paths = round_numeric_columns(raw_full_paths),
+  Raw_Scale_Interpretation = round_numeric_columns(raw_scale_interpretation, 6L),
+  Standardized_Full_Paths = round_numeric_columns(standardized_full_paths),
+  Standardized_Contrasts = round_numeric_columns(standardized_contrasts),
+  Coefficient_Comparison = round_numeric_columns(coefficient_comparison),
+  R_Squared = round_numeric_columns(r_squared),
+  R2_Comparison = round_numeric_columns(r2_comparison),
+  Model_Diagnostics = round_numeric_columns(diagnostics),
+  Predictor_Diagnostics = round_numeric_columns(predictor_diagnostics),
+  Predictor_Correlations = round_numeric_columns(predictor_correlations),
+  Duration_Linearity = round_numeric_columns(duration_linearity),
+  Residual_Diagnostics = round_numeric_columns(residual_diagnostics),
+  Influence_Diagnostics = round_numeric_columns(influence_diagnostics),
+  Duration_Context = round_numeric_columns(duration_context)
+)
+
+bruceR::export(workbook_sheets, file = table_file, overwrite = TRUE)
+style_and_sanitize_workbook(table_file, workbook_sheets)
+
+fit_s3_4_adjusted_distress <- list(
+  metadata = list(
+    generated_by = paste0(
+      "Step_3_Concurrent_Multilevel_Associations/",
+      "S3_4_EngagementAdjustedDistressModel.Rmd"
+    ),
+    input_file = "Res_2_Data_for_Analysis/dat_step3_concurrent.rda",
+    input_md5 = unname(tools::md5sum(input_file)),
+    upstream_s3_3_file =
+      "Res_2_Data_for_Analysis/fit_s3_3_unadjusted_distress.rda",
+    upstream_s3_3_md5 = unname(tools::md5sum(s3_3_result_file)),
+    observations = expected_observations,
+    clusters = expected_clusters,
+    sample_flag = "s33_s34_sample",
+    estimator = "MLR",
+    mplus_version = unique(model_fit$mplus_version),
+    duration_treatment = "Three separate raw-minute predictors",
+    nuisance_adjustment = "Within-person Day_c, Time_2, and Time_3",
+    comparison = "Same-sample standardized coefficient pattern plus six-path MLR test",
+    interpretation = "Concurrent association; adjustment is not causal mediation"
+  ),
+  model_runs = model_runs,
+  model_fit = model_fit,
+  raw_full_paths = raw_full_paths,
+  raw_scale_interpretation = raw_scale_interpretation,
+  standardized_full_paths = standardized_full_paths,
+  standardized_contrasts = standardized_contrasts,
+  r_squared = r_squared,
+  mlr_model_comparison = mlr_model_comparison,
+  coefficient_comparison = coefficient_comparison,
+  r2_comparison = r2_comparison,
+  diagnostics = diagnostics,
+  sign_agreement = sign_agreement,
+  predictor_diagnostics = predictor_diagnostics,
+  predictor_correlations = predictor_correlations,
+  duration_linearity = duration_linearity,
+  residual_diagnostics = residual_diagnostics,
+  influence_diagnostics = influence_diagnostics,
+  duration_context = duration_context,
+  diagnostic_flags = diagnostic_flags,
+  variable_map = variable_map,
+  output_files = list(
+    result_rda = "Res_2_Data_for_Analysis/fit_s3_4_adjusted_distress.rda",
+    workbook = "Res_3_Results/Table_S3_4_EngagementAdjustedDistress.xlsx",
+    figure = "Res_3_Results/Figure_S3_4_EngagementAdjustedDistress.svg"
+  )
+)
+save(
+  fit_s3_4_adjusted_distress, file = result_file,
+  compress = "xz", version = 3
+)
+```
+
+```{r result-figure, echo=FALSE}
+knitr::include_graphics(figure_file, rel_path = FALSE)
+```
+
+```{r final-validation, include=FALSE, eval=!use_saved_results}
+verified_result <- load_single_object(
+  result_file, "fit_s3_4_adjusted_distress"
+)
+workbook_sheets_read <- readxl::excel_sheets(table_file)
+svg_text <- readLines(figure_file, warn = FALSE)
+xlsx_entries <- utils::unzip(table_file, list = TRUE)$Name
+xlsx_relationship_entries <- xlsx_entries[grepl("\\.rels$", xlsx_entries)]
+xlsx_relationship_text <- unlist(lapply(xlsx_relationship_entries, function(entry) {
+  readLines(unz(table_file, entry), warn = FALSE)
+}), use.names = FALSE)
+dangling_drawing_relationship <- any(grepl(
+  "relationships/(drawing|vmlDrawing)", xlsx_relationship_text
+))
+
+artifact_audit <- data.frame(
+  artifact = c("Result RDA", "Workbook", "SVG figure"),
+  exists = c(
+    file.exists(result_file), file.exists(table_file), file.exists(figure_file)
+  ),
+  bytes = c(
+    file.info(result_file)$size,
+    file.info(table_file)$size,
+    file.info(figure_file)$size
+  ),
+  md5 = unname(tools::md5sum(c(result_file, table_file, figure_file))),
+  stringsAsFactors = FALSE
+)
+
+validation <- data.frame(
+  gate = c(
+    "All three Mplus models terminated normally",
+    "Mplus 8.7 and MLR verified",
+    "Common S3.3/S3.4 sample and 209 clusters verified",
+    "Six restricted duration paths explicitly fixed and estimated at zero",
+    "Four focal paths and two contrasts per model parsed",
+    "Six duration paths parsed in each full model",
+    "Residual variances positive",
+    "R-squared admissible",
+    "Raw and standardized full-model signs agree",
+    "Reconstructed raw-unit slopes agree with Mplus printed rounding",
+    "Scaled MLR six-path comparison valid",
+    "Six same-sample coefficient-comparison rows present",
+    "Multicollinearity thresholds passed",
+    "Residual and influence diagnostics finite",
+    "Posting zero mass and endpoints retained",
+    "Workbook sheets verified",
+    "Workbook has no dangling drawing relationships",
+    "SVG is vector output",
+    "Saved result RDA reloaded"
+  ),
+  passed = c(
+    all(diagnostics$normal_termination),
+    all(model_fit$mplus_version == "8.7" & model_fit$estimator == "MLR"),
+    all(model_fit$observations == expected_observations &
+      model_fit$clusters == expected_clusters),
+    model_runs$restricted_raw$checks$restriction_matches_specification &&
+      diagnostics$restricted_duration_estimates_zero[
+        diagnostics$model_id == "S3_4_RESTRICTED_RAW"
+      ],
+    all(diagnostics$required_focal_paths == 4L &
+      diagnostics$required_contrasts == 2L),
+    all(diagnostics$required_duration_paths[
+      diagnostics$model_id != "S3_4_RESTRICTED_RAW"
+    ] == 6L),
+    all(diagnostics$residual_variances_positive),
+    all(r_squared$r_squared >= 0 & r_squared$r_squared <= 1),
+    all(sign_agreement$sign_agrees),
+    max(abs(raw_scale_interpretation$reconstruction_minus_mplus_printed)) < 0.0006,
+    mlr_model_comparison$df_difference == 6L &&
+      mlr_model_comparison$free_parameter_difference == 6L &&
+      mlr_model_comparison$difference_scaling_correction > 0 &&
+      is.finite(mlr_model_comparison$p_value),
+    nrow(coefficient_comparison) == 6L &&
+      !anyNA(coefficient_comparison[c("unadjusted_estimate", "adjusted_estimate")]),
+    max(vif_diagnostics$vif) < 5 &&
+      max(condition_diagnostics$condition_index) < 30,
+    all(is.finite(residual_diagnostics$rmse)) &&
+      all(is.finite(influence_diagnostics$maximum_absolute_change)),
+    duration_context$zero_percent[duration_context$variable == "ActiveTime"] > 75 &&
+      duration_context$endpoint_300_count[duration_context$variable == "ActiveTime"] == 5L,
+    identical(workbook_sheets_read, names(workbook_sheets)),
+    !dangling_drawing_relationship,
+    any(grepl("<svg", svg_text, fixed = TRUE)) &&
+      !any(grepl("<image", svg_text, fixed = TRUE)),
+    identical(verified_result$metadata$observations, expected_observations)
+  ),
+  stringsAsFactors = FALSE
+)
+stopifnot(all(artifact_audit$exists), all(validation$passed))
+
+```

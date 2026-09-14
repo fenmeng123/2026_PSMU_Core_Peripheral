@@ -1,0 +1,440 @@
+---
+title: "S4.1 Prepare DSEM data"
+author: "Kunru Song"
+date: "2026-07-21 00:47:47 +08:00"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+<!-- Fixed date: earliest retained HTML CreationTime, not a verified analysis-start log. -->
+
+This report creates the sole stage-specific data entry for Step 4. It preserves
+the complete 90-prompt sequence, creates the strict Core, Peripheral, and
+Distress means, transforms the three duration variables with `log1p()`, recodes
+the three frequency variables from 1--4 to 0--3, and constructs the separately
+scaled 30-day aggregation sensitivity data. It estimates no statistical model.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  collapse = FALSE, comment = NA
+)
+
+required_packages <- c("dplyr", "knitr", "rmarkdown", "tibble", "tidyr")
+available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(available)) {
+  stop("Missing required R packages: ", paste(names(available)[!available], collapse = ", "))
+}
+
+locate_project_root <- function(start = getwd()) {
+  candidate <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(candidate)) candidate <- dirname(candidate)
+  repeat {
+    if (all(dir.exists(file.path(candidate, c(
+      "Step_1_Descriptive_and_Reliability", "Step_4_Dynamic_Structural_Equation_Modeling"
+    ))))) return(candidate)
+    parent <- dirname(candidate)
+    if (identical(parent, candidate)) break
+    candidate <- parent
+  }
+  stop("Could not identify the project root from the public Step folders")
+}
+
+load_single_object <- function(path, expected_name) {
+  environment <- new.env(parent = emptyenv())
+  loaded <- load(path, envir = environment)
+  if (!identical(loaded, expected_name)) {
+    stop("Expected only ", expected_name, "; found: ", paste(loaded, collapse = ", "))
+  }
+  environment[[expected_name]]
+}
+
+strict_complete_mean <- function(data, variables) {
+  values <- as.data.frame(lapply(data[variables], as.numeric))
+  complete <- rowSums(!is.na(values)) == length(variables)
+  score <- rep(NA_real_, nrow(values))
+  score[complete] <- rowMeans(values[complete, , drop = FALSE])
+  score
+}
+
+safe_mean <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+
+within_scaling_row <- function(data, variable, mode, level) {
+  person_mean <- ave(
+    data[[variable]], data[["Name_ID"]],
+    FUN = function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+  )
+  within_value <- data[[variable]] - person_mean
+  person_values <- tapply(data[[variable]], data[["Name_ID"]], safe_mean)
+  data.frame(
+    level = level,
+    mode = mode,
+    variable = variable,
+    transformation = "log1p duration",
+    n_observed = as.integer(sum(!is.na(data[[variable]]))),
+    participants = as.integer(length(unique(data[["Name_ID"]][!is.na(data[[variable]])]))),
+    within_sd = stats::sd(within_value, na.rm = TRUE),
+    total_sd = stats::sd(data[[variable]], na.rm = TRUE),
+    between_sd_person_means = stats::sd(person_values, na.rm = TRUE),
+    stringsAsFactors = FALSE
+  )
+}
+
+input_context <- knitr::current_input(dir = TRUE)
+project_start <- if (length(input_context) == 1L && !is.na(input_context) &&
+                     nzchar(input_context)) input_context else getwd()
+project_root <- locate_project_root(project_start)
+knitr::opts_knit$set(root.dir = project_root)
+
+input_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "dat_focal_analysis.rda"
+)
+output_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "dat_step4_dsem.rda"
+)
+stopifnot(file.exists(input_file))
+dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load and audit the canonical source
+
+```{r load-source}
+dat_focal_analysis <- load_single_object(input_file, "dat_focal_analysis")
+
+peripheral_items <- c("PMU1", "PMU2")
+core_items <- paste0("PMU", 3:6)
+distress_items <- paste0("DASS", 1:6)
+duration_source <- paste0("mu_time", 1:3)
+frequency_source <- paste0("mu_frequency", 1:3)
+required_source <- c(
+  "Data_ID", "Name_ID", "Day", "Time",
+  peripheral_items, core_items, distress_items,
+  duration_source, frequency_source
+)
+
+stopifnot(
+  all(required_source %in% names(dat_focal_analysis)),
+  nrow(dat_focal_analysis) == 18810L,
+  dplyr::n_distinct(dat_focal_analysis[["Name_ID"]]) == 209L,
+  !anyNA(dat_focal_analysis[c("Name_ID", "Day", "Time")]),
+  !anyDuplicated(dat_focal_analysis[c("Name_ID", "Day", "Time")]),
+  identical(sort(unique(dat_focal_analysis[["Day"]])), 1:30),
+  identical(sort(unique(dat_focal_analysis[["Time"]])), 1:3)
+)
+
+source_audit <- data.frame(
+  check = c(
+    "Scheduled prompt rows", "Participants", "Days per participant",
+    "Prompts per participant", "Duplicate prompt keys"
+  ),
+  value = c(
+    nrow(dat_focal_analysis),
+    dplyr::n_distinct(dat_focal_analysis[["Name_ID"]]),
+    min(tapply(dat_focal_analysis[["Day"]], dat_focal_analysis[["Name_ID"]], dplyr::n_distinct)),
+    min(table(dat_focal_analysis[["Name_ID"]])),
+    sum(duplicated(dat_focal_analysis[c("Name_ID", "Day", "Time")]))
+  ),
+  stringsAsFactors = FALSE
+)
+knitr::kable(source_audit)
+```
+
+# Prompt-level DSEM data
+
+```{r prepare-prompt}
+prompt <- dat_focal_analysis |>
+  dplyr::arrange(Name_ID, Day, Time) |>
+  dplyr::transmute(
+    Data_ID = as.numeric(Data_ID),
+    Name_ID = as.numeric(Name_ID),
+    Day = as.integer(Day),
+    Time = as.integer(Time),
+    tprompt = as.integer(3L * (Day - 1L) + Time),
+    dayc = as.numeric(Day - 15.5),
+    tm2 = as.integer(Time == 2L),
+    tm3 = as.integer(Time == 3L),
+    InteractiveMinutes = as.numeric(mu_time1),
+    ActiveMinutes = as.numeric(mu_time2),
+    PassiveMinutes = as.numeric(mu_time3),
+    InteractiveLog = log1p(InteractiveMinutes),
+    ActiveLog = log1p(ActiveMinutes),
+    PassiveLog = log1p(PassiveMinutes),
+    InteractiveFrequency = as.numeric(mu_frequency1) - 1,
+    ActiveFrequency = as.numeric(mu_frequency2) - 1,
+    PassiveFrequency = as.numeric(mu_frequency3) - 1,
+    Peripheral = strict_complete_mean(
+      dplyr::pick(dplyr::all_of(peripheral_items)), peripheral_items
+    ),
+    Core = strict_complete_mean(
+      dplyr::pick(dplyr::all_of(core_items)), core_items
+    ),
+    Distress = strict_complete_mean(
+      dplyr::pick(dplyr::all_of(distress_items)), distress_items
+    )
+  ) |>
+  as.data.frame()
+
+sequence_audit <- prompt |>
+  dplyr::group_by(Name_ID) |>
+  dplyr::summarise(
+    rows = dplyr::n(), min_tprompt = min(tprompt), max_tprompt = max(tprompt),
+    exact_sequence = identical(tprompt, 1:90), .groups = "drop"
+  )
+
+score_variables <- c(
+  "InteractiveLog", "ActiveLog", "PassiveLog",
+  "InteractiveFrequency", "ActiveFrequency", "PassiveFrequency",
+  "Core", "Peripheral", "Distress"
+)
+prompt_completeness <- data.frame(
+  level = "Prompt",
+  variable = score_variables,
+  observed = vapply(prompt[score_variables], function(x) sum(!is.na(x)), integer(1)),
+  missing = vapply(prompt[score_variables], function(x) sum(is.na(x)), integer(1)),
+  minimum = vapply(prompt[score_variables], function(x) min(x, na.rm = TRUE), numeric(1)),
+  maximum = vapply(prompt[score_variables], function(x) max(x, na.rm = TRUE), numeric(1)),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  nrow(prompt) == 18810L,
+  nrow(sequence_audit) == 209L,
+  all(sequence_audit$rows == 90L),
+  all(sequence_audit$min_tprompt == 1L),
+  all(sequence_audit$max_tprompt == 90L),
+  all(sequence_audit$exact_sequence),
+  all(prompt_completeness$minimum >= 0),
+  all(prompt_completeness$maximum[
+    prompt_completeness$variable %in% c("Core", "Peripheral", "Distress")
+  ] <= 5),
+  all(prompt_completeness$maximum[
+    grepl("Frequency", prompt_completeness$variable)
+  ] <= 3)
+)
+
+knitr::kable(prompt_completeness, digits = 4)
+```
+
+# Strict 30-day aggregation sensitivity data
+
+```{r prepare-daily}
+daily <- prompt |>
+  dplyr::group_by(Name_ID, Day) |>
+  dplyr::summarise(
+    n_scheduled = dplyr::n(),
+    InteractiveMinutes = if (sum(!is.na(InteractiveMinutes)) == 3L) {
+      sum(InteractiveMinutes)
+    } else NA_real_,
+    ActiveMinutes = if (sum(!is.na(ActiveMinutes)) == 3L) {
+      sum(ActiveMinutes)
+    } else NA_real_,
+    PassiveMinutes = if (sum(!is.na(PassiveMinutes)) == 3L) {
+      sum(PassiveMinutes)
+    } else NA_real_,
+    Core = if (sum(!is.na(Core)) == 3L) mean(Core) else NA_real_,
+    Peripheral = if (sum(!is.na(Peripheral)) == 3L) mean(Peripheral) else NA_real_,
+    Distress = if (sum(!is.na(Distress)) == 3L) mean(Distress) else NA_real_,
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    tday = as.integer(Day),
+    dayc = as.numeric(Day - 15.5),
+    InteractiveLog = log1p(InteractiveMinutes),
+    ActiveLog = log1p(ActiveMinutes),
+    PassiveLog = log1p(PassiveMinutes)
+  ) |>
+  dplyr::arrange(Name_ID, Day) |>
+  dplyr::select(
+    Name_ID, Day, tday, dayc, n_scheduled,
+    InteractiveMinutes, ActiveMinutes, PassiveMinutes,
+    InteractiveLog, ActiveLog, PassiveLog,
+    Core, Peripheral, Distress
+  ) |>
+  as.data.frame()
+
+daily_sequence_audit <- daily |>
+  dplyr::group_by(Name_ID) |>
+  dplyr::summarise(
+    rows = dplyr::n(), min_tday = min(tday), max_tday = max(tday),
+    exact_sequence = identical(tday, 1:30), .groups = "drop"
+  )
+
+daily_variables <- c(
+  "InteractiveLog", "ActiveLog", "PassiveLog", "Core", "Peripheral", "Distress"
+)
+daily_completeness <- data.frame(
+  level = "Daily",
+  variable = daily_variables,
+  observed = vapply(daily[daily_variables], function(x) sum(!is.na(x)), integer(1)),
+  missing = vapply(daily[daily_variables], function(x) sum(is.na(x)), integer(1)),
+  minimum = vapply(daily[daily_variables], function(x) min(x, na.rm = TRUE), numeric(1)),
+  maximum = vapply(daily[daily_variables], function(x) max(x, na.rm = TRUE), numeric(1)),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  nrow(daily) == 6270L,
+  all(daily$n_scheduled == 3L),
+  nrow(daily_sequence_audit) == 209L,
+  all(daily_sequence_audit$rows == 30L),
+  all(daily_sequence_audit$exact_sequence),
+  all(daily_completeness$observed > 0L)
+)
+
+knitr::kable(daily_completeness, digits = 4)
+```
+
+# Separate prompt and daily scaling constants
+
+```{r scaling-audit}
+mode_map <- c(
+  InteractiveLog = "Interactive/message",
+  ActiveLog = "Active/posting",
+  PassiveLog = "Passive/browsing"
+)
+scaling <- dplyr::bind_rows(
+  lapply(names(mode_map), function(variable) {
+    within_scaling_row(prompt, variable, mode_map[[variable]], "Prompt")
+  }),
+  lapply(names(mode_map), function(variable) {
+    within_scaling_row(daily, variable, mode_map[[variable]], "Daily")
+  })
+)
+
+prompt_targets <- c(
+  InteractiveLog = 0.822181,
+  ActiveLog = 0.756508,
+  PassiveLog = 0.988582
+)
+prompt_scaling <- scaling[scaling$level == "Prompt", ]
+target_difference <- prompt_scaling$within_sd - prompt_targets[prompt_scaling$variable]
+stopifnot(
+  all(is.finite(scaling$within_sd)),
+  all(scaling$within_sd > 0),
+  all(scaling$participants == 209L),
+  max(abs(target_difference)) < 0.000001
+)
+
+knitr::kable(scaling, digits = 6)
+```
+
+# Variable map, provenance, and saved object
+
+```{r save-object}
+variable_map <- data.frame(
+  source = c(
+    duration_source, frequency_source,
+    paste(peripheral_items, collapse = ", "),
+    paste(core_items, collapse = ", "),
+    paste(distress_items, collapse = ", ")
+  ),
+  prompt_variable = c(
+    "InteractiveLog", "ActiveLog", "PassiveLog",
+    "InteractiveFrequency", "ActiveFrequency", "PassiveFrequency",
+    "Peripheral", "Core", "Distress"
+  ),
+  role = c(
+    rep("Primary duration", 3), rep("Frequency sensitivity", 3),
+    "Mediator", "Mediator", "Outcome"
+  ),
+  scoring = c(
+    rep("log1p(raw prompt minutes)", 3),
+    rep("raw category minus 1", 3),
+    "Strict 2/2 mean", "Strict 4/4 mean", "Strict 6/6 mean"
+  ),
+  stringsAsFactors = FALSE
+)
+
+lag_audit <- data.frame(
+  interval = c("Lag-1 within-day", "Lag-1 overnight", "Lag-2 same-day", "Lag-2 crosses overnight"),
+  scheduled_per_person = c(60L, 29L, 30L, 58L),
+  stringsAsFactors = FALSE
+)
+
+dat_step4_dsem <- list(
+  prompt = prompt,
+  daily = daily,
+  variable_map = variable_map,
+  scaling = scaling,
+  audit = list(
+    source = source_audit,
+    prompt_completeness = prompt_completeness,
+    daily_completeness = daily_completeness,
+    prompt_sequence = sequence_audit,
+    daily_sequence = daily_sequence_audit,
+    lag_structure = lag_audit
+  ),
+  provenance = list(
+    generated_by = paste0(
+      "Step_4_Dynamic_Structural_Equation_Modeling/",
+      "S4_1_PrepareDSEMData.Rmd"
+    ),
+    generated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %z"),
+    source_file = "Res_2_Data_for_Analysis/dat_focal_analysis.rda",
+    source_md5 = unname(tools::md5sum(input_file)),
+    scoring = "Strict-complete unit-weighted prompt means",
+    prompt_time_index = "tprompt = 3 * (Day - 1) + Time",
+    daily_time_index = "tday = Day",
+    frequency_recode = "1-4 recoded to 0-3",
+    duration_transform = "log1p",
+    within_sd_rule = "sd(person-centered values, na.rm = TRUE; N-1 denominator)"
+  )
+)
+
+expected_components <- c("prompt", "daily", "variable_map", "scaling", "audit", "provenance")
+stopifnot(
+  identical(names(dat_step4_dsem), expected_components),
+  nrow(dat_step4_dsem$prompt) == 18810L,
+  nrow(dat_step4_dsem$daily) == 6270L
+)
+
+save(dat_step4_dsem, file = output_file, compress = "xz", version = 3)
+verified <- load_single_object(output_file, "dat_step4_dsem")
+stopifnot(
+  identical(names(verified), expected_components),
+  identical(verified$scaling, scaling),
+  identical(verified$provenance$source_md5, unname(tools::md5sum(input_file))),
+  nrow(verified$prompt) == 18810L,
+  nrow(verified$daily) == 6270L
+)
+```
+
+```{r final-acceptance, include=FALSE}
+acceptance <- data.frame(
+  gate = c(
+    "Canonical source validated",
+    "Prompt scaffold and tprompt validated",
+    "Strict construct scores validated",
+    "Frequency recode validated",
+    "Daily scaffold and tday validated",
+    "Prompt scaling reproduces targets",
+    "Daily scaling independently calculated",
+    "Saved RDA reloaded successfully"
+  ),
+  passed = c(
+    nrow(dat_focal_analysis) == 18810L,
+    nrow(prompt) == 18810L && all(sequence_audit$exact_sequence),
+    all(prompt_completeness$maximum[
+      prompt_completeness$variable %in% c("Core", "Peripheral", "Distress")
+    ] <= 5),
+    all(prompt_completeness$minimum[grepl("Frequency", prompt_completeness$variable)] >= 0) &&
+      all(prompt_completeness$maximum[grepl("Frequency", prompt_completeness$variable)] <= 3),
+    nrow(daily) == 6270L && all(daily_sequence_audit$exact_sequence),
+    max(abs(target_difference)) < 0.000001,
+    all(scaling$within_sd[scaling$level == "Daily"] > 0),
+    file.exists(output_file) && nrow(verified$prompt) == 18810L
+  ),
+  stringsAsFactors = FALSE
+)
+stopifnot(all(acceptance$passed))
+knitr::kable(acceptance)
+```
+
+The canonical Step 4 data object was written to
+`Res_2_Data_for_Analysis/dat_step4_dsem.rda`. Downstream Step 4 scripts must
+load this object and must not independently rescore items or return to raw SAV
+files.

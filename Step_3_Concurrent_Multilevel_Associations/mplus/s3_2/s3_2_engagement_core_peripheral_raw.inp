@@ -1,0 +1,51 @@
+TITLE:
+! Author: Kunru Song
+! Step 3.2 concurrent association; predictor orientation is not causal.
+Raw mean scores and raw minutes
+DATA:
+FILE = "F:/2026_[8]_PSMU_Daily_CorePeripheral/
+Step_3_Concurrent_Multilevel_Associations/mplus/s3_2/
+s3_2_engagement_core_peripheral_raw.dat"; 
+VARIABLE:
+NAMES = id dayc tm2 tm3 corew periw intw actw pasw coreb perib intb actb pasb; 
+ MISSING=.;
+ CLUSTER = id;
+WITHIN = corew periw intw actw pasw dayc tm2 tm3;
+BETWEEN = coreb perib intb actb pasb;
+ANALYSIS:
+TYPE = TWOLEVEL;
+ESTIMATOR = MLR;
+MODEL:
+%WITHIN%
+corew ON intw (cwi);
+corew ON actw (cwa);
+corew ON pasw (cwp);
+corew ON dayc tm2 tm3;
+periw ON intw (pwi);
+periw ON actw (pwa);
+periw ON pasw (pwp);
+periw ON dayc tm2 tm3;
+corew WITH periw;
+%BETWEEN%
+coreb ON intb (cbi);
+coreb ON actb (cba);
+coreb ON pasb (cbp);
+perib ON intb (pbi);
+perib ON actb (pba);
+perib ON pasb (pbp);
+coreb WITH perib;
+MODEL CONSTRAINT:
+NEW(dwi dwa dwp dbi dba dbp);
+dwi = pwi - cwi;
+dwa = pwa - cwa;
+dwp = pwp - cwp;
+dbi = pbi - cbi;
+dba = pba - cba;
+dbp = pbp - cbp;
+OUTPUT:
+SAMPSTAT;
+STANDARDIZED(STDYX);
+CINTERVAL;
+RESIDUAL;
+TECH1;
+TECH4;

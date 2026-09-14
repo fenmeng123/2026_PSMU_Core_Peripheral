@@ -1,0 +1,1622 @@
+---
+title: "S2.4 Baseline latent structural equation model"
+author: "Kunru Song"
+date: "2026-07-18 18:29:40 +08:00"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+<!-- Author: Kunru Song -->
+
+Existing RDA object identifiers are retained for compatibility. Mplus folders,
+run-file prefixes, reports, tables and figures use the current analysis numbering.
+
+# Scientific question and model design
+
+This analysis tests whether baseline Trait Peripheral and Trait Core PSMU
+factors are associated with latent baseline depression, anxiety, and perceived stress. All five constructs are represented by their raw items rather
+than scale totals.
+
+Two models are estimated with local Mplus 8.7 through R `MplusAutomation`:
+
+1. a five-factor measurement model in which all latent factors correlate;
+2. a structural model in which latent depression, anxiety, and
+   perceived stress are simultaneously regressed on latent Peripheral and Core.
+
+The structural model freely estimates the Peripheral--Core covariance and the
+residual covariances among the three endogenous outcome factors. This allows depression, anxiety, and stress to remain associated after accounting for PSMU. With these residual covariances, the two
+models are covariance-equivalent parameterizations and should have identical
+global fit; the structural model supplies the mutually adjusted regression
+paths.
+
+The 42 indicators are treated as ordered categorical with WLSMV and Delta
+parameterization, matching the primary baseline CFA estimator. The documented
+anxiety shift and perceived-stress reversals are applied only to the generated
+S2.4 analysis data; the canonical S2.1 raw-item RDA is not modified.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA
+)
+
+required_packages <- c(
+  "bruceR",
+  "dplyr",
+  "ggplot2",
+  "knitr",
+  "MplusAutomation",
+  "openxlsx",
+  "readxl",
+  "rmarkdown",
+  "stringr",
+  "svglite",
+  "tibble",
+  "tidySEM",
+  "tidyr",
+  "zip",
+  "xml2"
+)
+package_available <- vapply(
+  required_packages,
+  requireNamespace,
+  logical(1),
+  quietly = TRUE
+)
+if (!all(package_available)) {
+  stop(
+    "Missing required R packages: ",
+    paste(names(package_available)[!package_available], collapse = ", ")
+  )
+}
+
+locate_project_root <- function(start = getwd()) {
+  candidate <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(candidate)) candidate <- dirname(candidate)
+  repeat {
+    if (all(dir.exists(file.path(candidate, c(
+      "Step_1_Descriptive_and_Reliability", "Step_2_Measurement_Models"
+    ))))) return(candidate)
+    parent <- dirname(candidate)
+    if (identical(parent, candidate)) break
+    candidate <- parent
+  }
+  stop("Could not identify the project root from the public Step folders")
+}
+
+load_single_object <- function(path, expected_name) {
+  environment <- new.env(parent = emptyenv())
+  loaded <- load(path, envir = environment)
+  if (!identical(loaded, expected_name)) {
+    stop(
+      "Expected ", expected_name, " in ", path,
+      "; found: ", paste(loaded, collapse = ", ")
+    )
+  }
+  environment[[expected_name]]
+}
+
+clean_mplus_numeric <- function(x) {
+  x <- as.numeric(x)
+  x[abs(x) >= 900] <- NA_real_
+  x
+}
+
+input_path <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(if (is.null(input_path)) getwd() else input_path)
+knitr::opts_knit$set(root.dir = project_root)
+knitr::opts_chunk$set(dev = "svglite")
+
+measurement_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "dat_step2_measurement.rda"
+)
+result_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "fit_s2_8_baseline_sem.rda"
+)
+table_file <- file.path(
+  project_root,
+  "Res_3_Results",
+  "Table_S2_4_BaselineSEM_PSMU_PsychologicalDistress.xlsx"
+)
+figure_file <- file.path(
+  project_root,
+  "Res_3_Results",
+  "Figure_S2_4_BaselineSEM_PSMU_PsychologicalDistress.svg"
+)
+mplus_directory <- file.path(
+  project_root,
+  "Step_2_Measurement_Models",
+  "mplus",
+  "s2_4"
+)
+mplus_command <- Sys.getenv("MPLUS_COMMAND", unset = "D:/Program Files/Mplus/Mplus.exe")
+
+stopifnot(file.exists(measurement_file), file.exists(mplus_command))
+dir.create(dirname(result_file), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(table_file), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(figure_file), recursive = TRUE, showWarnings = FALSE)
+dir.create(mplus_directory, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load and validate the expanded S2.1 baseline entry
+
+```{r load-and-validate-input}
+dat_step2_measurement <- load_single_object(
+  measurement_file,
+  "dat_step2_measurement"
+)
+
+psmu_items <- paste0("V_BSMAS_", 1:18)
+depression_items <- paste0("K_CESD_", 1:7)
+anxiety_items <- paste0("L_DASS_", 1:7)
+stress_items <- paste0("M_PSS_", 1:10)
+all_model_items <- c(
+  psmu_items,
+  depression_items,
+  anxiety_items,
+  stress_items
+)
+required_columns <- c("Name_ID", all_model_items)
+
+dat_baseline_raw <- dat_step2_measurement$baseline |>
+  dplyr::select(dplyr::all_of(required_columns)) |>
+  as.data.frame()
+
+stopifnot(
+  identical(
+    names(dat_step2_measurement),
+    c("baseline", "ema", "item_map", "audit")
+  ),
+  nrow(dat_step2_measurement$baseline) == 209L,
+  ncol(dat_step2_measurement$baseline) == 43L,
+  nrow(dat_step2_measurement$item_map) == 48L,
+  identical(names(dat_baseline_raw), required_columns),
+  nrow(dat_baseline_raw) == 209L,
+  dplyr::n_distinct(dat_baseline_raw$Name_ID) == 209L,
+  !anyNA(dat_baseline_raw),
+  all(vapply(dat_baseline_raw[psmu_items], function(x) all(x %in% 1:5), logical(1))),
+  all(vapply(dat_baseline_raw[depression_items], function(x) all(x %in% 1:4), logical(1))),
+  all(vapply(dat_baseline_raw[anxiety_items], function(x) all(x %in% 1:4), logical(1))),
+  all(vapply(dat_baseline_raw[stress_items], function(x) all(x %in% 1:5), logical(1)))
+)
+
+input_audit <- data.frame(
+  participants = nrow(dat_baseline_raw),
+  raw_items = length(all_model_items),
+  missing_item_cells = sum(is.na(dat_baseline_raw[all_model_items])),
+  measurement_rda_md5 = unname(tools::md5sum(measurement_file)),
+  generated_by = dat_step2_measurement$audit$generated_by,
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(input_audit)
+```
+
+# Apply the documented analysis-only transformations
+
+```{r transform-and-map-items}
+dat_baseline_sem <- dat_baseline_raw
+dat_baseline_sem[anxiety_items] <- lapply(
+  dat_baseline_sem[anxiety_items],
+  function(x) x - 1
+)
+stress_reverse_items <- c("M_PSS_4", "M_PSS_5", "M_PSS_7", "M_PSS_8")
+dat_baseline_sem[stress_reverse_items] <- lapply(
+  dat_baseline_sem[stress_reverse_items],
+  function(x) 6 - x
+)
+
+mplus_names <- c(
+  paste0("bs", 1:18),
+  paste0("d", 1:7),
+  paste0("a", 1:7),
+  paste0("s", 1:10)
+)
+constructs <- c(
+  rep("Trait PSMU", 18),
+  rep("Depression", 7),
+  rep("Anxiety", 7),
+  rep("Perceived stress", 10)
+)
+factor_names <- c(
+  rep(c("PERIPH", "CORE"), c(6, 12)),
+  rep("DEP", 7),
+  rep("ANX", 7),
+  rep("STR", 10)
+)
+transformations <- c(
+  rep("Raw 1-5", 18),
+  rep("Raw 1-4", 7),
+  rep("Shifted from 1-4 to 0-3 using x - 1", 7),
+  ifelse(
+    stress_items %in% stress_reverse_items,
+    "Reverse-scored using 6 - x",
+    "Raw 1-5"
+  )
+)
+
+variable_map <- data.frame(
+  item_order = seq_along(all_model_items),
+  project_variable = all_model_items,
+  mplus_variable = toupper(mplus_names),
+  construct = constructs,
+  factor = factor_names,
+  transformation = transformations,
+  stringsAsFactors = FALSE
+)
+
+mplus_data <- dat_baseline_sem[all_model_items]
+names(mplus_data) <- mplus_names
+mplus_data <- as.data.frame(mplus_data)
+
+stopifnot(
+  identical(names(mplus_data), mplus_names),
+  nrow(mplus_data) == 209L,
+  !anyNA(mplus_data),
+  all(vapply(mplus_data[paste0("bs", 1:18)], function(x) all(x %in% 1:5), logical(1))),
+  all(vapply(mplus_data[paste0("d", 1:7)], function(x) all(x %in% 1:4), logical(1))),
+  all(vapply(mplus_data[paste0("a", 1:7)], function(x) all(x %in% 0:3), logical(1))),
+  all(vapply(mplus_data[paste0("s", 1:10)], function(x) all(x %in% 1:5), logical(1))),
+  length(unique(substr(mplus_names, 1L, 8L))) == 42L
+)
+
+transformation_audit <- variable_map |>
+  dplyr::group_by(construct, transformation) |>
+  dplyr::summarise(items = dplyr::n(), .groups = "drop")
+
+knitr::kable(transformation_audit)
+knitr::kable(variable_map)
+```
+
+# Specify the measurement and structural models
+
+```{r model-specifications}
+measurement_syntax <- paste(
+  "periph BY bs1-bs6;",
+  "core BY bs7-bs18;",
+  "dep BY d1-d7;",
+  "anx BY a1-a7;",
+  "str BY s1-s10;",
+  "periph WITH core dep anx str;",
+  "core WITH dep anx str;",
+  "dep WITH anx str;",
+  "anx WITH str;",
+  sep = "\n"
+)
+
+structural_syntax <- paste(
+  "periph BY bs1-bs6;",
+  "core BY bs7-bs18;",
+  "dep BY d1-d7;",
+  "anx BY a1-a7;",
+  "str BY s1-s10;",
+  "dep anx str ON periph core;",
+  "periph WITH core;",
+  "dep WITH anx str;",
+  "anx WITH str;",
+  sep = "\n"
+)
+
+model_specs <- list(
+  Measurement_5Factor = list(
+    label = "Five-factor measurement model",
+    stem = "s2_4_measurement_5factor",
+    model = measurement_syntax,
+    structural = FALSE
+  ),
+  Structural_CorePeripheral = list(
+    label = "Core and Peripheral predicting three latent outcomes",
+    stem = "s2_4_structural_core_peripheral",
+    model = structural_syntax,
+    structural = TRUE
+  )
+)
+
+model_plan <- dplyr::bind_rows(lapply(names(model_specs), function(model_id) {
+  specification <- model_specs[[model_id]]
+  data.frame(
+    model_id = model_id,
+    model = specification$label,
+    estimator = "WLSMV",
+    parameterization = "DELTA",
+    participants = 209L,
+    indicators = 42L,
+    latent_factors = 5L,
+    structural_paths = ifelse(specification$structural, 6L, 0L),
+    outcome_residual_covariances = ifelse(specification$structural, 3L, NA_integer_),
+    mplus_input = paste0(specification$stem, ".inp"),
+    stringsAsFactors = FALSE
+  )
+}))
+
+knitr::kable(model_plan)
+```
+
+# Generate and run both models in Mplus 8.7
+
+```{r run-mplus-models}
+run_sem_model <- function(model_id, specification) {
+  data_path <- file.path(mplus_directory, paste0(specification$stem, ".dat"))
+  input_path <- file.path(mplus_directory, paste0(specification$stem, ".inp"))
+  output_path <- file.path(mplus_directory, paste0(specification$stem, ".out"))
+
+  mplus_object <- MplusAutomation::mplusObject(
+    TITLE = paste(
+      "! Author: Kunru Song",
+      paste0("S2.4 ", specification$label, ";"),
+      sep = "\n"
+    ),
+    VARIABLE = paste0(
+      "CATEGORICAL = bs1-bs18 d1-d7 a1-a7 s1-s10;"
+    ),
+    ANALYSIS = paste(
+      "ESTIMATOR = WLSMV;",
+      "PARAMETERIZATION = DELTA;",
+      sep = "\n"
+    ),
+    MODEL = specification$model,
+    OUTPUT = paste(
+      "SAMPSTAT;",
+      "STANDARDIZED(STDYX);",
+      "CINTERVAL;",
+      "RESIDUAL;",
+      "TECH1;",
+      "TECH4;",
+      sep = "\n"
+    ),
+    usevariables = mplus_names,
+    rdata = mplus_data,
+    autov = FALSE,
+    quiet = TRUE
+  )
+
+  MplusAutomation::mplusModeler(
+    object = mplus_object,
+    dataout = data_path,
+    modelout = input_path,
+    run = 1L,
+    check = FALSE,
+    varwarnings = TRUE,
+    Mplus_command = mplus_command,
+    writeData = "always",
+    hashfilename = FALSE,
+    killOnFail = TRUE,
+    quiet = TRUE
+  )
+
+  stopifnot(file.exists(data_path), file.exists(input_path), file.exists(output_path))
+  input_lines <- readLines(input_path, warn = FALSE)
+  output_lines <- readLines(output_path, warn = FALSE)
+  parsed <- MplusAutomation::readModels(output_path, what = "all", quiet = TRUE)
+
+  checks <- list(
+    author_present = any(trimws(input_lines) == "! Author: Kunru Song"),
+    categorical_declared = any(grepl(
+      "CATEGORICAL\\s*=\\s*bs1-bs18 d1-d7 a1-a7 s1-s10;",
+      input_lines,
+      ignore.case = TRUE,
+      perl = TRUE
+    )),
+    wlsmv_declared = any(grepl(
+      "ESTIMATOR\\s*=\\s*WLSMV;",
+      input_lines,
+      ignore.case = TRUE,
+      perl = TRUE
+    )),
+    delta_declared = any(grepl(
+      "PARAMETERIZATION\\s*=\\s*DELTA;",
+      input_lines,
+      ignore.case = TRUE,
+      perl = TRUE
+    )),
+    no_posthoc_modification = !any(grepl(
+      "MODINDICES|MODEL MODIFICATION|WITH bs|WITH d[0-9]|WITH a[0-9]|WITH s[0-9]",
+      input_lines,
+      ignore.case = TRUE,
+      perl = TRUE
+    )),
+    normal_termination = any(grepl(
+      "THE MODEL ESTIMATION TERMINATED NORMALLY",
+      output_lines,
+      fixed = TRUE
+    )),
+    no_fatal_error = !any(grepl("*** ERROR", output_lines, fixed = TRUE)),
+    mplus_version_ok = any(grepl("Mplus VERSION 8.7", output_lines, fixed = TRUE))
+  )
+
+  stopifnot(
+    all(unlist(checks)),
+    is.list(parsed),
+    identical(as.character(parsed$summaries$Mplus.version), "8.7"),
+    identical(as.character(parsed$summaries$Estimator), "WLSMV"),
+    as.integer(parsed$summaries$Observations) == 209L
+  )
+
+  list(
+    model_id = model_id,
+    model_label = specification$label,
+    model_syntax = specification$model,
+    structural = specification$structural,
+    paths = c(data = data_path, input = input_path, output = output_path),
+    parsed = parsed,
+    output_lines = output_lines,
+    checks = checks
+  )
+}
+
+model_runs <- lapply(names(model_specs), function(model_id) {
+  run_sem_model(model_id, model_specs[[model_id]])
+})
+names(model_runs) <- names(model_specs)
+```
+
+# Extract fit, loadings, latent relations, and structural paths
+
+```{r extract-results}
+factor_label_map <- c(
+  PERIPH = "Trait Peripheral PSMU",
+  CORE = "Trait Core PSMU",
+  DEP = "Depression",
+  ANX = "Anxiety",
+  STR = "Perceived stress"
+)
+
+extract_fit <- function(run) {
+  summary_row <- run$parsed$summaries
+  data.frame(
+    model_id = run$model_id,
+    model = run$model_label,
+    mplus_version = as.character(summary_row$Mplus.version),
+    estimator = as.character(summary_row$Estimator),
+    observations = as.integer(summary_row$Observations),
+    free_parameters = as.integer(summary_row$Parameters),
+    chi_square = as.numeric(summary_row$ChiSqM_Value),
+    df = as.integer(summary_row$ChiSqM_DF),
+    p_value = as.numeric(summary_row$ChiSqM_PValue),
+    cfi = as.numeric(summary_row$CFI),
+    tli = as.numeric(summary_row$TLI),
+    rmsea = as.numeric(summary_row$RMSEA_Estimate),
+    rmsea_ci_lower = as.numeric(summary_row$RMSEA_90CI_LB),
+    rmsea_ci_upper = as.numeric(summary_row$RMSEA_90CI_UB),
+    srmr = as.numeric(summary_row$SRMR),
+    normal_termination = run$checks$normal_termination,
+    warnings_n = length(run$parsed$warnings),
+    errors_n = length(run$parsed$errors),
+    stringsAsFactors = FALSE
+  )
+}
+
+model_fit <- dplyr::bind_rows(lapply(model_runs, extract_fit))
+
+extract_loadings <- function(run) {
+  unstandardized <- run$parsed$parameters$unstandardized
+  standardized <- run$parsed$parameters$stdyx.standardized
+  confidence <- run$parsed$parameters$ci.stdyx.standardized
+  r2 <- run$parsed$parameters$r2
+
+  std_rows <- standardized |>
+    dplyr::filter(grepl("\\.BY$", paramHeader)) |>
+    dplyr::transmute(
+      paramHeader,
+      mplus_variable = param,
+      standardized_loading = clean_mplus_numeric(est),
+      standardized_se = clean_mplus_numeric(se),
+      standardized_z = clean_mplus_numeric(est_se),
+      standardized_p = clean_mplus_numeric(pval)
+    )
+  unstd_rows <- unstandardized |>
+    dplyr::filter(grepl("\\.BY$", paramHeader)) |>
+    dplyr::transmute(
+      paramHeader,
+      mplus_variable = param,
+      unstandardized_loading = clean_mplus_numeric(est),
+      unstandardized_se = clean_mplus_numeric(se),
+      unstandardized_z = clean_mplus_numeric(est_se),
+      unstandardized_p = clean_mplus_numeric(pval)
+    )
+  ci_rows <- confidence |>
+    dplyr::filter(grepl("\\.BY$", paramHeader)) |>
+    dplyr::transmute(
+      paramHeader,
+      mplus_variable = param,
+      standardized_ci_lower = clean_mplus_numeric(low2.5),
+      standardized_ci_upper = clean_mplus_numeric(up2.5)
+    )
+  r2_rows <- r2 |>
+    dplyr::filter(param %in% toupper(mplus_names)) |>
+    dplyr::transmute(
+      mplus_variable = param,
+      item_r_squared = clean_mplus_numeric(est),
+      standardized_residual_variance = clean_mplus_numeric(resid_var)
+    )
+
+  std_rows |>
+    dplyr::left_join(
+      unstd_rows,
+      by = c("paramHeader", "mplus_variable")
+    ) |>
+    dplyr::left_join(
+      ci_rows,
+      by = c("paramHeader", "mplus_variable")
+    ) |>
+    dplyr::left_join(r2_rows, by = "mplus_variable") |>
+    dplyr::left_join(variable_map, by = "mplus_variable") |>
+    dplyr::mutate(
+      model_id = run$model_id,
+      model = run$model_label,
+      factor = sub("\\.BY$", "", paramHeader),
+      factor_label = unname(factor_label_map[factor]),
+      loading_estimation = ifelse(
+        is.na(unstandardized_se) | unstandardized_se == 0,
+        "Marker loading fixed at 1",
+        "Freely estimated loading"
+      )
+    ) |>
+    dplyr::select(
+      model_id,
+      model,
+      factor,
+      factor_label,
+      item_order,
+      project_variable,
+      mplus_variable,
+      construct,
+      transformation,
+      loading_estimation,
+      unstandardized_loading,
+      unstandardized_se,
+      unstandardized_z,
+      unstandardized_p,
+      standardized_loading,
+      standardized_se,
+      standardized_z,
+      standardized_p,
+      standardized_ci_lower,
+      standardized_ci_upper,
+      item_r_squared,
+      standardized_residual_variance
+    ) |>
+    dplyr::arrange(item_order)
+}
+
+loadings <- dplyr::bind_rows(lapply(model_runs, extract_loadings))
+
+extract_factor_relations <- function(run) {
+  standardized <- run$parsed$parameters$stdyx.standardized
+  confidence <- run$parsed$parameters$ci.stdyx.standardized
+  relations <- standardized |>
+    dplyr::filter(grepl("\\.WITH$", paramHeader)) |>
+    dplyr::transmute(
+      paramHeader,
+      factor_2 = param,
+      estimate = clean_mplus_numeric(est),
+      se = clean_mplus_numeric(se),
+      z = clean_mplus_numeric(est_se),
+      p_value = clean_mplus_numeric(pval)
+    )
+  relation_ci <- confidence |>
+    dplyr::filter(grepl("\\.WITH$", paramHeader)) |>
+    dplyr::transmute(
+      paramHeader,
+      factor_2 = param,
+      ci_lower = clean_mplus_numeric(low2.5),
+      ci_upper = clean_mplus_numeric(up2.5)
+    )
+
+  relations |>
+    dplyr::left_join(relation_ci, by = c("paramHeader", "factor_2")) |>
+    dplyr::mutate(
+      model_id = run$model_id,
+      model = run$model_label,
+      factor_1 = sub("\\.WITH$", "", paramHeader),
+      factor_1_label = unname(factor_label_map[factor_1]),
+      factor_2_label = unname(factor_label_map[factor_2]),
+      relation_type = dplyr::case_when(
+        !run$structural ~ "Latent factor correlation",
+        factor_1 %in% c("PERIPH", "CORE") &
+          factor_2 %in% c("PERIPH", "CORE") ~ "Exogenous factor correlation",
+        TRUE ~ "Residual correlation among endogenous outcomes"
+      )
+    ) |>
+    dplyr::select(
+      model_id,
+      model,
+      relation_type,
+      factor_1,
+      factor_1_label,
+      factor_2,
+      factor_2_label,
+      estimate,
+      se,
+      z,
+      p_value,
+      ci_lower,
+      ci_upper
+    )
+}
+
+factor_relations <- dplyr::bind_rows(lapply(model_runs, extract_factor_relations))
+
+structural_run <- model_runs$Structural_CorePeripheral
+structural_unstd <- structural_run$parsed$parameters$unstandardized |>
+  dplyr::filter(grepl("\\.ON$", paramHeader)) |>
+  dplyr::transmute(
+    paramHeader,
+    predictor = param,
+    unstandardized_estimate = clean_mplus_numeric(est),
+    unstandardized_se = clean_mplus_numeric(se),
+    unstandardized_z = clean_mplus_numeric(est_se),
+    unstandardized_p = clean_mplus_numeric(pval)
+  )
+structural_std <- structural_run$parsed$parameters$stdyx.standardized |>
+  dplyr::filter(grepl("\\.ON$", paramHeader)) |>
+  dplyr::transmute(
+    paramHeader,
+    predictor = param,
+    standardized_estimate = clean_mplus_numeric(est),
+    standardized_se = clean_mplus_numeric(se),
+    standardized_z = clean_mplus_numeric(est_se),
+    standardized_p = clean_mplus_numeric(pval)
+  )
+structural_ci <- structural_run$parsed$parameters$ci.stdyx.standardized |>
+  dplyr::filter(grepl("\\.ON$", paramHeader)) |>
+  dplyr::transmute(
+    paramHeader,
+    predictor = param,
+    standardized_ci_lower = clean_mplus_numeric(low2.5),
+    standardized_ci_upper = clean_mplus_numeric(up2.5)
+  )
+
+outcome_r2 <- structural_run$parsed$parameters$r2 |>
+  dplyr::filter(param %in% c("DEP", "ANX", "STR")) |>
+  dplyr::transmute(
+    outcome = param,
+    outcome_r_squared = clean_mplus_numeric(est)
+  )
+
+structural_paths <- structural_unstd |>
+  dplyr::left_join(structural_std, by = c("paramHeader", "predictor")) |>
+  dplyr::left_join(structural_ci, by = c("paramHeader", "predictor")) |>
+  dplyr::mutate(
+    outcome = sub("\\.ON$", "", paramHeader),
+    outcome_label = unname(factor_label_map[outcome]),
+    predictor_label = unname(factor_label_map[predictor])
+  ) |>
+  dplyr::left_join(outcome_r2, by = "outcome") |>
+  dplyr::select(
+    outcome,
+    outcome_label,
+    predictor,
+    predictor_label,
+    unstandardized_estimate,
+    unstandardized_se,
+    unstandardized_z,
+    unstandardized_p,
+    standardized_estimate,
+    standardized_se,
+    standardized_z,
+    standardized_p,
+    standardized_ci_lower,
+    standardized_ci_upper,
+    outcome_r_squared
+  ) |>
+  dplyr::arrange(
+    match(outcome, c("DEP", "ANX", "STR")),
+    match(predictor, c("PERIPH", "CORE"))
+  )
+
+stopifnot(
+  nrow(model_fit) == 2L,
+  nrow(loadings) == 84L,
+  all(table(loadings$model_id) == 42L),
+  all(is.finite(loadings$standardized_loading)),
+  all(is.finite(loadings$standardized_ci_lower)),
+  all(is.finite(loadings$standardized_ci_upper)),
+  nrow(factor_relations) == 14L,
+  nrow(structural_paths) == 6L,
+  identical(unique(structural_paths$outcome), c("DEP", "ANX", "STR")),
+  all(sort(unique(structural_paths$predictor)) == c("CORE", "PERIPH")),
+  all(is.finite(structural_paths$standardized_estimate)),
+  all(is.finite(structural_paths$standardized_ci_lower)),
+  all(is.finite(structural_paths$standardized_ci_upper)),
+  all(is.finite(structural_paths$outcome_r_squared))
+)
+
+fit_equivalence <- data.frame(
+  statistic = c("chi_square", "df", "cfi", "tli", "rmsea", "srmr"),
+  measurement = unlist(model_fit[1, c("chi_square", "df", "cfi", "tli", "rmsea", "srmr")]),
+  structural = unlist(model_fit[2, c("chi_square", "df", "cfi", "tli", "rmsea", "srmr")]),
+  stringsAsFactors = FALSE
+) |>
+  dplyr::mutate(absolute_difference = abs(measurement - structural))
+
+stopifnot(all(fit_equivalence$absolute_difference < 1e-6))
+
+knitr::kable(model_fit, digits = 4)
+knitr::kable(structural_paths, digits = 4)
+knitr::kable(
+  dplyr::filter(
+    factor_relations,
+    model_id == "Structural_CorePeripheral"
+  ),
+  digits = 4
+)
+knitr::kable(fit_equivalence, digits = 6)
+```
+
+# Diagnose admissibility and interpretation limits
+
+```{r diagnostics}
+extract_diagnostics <- function(run) {
+  model_loadings <- loadings[loadings$model_id == run$model_id, , drop = FALSE]
+  model_relations <- factor_relations[
+    factor_relations$model_id == run$model_id,
+    ,
+    drop = FALSE
+  ]
+  unstandardized <- run$parsed$parameters$unstandardized
+  factor_variances <- unstandardized |>
+    dplyr::filter(
+      paramHeader %in% c("Variances", "Residual.Variances"),
+      param %in% names(factor_label_map)
+    ) |>
+    dplyr::pull(est) |>
+    clean_mplus_numeric()
+
+  loading_bounds_ok <- all(
+    abs(model_loadings$standardized_loading) <= 1.01,
+    na.rm = TRUE
+  )
+  item_residuals_nonnegative <- all(
+    model_loadings$standardized_residual_variance >= -1e-6,
+    na.rm = TRUE
+  )
+  factor_variances_positive <- length(factor_variances) >= 2L &&
+    all(factor_variances > 0, na.rm = TRUE)
+  factor_relations_within_bounds <- all(
+    abs(model_relations$estimate) < 1,
+    na.rm = TRUE
+  )
+  structural_paths_complete <- if (run$structural) {
+    nrow(structural_paths) == 6L &&
+      all(is.finite(structural_paths$standardized_estimate))
+  } else {
+    TRUE
+  }
+
+  data.frame(
+    model_id = run$model_id,
+    model = run$model_label,
+    normal_termination = run$checks$normal_termination,
+    errors_n = length(run$parsed$errors),
+    warnings_n = length(run$parsed$warnings),
+    maximum_absolute_loading = max(abs(model_loadings$standardized_loading)),
+    minimum_standardized_item_residual = min(
+      model_loadings$standardized_residual_variance,
+      na.rm = TRUE
+    ),
+    minimum_factor_variance = ifelse(
+      length(factor_variances),
+      min(factor_variances, na.rm = TRUE),
+      NA_real_
+    ),
+    maximum_absolute_factor_relation = max(abs(model_relations$estimate)),
+    loading_bounds_ok = loading_bounds_ok,
+    item_residuals_nonnegative = item_residuals_nonnegative,
+    factor_variances_positive = factor_variances_positive,
+    factor_relations_within_bounds = factor_relations_within_bounds,
+    structural_paths_complete = structural_paths_complete,
+    fit_equivalent_parameterization = all(fit_equivalence$absolute_difference < 1e-6),
+    technical_checks_passed =
+      run$checks$normal_termination &&
+      run$checks$no_fatal_error &&
+      loading_bounds_ok &&
+      item_residuals_nonnegative &&
+      factor_variances_positive &&
+      factor_relations_within_bounds &&
+      structural_paths_complete,
+    stringsAsFactors = FALSE
+  )
+}
+
+diagnostics <- dplyr::bind_rows(lapply(model_runs, extract_diagnostics))
+
+stopifnot(
+  nrow(diagnostics) == 2L,
+  all(diagnostics$normal_termination),
+  all(diagnostics$errors_n == 0L),
+  all(diagnostics$technical_checks_passed)
+)
+
+knitr::kable(diagnostics, digits = 4)
+```
+
+# Visualize the latent structural model
+
+The path diagram is a structural summary rather than a 42-box item diagram.
+Each latent-variable node reports its number of indicators and the range of
+Mplus STDYX loadings, preserving the measurement-model information without
+making the structural paths unreadable. All edges and labels are assembled
+from the already extracted Mplus results and drawn with `tidySEM`; no model is
+re-estimated in R.
+
+```{r visualize-latent-sem, fig.width=13, fig.height=8, out.width="100%"}
+structural_loadings <- loadings |>
+  dplyr::filter(model_id == "Structural_CorePeripheral")
+structural_relations <- factor_relations |>
+  dplyr::filter(model_id == "Structural_CorePeripheral")
+
+loading_range_label <- function(factor_name) {
+  values <- structural_loadings$standardized_loading[
+    structural_loadings$factor == factor_name
+  ]
+  sprintf(
+    "Std. loading = %.3f-%.3f",
+    min(values),
+    max(values)
+  )
+}
+
+outcome_r_squared <- tapply(
+  structural_paths$outcome_r_squared,
+  structural_paths$outcome,
+  unique
+)
+
+sem_node_labels <- c(
+  PERIPH = paste(
+    "Peripheral PSMU",
+    "6 BSMAS items",
+    loading_range_label("PERIPH"),
+    sep = "\n"
+  ),
+  CORE = paste(
+    "Core PSMU",
+    "12 BSMAS items",
+    loading_range_label("CORE"),
+    sep = "\n"
+  ),
+  DEP = paste(
+    "Depression",
+    "7 CES-D items",
+    loading_range_label("DEP"),
+    sprintf("R2 = %.3f", outcome_r_squared[["DEP"]]),
+    sep = "\n"
+  ),
+  ANX = paste(
+    "Anxiety",
+    "7 DASS items",
+    loading_range_label("ANX"),
+    sprintf("R2 = %.3f", outcome_r_squared[["ANX"]]),
+    sep = "\n"
+  ),
+  STR = paste(
+    "Perceived stress",
+    "10 PSS items",
+    loading_range_label("STR"),
+    sprintf("R2 = %.3f", outcome_r_squared[["STR"]]),
+    sep = "\n"
+  )
+)
+
+sem_nodes <- data.frame(
+  name = names(sem_node_labels),
+  label = unname(sem_node_labels),
+  shape = "oval",
+  fill = c("#FCE4D6", "#DDEBF7", rep("#E2F0D9", 3)),
+  colour = c("#D55E00", "#0072B2", rep("#4D6B53", 3)),
+  linewidth = 0.8,
+  label_family = "sans",
+  label_fontface = c("bold", "bold", "plain", "plain", "plain"),
+  stringsAsFactors = FALSE
+)
+
+sem_regression_edges <- structural_paths |>
+  dplyr::transmute(
+    from = predictor,
+    to = outcome,
+    arrow = "last",
+    label = sprintf(
+      "beta = %.3f\np %s",
+      standardized_estimate,
+      ifelse(
+        standardized_p < .001,
+        "< .001",
+        sprintf("= %.3f", standardized_p)
+      )
+    ),
+    linetype = ifelse(standardized_p < .05, 1, 2),
+    colour = ifelse(predictor == "CORE", "#0072B2", "#D55E00"),
+    linewidth = ifelse(standardized_p < .05, 1.15, 0.75),
+    alpha = ifelse(standardized_p < .05, 1, 0.58),
+    label_size = 3.3,
+    label_family = "sans",
+    label_fill = "white",
+    label_alpha = 0.92,
+    label_colour = "#222222",
+    label_location = 0.5,
+    edge_type = "regression"
+  )
+
+sem_correlation_edges <- structural_relations |>
+  dplyr::transmute(
+    from = factor_1,
+    to = factor_2,
+    arrow = "both",
+    label = ifelse(
+      relation_type == "Exogenous factor correlation",
+      sprintf("r = %.3f", estimate),
+      sprintf("residual r = %.3f", estimate)
+    ),
+    linetype = 3,
+    colour = "#666666",
+    linewidth = 0.75,
+    alpha = 0.9,
+    label_size = 3,
+    label_family = "sans",
+    label_fill = "white",
+    label_alpha = 0.92,
+    label_colour = "#333333",
+    label_location = 0.5,
+    edge_type = ifelse(
+      relation_type == "Exogenous factor correlation",
+      "exogenous_correlation",
+      "residual_correlation"
+    )
+  )
+
+sem_edges <- dplyr::bind_rows(
+  sem_regression_edges,
+  sem_correlation_edges
+)
+
+sem_layout <- tidySEM::get_layout(
+  "PERIPH", "", "", "", "DEP",
+  "", "", "", "", "ANX",
+  "CORE", "", "", "", "STR",
+  rows = 3
+)
+
+sem_graph_data <- tidySEM::prepare_graph(
+  edges = sem_edges,
+  nodes = sem_nodes,
+  layout = sem_layout,
+  ellipses_width = 3.2,
+  ellipses_height = 1.65,
+  spacing_x = 2,
+  spacing_y = 2,
+  text_size = 3.15,
+  angle = 150,
+  fix_coord = FALSE
+)
+
+positioned_edges <- tidySEM::edges(sem_graph_data)
+is_regression <- positioned_edges$edge_type == "regression"
+positioned_edges$connect_from[is_regression] <- "right"
+positioned_edges$connect_to[is_regression] <- "left"
+positioned_edges$curvature[
+  is_regression & positioned_edges$from == "PERIPH" &
+    positioned_edges$to == "DEP"
+] <- NA
+positioned_edges$curvature[
+  is_regression & positioned_edges$from == "PERIPH" &
+    positioned_edges$to == "ANX"
+] <- -12
+positioned_edges$curvature[
+  is_regression & positioned_edges$from == "PERIPH" &
+    positioned_edges$to == "STR"
+] <- -22
+positioned_edges$curvature[
+  is_regression & positioned_edges$from == "CORE" &
+    positioned_edges$to == "DEP"
+] <- 22
+positioned_edges$curvature[
+  is_regression & positioned_edges$from == "CORE" &
+    positioned_edges$to == "ANX"
+] <- 12
+positioned_edges$curvature[
+  is_regression & positioned_edges$from == "CORE" &
+    positioned_edges$to == "STR"
+] <- NA
+
+is_exogenous_correlation <-
+  positioned_edges$edge_type == "exogenous_correlation"
+positioned_edges$connect_from[is_exogenous_correlation] <- "left"
+positioned_edges$connect_to[is_exogenous_correlation] <- "left"
+positioned_edges$curvature[is_exogenous_correlation] <- 65
+
+is_residual_correlation <-
+  positioned_edges$edge_type == "residual_correlation"
+positioned_edges$connect_from[is_residual_correlation] <- "right"
+positioned_edges$connect_to[is_residual_correlation] <- "right"
+positioned_edges$curvature[
+  is_residual_correlation & positioned_edges$from == "DEP" &
+    positioned_edges$to == "ANX"
+] <- -45
+positioned_edges$curvature[
+  is_residual_correlation & positioned_edges$from == "ANX" &
+    positioned_edges$to == "STR"
+] <- -45
+positioned_edges$curvature[
+  is_residual_correlation & positioned_edges$from == "DEP" &
+    positioned_edges$to == "STR"
+] <- -35
+positioned_edges$label_location[
+  is_residual_correlation & positioned_edges$from == "DEP" &
+    positioned_edges$to == "ANX"
+] <- 0.55
+positioned_edges$label_location[
+  is_residual_correlation & positioned_edges$from == "DEP" &
+    positioned_edges$to == "STR"
+] <- 0.5
+positioned_edges$label_location[
+  is_residual_correlation & positioned_edges$from == "ANX" &
+    positioned_edges$to == "STR"
+] <- 0.45
+
+tidySEM::edges(sem_graph_data) <- positioned_edges
+
+sem_plot <- plot(sem_graph_data) +
+  ggplot2::scale_x_continuous(
+    expand = ggplot2::expansion(mult = c(0.08, 0.30))
+  ) +
+  ggplot2::labs(
+    title = "Baseline latent-variable SEM",
+    subtitle = paste(
+      "Standardized Mplus 8.7 WLSMV estimates (N = 209);",
+      "CFI = .917, TLI = .911, RMSEA = .073, SRMR = .078"
+    ),
+    caption = paste(
+      "Node labels give item count and the STDYX loading range.",
+      "Solid paths: p < .05; dashed paths: p >= .05.",
+      "Dotted double-headed arcs are latent correlations;",
+      "outcome arcs are residual correlations."
+    )
+  ) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      face = "bold",
+      size = 15,
+      family = "sans",
+      hjust = 0
+    ),
+    plot.subtitle = ggplot2::element_text(
+      size = 11,
+      family = "sans",
+      colour = "#444444",
+      hjust = 0
+    ),
+    plot.title.position = "plot",
+    plot.caption.position = "plot",
+    plot.caption = ggplot2::element_text(
+      size = 9,
+      family = "sans",
+      colour = "#555555",
+      hjust = 0
+    ),
+    plot.margin = ggplot2::margin(15, 35, 15, 35)
+  )
+
+ggplot2::ggsave(
+  filename = figure_file,
+  plot = sem_plot,
+  device = svglite::svglite,
+  width = 13,
+  height = 8,
+  bg = "white"
+)
+svg_text <- paste(readLines(figure_file, warn = FALSE), collapse = "\n")
+figure_audit <- data.frame(
+  file = "Res_3_Results/Figure_S2_4_BaselineSEM_PSMU_PsychologicalDistress.svg",
+  format = "SVG",
+  bytes = as.numeric(file.info(figure_file)$size),
+  md5 = unname(tools::md5sum(figure_file)),
+  generated_with = paste0("tidySEM ", packageVersion("tidySEM")),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  nrow(tidySEM::nodes(sem_graph_data)) == 5L,
+  nrow(tidySEM::edges(sem_graph_data)) == 10L,
+  sum(tidySEM::edges(sem_graph_data)$edge_type == "regression") == 6L,
+  sum(tidySEM::edges(sem_graph_data)$edge_type ==
+    "exogenous_correlation") == 1L,
+  sum(tidySEM::edges(sem_graph_data)$edge_type ==
+    "residual_correlation") == 3L,
+  all(figure_audit$bytes > 0),
+  grepl("<svg", svg_text, fixed = TRUE),
+  !grepl("<image", svg_text, fixed = TRUE),
+  !grepl("data:image", svg_text, fixed = TRUE)
+)
+
+knitr::kable(figure_audit)
+sem_plot
+```
+
+# Save the full-precision result bundle
+
+```{r build-mplus-file-audit}
+mplus_files <- dplyr::bind_rows(lapply(model_runs, function(run) {
+  data.frame(
+    model_id = run$model_id,
+    role = names(run$paths),
+    file = vapply(
+      run$paths,
+      function(path) normalizePath(path, winslash = "/", mustWork = TRUE),
+      character(1)
+    ),
+    bytes = as.numeric(file.info(unname(run$paths))$size),
+    md5 = unname(tools::md5sum(unname(run$paths))),
+    stringsAsFactors = FALSE
+  )
+}))
+
+stopifnot(
+  nrow(mplus_files) == 6L,
+  all(mplus_files$bytes > 0),
+  all(file.exists(mplus_files$file))
+)
+
+knitr::kable(mplus_files)
+```
+
+# Export the review workbook
+
+```{r export-workbook}
+round_numeric_columns <- function(data, digits = 4L) {
+  data |>
+    dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, digits))) |>
+    dplyr::mutate(dplyr::across(where(is.factor), as.character))
+}
+
+workbook_sheets <- list(
+  Model_Fit = round_numeric_columns(model_fit),
+  Structural_Paths = round_numeric_columns(structural_paths),
+  Factor_Relations = round_numeric_columns(factor_relations),
+  Loadings = round_numeric_columns(loadings),
+  Diagnostics = round_numeric_columns(diagnostics)
+)
+
+bruceR::export(
+  workbook_sheets,
+  file = table_file,
+  overwrite = TRUE,
+  verbose = FALSE
+)
+
+workbook <- openxlsx::loadWorkbook(table_file)
+header_style <- openxlsx::createStyle(
+  fontName = "Arial",
+  fontSize = 10,
+  fontColour = "#FFFFFF",
+  fgFill = "#1F4E78",
+  textDecoration = "bold",
+  halign = "center",
+  valign = "center",
+  wrapText = TRUE,
+  border = "bottom",
+  borderColour = "#163A5C"
+)
+decimal_style <- openxlsx::createStyle(numFmt = "0.0000")
+integer_style <- openxlsx::createStyle(numFmt = "#,##0")
+significant_style <- openxlsx::createStyle(fgFill = "#E2F0D9")
+integer_columns <- c(
+  "observations",
+  "free_parameters",
+  "df",
+  "warnings_n",
+  "errors_n",
+  "item_order"
+)
+
+for (sheet_name in names(workbook_sheets)) {
+  sheet_data <- workbook_sheets[[sheet_name]]
+  n_rows <- nrow(sheet_data)
+  n_columns <- ncol(sheet_data)
+
+  openxlsx::addStyle(
+    workbook,
+    sheet = sheet_name,
+    style = header_style,
+    rows = 1,
+    cols = seq_len(n_columns),
+    gridExpand = TRUE,
+    stack = TRUE
+  )
+  openxlsx::setRowHeights(workbook, sheet_name, rows = 1, heights = 32)
+  openxlsx::freezePane(workbook, sheet_name, firstRow = TRUE)
+  openxlsx::addFilter(workbook, sheet_name, rows = 1, cols = seq_len(n_columns))
+  openxlsx::showGridLines(workbook, sheet_name, showGridLines = FALSE)
+
+  widths <- vapply(seq_len(n_columns), function(index) {
+    values <- c(names(sheet_data)[index], as.character(sheet_data[[index]]))
+    values[is.na(values)] <- ""
+    min(36, max(10, max(nchar(values), na.rm = TRUE) + 2))
+  }, numeric(1))
+  openxlsx::setColWidths(
+    workbook,
+    sheet = sheet_name,
+    cols = seq_len(n_columns),
+    widths = widths
+  )
+
+  if (n_rows > 0L) {
+    numeric_indices <- which(vapply(sheet_data, is.numeric, logical(1)))
+    integer_indices <- which(names(sheet_data) %in% integer_columns)
+    decimal_indices <- setdiff(numeric_indices, integer_indices)
+    if (length(integer_indices)) {
+      openxlsx::addStyle(
+        workbook,
+        sheet = sheet_name,
+        style = integer_style,
+        rows = 2:(n_rows + 1L),
+        cols = integer_indices,
+        gridExpand = TRUE,
+        stack = TRUE
+      )
+    }
+    if (length(decimal_indices)) {
+      openxlsx::addStyle(
+        workbook,
+        sheet = sheet_name,
+        style = decimal_style,
+        rows = 2:(n_rows + 1L),
+        cols = decimal_indices,
+        gridExpand = TRUE,
+        stack = TRUE
+      )
+    }
+  }
+}
+
+if ("standardized_p" %in% names(workbook_sheets$Structural_Paths)) {
+  significant_rows <- which(
+    workbook_sheets$Structural_Paths$standardized_p < .05
+  ) + 1L
+  if (length(significant_rows)) {
+    openxlsx::addStyle(
+      workbook,
+      sheet = "Structural_Paths",
+      style = significant_style,
+      rows = significant_rows,
+      cols = seq_len(ncol(workbook_sheets$Structural_Paths)),
+      gridExpand = TRUE,
+      stack = TRUE
+    )
+  }
+}
+
+for (sheet_name in names(workbook_sheets)) {
+  openxlsx::pageSetup(
+    workbook,
+    sheet = sheet_name,
+    orientation = "landscape",
+    fitToWidth = 1,
+    fitToHeight = 0
+  )
+}
+
+openxlsx::saveWorkbook(workbook, table_file, overwrite = TRUE)
+
+repair_orphan_drawing_relationships <- function(xlsx_file) {
+  repair_dir <- tempfile("baseline_cfa_xlsx_repair_")
+  dir.create(repair_dir)
+  on.exit(unlink(repair_dir, recursive = TRUE, force = TRUE), add = TRUE)
+
+  members <- utils::unzip(xlsx_file, list = TRUE)$Name
+  # Reject unsafe archive paths before extracting a package.
+  unsafe_member <- function(path) {
+    parts <- strsplit(gsub("\\\\", "/", path), "/", fixed = TRUE)[[1L]]
+    grepl("^[/\\\\]|^[A-Za-z]:", path) || any(parts == "..")
+  }
+  stopifnot(length(members) > 0L, !anyDuplicated(members),
+            !any(vapply(members, unsafe_member, logical(1))))
+  utils::unzip(xlsx_file, exdir = repair_dir)
+  relationship_files <- list.files(
+    file.path(repair_dir, "xl", "worksheets", "_rels"),
+    pattern = "\\.rels$", full.names = TRUE
+  )
+  if (!length(relationship_files)) return(invisible(0L))
+
+  resolve_member <- function(target) {
+    target <- gsub("\\\\", "/", utils::URLdecode(target))
+    if (!nzchar(target) || grepl("^[A-Za-z][A-Za-z0-9+.-]*:", target)) {
+      stop("Invalid internal drawing target")
+    }
+    parts <- strsplit(target, "/", fixed = TRUE)[[1L]]
+    result <- if (startsWith(target, "/")) character() else c("xl", "worksheets")
+    for (part in parts) {
+      if (!nzchar(part) || part == ".") next
+      if (part == "..") {
+        if (!length(result)) stop("Drawing target escapes the workbook package")
+        result <- head(result, -1L)
+      } else result <- c(result, part)
+    }
+    paste(result, collapse = "/")
+  }
+  drawing_types <- paste0(
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/",
+    c("drawing", "vmlDrawing")
+  )
+  removed_relationships <- 0L
+  for (relationship_file in relationship_files) {
+    document <- xml2::read_xml(relationship_file, options = "NONET")
+    relationships <- xml2::xml_find_all(
+      document, "/*[local-name()='Relationships']/*[local-name()='Relationship']"
+    )
+    changed <- FALSE
+    for (relationship in relationships) {
+      type <- xml2::xml_attr(relationship, "Type")
+      external <- identical(xml2::xml_attr(relationship, "TargetMode"), "External")
+      if (!type %in% drawing_types || external) next
+      target <- xml2::xml_attr(relationship, "Target")
+      if (is.na(target)) stop("Drawing relationship is missing its Target")
+      if (!resolve_member(target) %in% members) {
+        xml2::xml_remove(relationship)
+        removed_relationships <- removed_relationships + 1L
+        changed <- TRUE
+      }
+    }
+    if (changed) xml2::write_xml(document, relationship_file)
+  }
+  if (removed_relationships == 0L) return(invisible(0L))
+
+  repaired_file <- tempfile(fileext = ".xlsx")
+  on.exit(unlink(repaired_file), add = TRUE)
+  archive_members <- list.files(
+    repair_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE
+  )
+  zip::zipr(
+    zipfile = repaired_file, files = archive_members, root = repair_dir,
+    include_directories = FALSE, mode = "mirror"
+  )
+  stopifnot(file.exists(repaired_file), file.info(repaired_file)$size > 0)
+  stopifnot(file.copy(repaired_file, xlsx_file, overwrite = TRUE))
+  invisible(removed_relationships)
+}
+
+orphan_relationships_removed <- repair_orphan_drawing_relationships(table_file)
+stopifnot(
+  file.exists(table_file),
+  file.info(table_file)$size > 0,
+  identical(openxlsx::getSheetNames(table_file), names(workbook_sheets))
+)
+```
+
+# Reload and verify the workbook
+
+```{r verify-workbook}
+expected_sheets <- names(workbook_sheets)
+stopifnot(identical(readxl::excel_sheets(table_file), expected_sheets))
+
+workbook_reload <- lapply(expected_sheets, function(sheet_name) {
+  as.data.frame(readxl::read_excel(table_file, sheet = sheet_name))
+})
+names(workbook_reload) <- expected_sheets
+
+for (sheet_name in expected_sheets) {
+  stopifnot(
+    nrow(workbook_reload[[sheet_name]]) == nrow(workbook_sheets[[sheet_name]]),
+    ncol(workbook_reload[[sheet_name]]) == ncol(workbook_sheets[[sheet_name]]),
+    identical(names(workbook_reload[[sheet_name]]), names(workbook_sheets[[sheet_name]]))
+  )
+}
+
+stopifnot(
+  nrow(workbook_reload$Model_Fit) == 2L,
+  nrow(workbook_reload$Structural_Paths) == 6L,
+  nrow(workbook_reload$Factor_Relations) == 14L,
+  nrow(workbook_reload$Loadings) == 84L,
+  nrow(workbook_reload$Diagnostics) == 2L,
+  all(workbook_reload$Diagnostics$technical_checks_passed)
+)
+
+workbook_audit <- data.frame(
+  sheet = expected_sheets,
+  rows = vapply(workbook_reload, nrow, integer(1)),
+  columns = vapply(workbook_reload, ncol, integer(1)),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(workbook_audit)
+```
+
+# Save and reload the canonical S2.4 RDA
+
+```{r save-result-bundle}
+fit_s2_8_baseline_sem <- list(
+  metadata = list(
+    generated_by = "Step_2_Measurement_Models/S2_4_BaselineSEM_PSMU_PsychologicalDistress.Rmd",
+    input_file = "Res_2_Data_for_Analysis/dat_step2_measurement.rda",
+    input_md5 = unname(tools::md5sum(measurement_file)),
+    mplus_version = "8.7",
+    estimator = "WLSMV",
+    parameterization = "DELTA",
+    participants = 209L,
+    workbook = "Res_3_Results/Table_S2_4_BaselineSEM_PSMU_PsychologicalDistress.xlsx",
+    workbook_md5 = unname(tools::md5sum(table_file)),
+    figure = "Res_3_Results/Figure_S2_4_BaselineSEM_PSMU_PsychologicalDistress.svg",
+    figure_md5 = unname(tools::md5sum(figure_file)),
+    figure_generated_with = paste0(
+      "tidySEM ",
+      packageVersion("tidySEM")
+    ),
+    s2_8_passed = all(diagnostics$technical_checks_passed) &&
+      nrow(tidySEM::nodes(sem_graph_data)) == 5L &&
+      nrow(tidySEM::edges(sem_graph_data)) == 10L &&
+      grepl("<svg", svg_text, fixed = TRUE) &&
+      !grepl("<image", svg_text, fixed = TRUE) &&
+      !grepl("data:image", svg_text, fixed = TRUE)
+  ),
+  input_audit = input_audit,
+  transformations = transformation_audit,
+  variable_map = variable_map,
+  model_plan = model_plan,
+  model_syntax = lapply(model_specs, `[[`, "model"),
+  model_fit = model_fit,
+  fit_equivalence = fit_equivalence,
+  loadings = loadings,
+  factor_relations = factor_relations,
+  structural_paths = structural_paths,
+  diagnostics = diagnostics,
+  sem_nodes = tidySEM::nodes(sem_graph_data),
+  sem_edges = tidySEM::edges(sem_graph_data),
+  figure_audit = figure_audit,
+  workbook_audit = workbook_audit,
+  mplus_files = mplus_files,
+  parsed_models = lapply(model_runs, `[[`, "parsed")
+)
+
+save(
+  fit_s2_8_baseline_sem,
+  file = result_file,
+  compress = "xz",
+  version = 3
+)
+
+verification_environment <- new.env(parent = emptyenv())
+verified_objects <- load(result_file, envir = verification_environment)
+stopifnot(
+  identical(verified_objects, "fit_s2_8_baseline_sem"),
+  isTRUE(verification_environment$fit_s2_8_baseline_sem$metadata$s2_8_passed),
+  identical(
+    verification_environment$fit_s2_8_baseline_sem$metadata$input_md5,
+    unname(tools::md5sum(measurement_file))
+  ),
+  identical(
+    verification_environment$fit_s2_8_baseline_sem$metadata$workbook_md5,
+    unname(tools::md5sum(table_file))
+  ),
+  identical(
+    verification_environment$fit_s2_8_baseline_sem$metadata$figure_md5,
+    unname(tools::md5sum(figure_file))
+  ),
+  nrow(verification_environment$fit_s2_8_baseline_sem$structural_paths) == 6L,
+  nrow(verification_environment$fit_s2_8_baseline_sem$sem_nodes) == 5L,
+  nrow(verification_environment$fit_s2_8_baseline_sem$sem_edges) == 10L
+)
+
+artifact_audit <- data.frame(
+  file = c(
+    "Res_2_Data_for_Analysis/fit_s2_8_baseline_sem.rda",
+    "Res_3_Results/Table_S2_4_BaselineSEM_PSMU_PsychologicalDistress.xlsx",
+    "Res_3_Results/Figure_S2_4_BaselineSEM_PSMU_PsychologicalDistress.svg"
+  ),
+  bytes = as.numeric(file.info(c(result_file, table_file, figure_file))$size),
+  md5 = unname(tools::md5sum(c(result_file, table_file, figure_file))),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(all(artifact_audit$bytes > 0))
+knitr::kable(artifact_audit)
+```
+
+# Result summary
+
+```{r result-summary}
+path_summary <- structural_paths |>
+  dplyr::mutate(
+    significant = standardized_p < .05,
+    direction = ifelse(standardized_estimate >= 0, "Positive", "Negative")
+  ) |>
+  dplyr::select(
+    outcome_label,
+    predictor_label,
+    standardized_estimate,
+    standardized_se,
+    standardized_p,
+    standardized_ci_lower,
+    standardized_ci_upper,
+    outcome_r_squared,
+    direction,
+    significant
+  )
+
+knitr::kable(path_summary, digits = 4)
+```
+
+The regression coefficients are mutually adjusted: each Core coefficient
+controls for Peripheral, and each Peripheral coefficient controls for Core.
+They are cross-sectional latent associations and must not be interpreted as
+causal effects. Statistical significance of one path and nonsignificance of
+another does not establish that the two coefficients differ; S2.4 does not test coefficient equality.
+
+```{r validation-checks, include=FALSE}
+validation_checks <- data.frame(
+  check = c(
+    "S2.1 contains all 42 required baseline items",
+    "Documented anxiety and perceived-stress transformations were applied only to S2.4 data",
+    "Both Mplus inputs contain the exact author text",
+    "Both models use categorical WLSMV with Delta parameterization",
+    "Measurement and structural models terminated normally",
+    "No fatal Mplus error or post-hoc item residual modification occurred",
+    "Measurement and structural parameterizations have identical global fit",
+    "All 84 loading rows are finite and admissible",
+    "All six structural paths and three outcome R-squared values were extracted",
+    "The tidySEM figure contains five latent nodes, ten model edges, and a vector-only SVG",
+    "The five-sheet workbook reloaded with the expected dimensions",
+    "The canonical RDA contains one verified object",
+    "All six Mplus audit files exist and match their recorded hashes"
+  ),
+  passed = c(
+    all(all_model_items %in% names(dat_step2_measurement$baseline)),
+    identical(dat_step2_measurement$baseline, dat_baseline_raw) &&
+      all(variable_map$transformation[variable_map$construct == "Anxiety"] ==
+        "Shifted from 1-4 to 0-3 using x - 1") &&
+      sum(variable_map$transformation == "Reverse-scored using 6 - x") == 4L,
+    all(vapply(model_runs, function(x) x$checks$author_present, logical(1))),
+    all(vapply(
+      model_runs,
+      function(x) x$checks$categorical_declared &&
+        x$checks$wlsmv_declared && x$checks$delta_declared,
+      logical(1)
+    )),
+    all(diagnostics$normal_termination),
+    all(vapply(
+      model_runs,
+      function(x) x$checks$no_fatal_error && x$checks$no_posthoc_modification,
+      logical(1)
+    )),
+    all(fit_equivalence$absolute_difference < 1e-6),
+    nrow(loadings) == 84L &&
+      all(abs(loadings$standardized_loading) <= 1.01) &&
+      all(loadings$standardized_residual_variance >= -1e-6),
+    nrow(structural_paths) == 6L &&
+      all(is.finite(structural_paths$outcome_r_squared)),
+    nrow(tidySEM::nodes(sem_graph_data)) == 5L &&
+      nrow(tidySEM::edges(sem_graph_data)) == 10L &&
+      file.exists(figure_file) &&
+      identical(
+        unname(tools::md5sum(figure_file)),
+        figure_audit$md5[figure_audit$format == "SVG"]
+      ) &&
+      !grepl("<image", svg_text, fixed = TRUE) &&
+      !grepl("data:image", svg_text, fixed = TRUE),
+    identical(workbook_audit$rows, c(2L, 6L, 14L, 84L, 2L)),
+    identical(verified_objects, "fit_s2_8_baseline_sem"),
+    all(file.exists(mplus_files$file)) &&
+      identical(unname(tools::md5sum(mplus_files$file)), mplus_files$md5)
+  ),
+  stringsAsFactors = FALSE
+)
+
+if (!all(validation_checks$passed)) {
+  stop(
+    "S2.4 validation failed: ",
+    paste(validation_checks$check[!validation_checks$passed], collapse = "; ")
+  )
+}
+
+
+```

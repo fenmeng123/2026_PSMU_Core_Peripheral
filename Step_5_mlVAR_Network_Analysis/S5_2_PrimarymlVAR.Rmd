@@ -1,0 +1,397 @@
+---
+title: "S5.2 Primary 12-node mlVAR"
+author: "Kunru Song"
+date: "2026-07-21"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+
+This report estimates and diagnoses the prespecified primary 12-node mlVAR. It uses
+one global 90-occasion sequence per participant, retains overnight transitions,
+and estimates orthogonal person-specific temporal and contemporaneous random
+effects. It creates no network table or figure; those belong to S5.3 and S5.4.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  collapse = FALSE, comment = NA
+)
+
+required_packages <- c(
+  "dplyr", "knitr", "lme4", "Matrix", "mlVAR", "rmarkdown", "tibble"
+)
+available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(available)) {
+  stop("Missing required R packages: ", paste(names(available)[!available], collapse = ", "))
+}
+
+report_file <- knitr::current_input(dir = TRUE)
+report_directory <- if (length(report_file) == 1L && file.exists(report_file)) {
+  dirname(normalizePath(report_file, winslash = "/", mustWork = TRUE))
+} else getwd()
+helper_candidates <- c(
+  file.path(report_directory, "S5_0_mlVARHelpers.R"),
+  file.path(getwd(), "S5_0_mlVARHelpers.R"),
+  file.path(getwd(), "Step_5_mlVAR_Network_Analysis", "S5_0_mlVARHelpers.R"),
+  file.path(dirname(getwd()), "Step_5_mlVAR_Network_Analysis", "S5_0_mlVARHelpers.R")
+)
+helper_file <- helper_candidates[file.exists(helper_candidates)][1L]
+if (is.na(helper_file)) stop("Could not locate S5_0_mlVARHelpers.R")
+source(helper_file, encoding = "UTF-8")
+
+project_root <- locate_project_root(dirname(helper_file))
+knitr::opts_knit$set(root.dir = project_root)
+
+input_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "dat_step5_mlvar.rda"
+)
+result_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "fit_s5_2_primary_mlvar.rda"
+)
+
+stopifnot(file.exists(input_file), file.exists(helper_file))
+dir.create(dirname(result_file), recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load and validate the S5.1 entry
+
+```{r load-data}
+dat_step5_mlvar <- load_single_object(input_file, "dat_step5_mlvar")
+node_names <- dat_step5_mlvar$node_map$node
+
+stopifnot(
+  identical(
+    names(dat_step5_mlvar),
+    c("prompt", "node_map", "layout", "scaling", "sample_audit", "diagnostics", "provenance")
+  ),
+  length(node_names) == 12L,
+  nrow(dat_step5_mlvar$prompt) == 18810L,
+  sum(dat_step5_mlvar$prompt$lag1_complete) == 16598L,
+  identical(
+    dat_step5_mlvar$provenance$overnight_rule,
+    "Primary model retains overnight transitions; no exclusion sensitivity planned"
+  )
+)
+
+model_data <- dat_step5_mlvar$prompt |>
+  dplyr::select(Name_ID, occasion, dplyr::all_of(node_names)) |>
+  dplyr::arrange(Name_ID, occasion) |>
+  as.data.frame()
+
+stopifnot(
+  nrow(model_data) == 18810L,
+  dplyr::n_distinct(model_data$Name_ID) == 209L,
+  !anyNA(model_data[c("Name_ID", "occasion")]),
+  !anyDuplicated(model_data[c("Name_ID", "occasion")]),
+  all(tapply(model_data$occasion, model_data$Name_ID, function(x) identical(x, 1:90)))
+)
+
+input_audit <- data.frame(
+  scheduled_rows = nrow(model_data),
+  participants = dplyr::n_distinct(model_data$Name_ID),
+  complete_12_node_occasions = sum(stats::complete.cases(model_data[node_names])),
+  expected_usable_lag1_rows = sum(dat_step5_mlvar$prompt$lag1_complete),
+  s5_1_md5 = unname(tools::md5sum(input_file)),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(input_audit)
+```
+
+# Model specification and estimation
+
+`orthogonal` sets random-effect covariances to zero but retains every fixed
+network edge and person-specific random-slope variance. `scale = TRUE` applies
+global standardization; `scaleWithin = FALSE` person-mean centers lagged
+predictors without dividing by person-specific SDs. The explicit global
+`occasion` beep and absent `dayvar` retain the evening-to-next-day lag.
+
+```{r fit-primary, cache=TRUE}
+model_specification <- data.frame(
+  argument = c(
+    "vars", "idvar", "beepvar", "dayvar", "lags", "estimator",
+    "temporal", "contemporaneous", "scale", "scaleWithin",
+    "na.rm", "full_detrend", "overnight_exclusion_sensitivity"
+  ),
+  value = c(
+    paste(node_names, collapse = ", "), "Name_ID", "occasion", "Not supplied",
+    "1", "lmer", "orthogonal", "orthogonal", "TRUE", "FALSE",
+    "TRUE", "FALSE", "Not planned"
+  ),
+  stringsAsFactors = FALSE
+)
+
+set.seed(52102L)
+requested_cores <- min(13L, parallel::detectCores(logical = TRUE))
+fit_start <- Sys.time()
+primary_model <- mlVAR::mlVAR(
+  data = model_data,
+  vars = node_names,
+  idvar = "Name_ID",
+  beepvar = "occasion",
+  lags = 1,
+  estimator = "lmer",
+  temporal = "orthogonal",
+  contemporaneous = "orthogonal",
+  nCores = requested_cores,
+  verbose = TRUE,
+  scale = TRUE,
+  scaleWithin = FALSE,
+  na.rm = TRUE,
+  full_detrend = FALSE
+)
+fit_end <- Sys.time()
+
+timing <- data.frame(
+  started = format(fit_start, "%Y-%m-%d %H:%M:%S %Z"),
+  finished = format(fit_end, "%Y-%m-%d %H:%M:%S %Z"),
+  elapsed_seconds = as.numeric(difftime(fit_end, fit_start, units = "secs")),
+  requested_cores = requested_cores,
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(model_specification)
+knitr::kable(timing, digits = 2)
+```
+
+# Mixed-model and network diagnostics
+
+```{r diagnostics}
+names(primary_model$output$temporal) <- node_names
+names(primary_model$output$contemporaneous) <- node_names
+
+temporal_diagnostics <- lmer_diagnostic_table(
+  primary_model$output$temporal, node_names, "Temporal/between"
+)
+contemporaneous_diagnostics <- lmer_diagnostic_table(
+  primary_model$output$contemporaneous, node_names, "Contemporaneous"
+)
+model_diagnostics <- dplyr::bind_rows(
+  temporal_diagnostics, contemporaneous_diagnostics
+) |>
+  dplyr::mutate(
+    boundary_singularity_message = grepl(
+      "boundary (singular) fit", convergence_message, fixed = TRUE
+    ),
+    nonboundary_convergence_message = nzchar(convergence_message) &
+      !boundary_singularity_message
+  )
+
+fixed_effect_covariance <- list(
+  temporal = stats::setNames(
+    lapply(primary_model$output$temporal, stats::vcov), node_names
+  ),
+  contemporaneous = stats::setNames(
+    lapply(primary_model$output$contemporaneous, stats::vcov), node_names
+  )
+)
+
+matrices <- extract_mlvar_matrices(primary_model)
+validate_network_matrix(matrices$temporal, node_names, symmetric = FALSE)
+validate_network_matrix(matrices$contemporaneous, node_names, symmetric = TRUE)
+validate_network_matrix(matrices$between, node_names, symmetric = TRUE)
+
+spectral_radius <- matrix_spectral_radius(t(matrices$temporal))
+distress_between_correlation <-
+  dat_step5_mlvar$diagnostics$distress_between_correlation
+distress_between_eigenvalues <- eigen(
+  distress_between_correlation, symmetric = TRUE, only.values = TRUE
+)$values
+
+network_diagnostics <- data.frame(
+  diagnostic = c(
+    "Rows used by mlVAR augmented data",
+    "Participants used",
+    "Temporal models",
+    "Contemporaneous models",
+    "Models with optimizer code != 0",
+    "Models with boundary-singularity messages",
+    "Models with nonboundary convergence messages",
+    "Models singular at 1e-4",
+    "Models singular at 1e-6",
+    "Models with nonfinite fixed effects",
+    "Fixed temporal spectral radius",
+    "Minimum eigenvalue of Distress person-mean correlation",
+    "Condition number of Distress person-mean correlation"
+  ),
+  value = c(
+    nrow(primary_model$data),
+    dplyr::n_distinct(primary_model$data$Name_ID),
+    length(primary_model$output$temporal),
+    length(primary_model$output$contemporaneous),
+    sum(model_diagnostics$optimizer_code != 0L),
+    sum(model_diagnostics$boundary_singularity_message),
+    sum(model_diagnostics$nonboundary_convergence_message),
+    sum(model_diagnostics$singular_1e4),
+    sum(model_diagnostics$singular_1e6),
+    sum(!model_diagnostics$finite_fixed_effects),
+    spectral_radius,
+    min(distress_between_eigenvalues),
+    kappa(distress_between_correlation)
+  ),
+  stringsAsFactors = FALSE
+)
+
+fatal_diagnostics <- data.frame(
+  criterion = c(
+    "All 24 node-wise mixed models returned",
+    "All models used the exact 16,598 lag-1 rows",
+    "All 209 participants retained",
+    "No nonzero optimizer termination code",
+    "No nonboundary lme4 convergence message",
+    "All fixed effects finite",
+    "All three network matrices finite",
+    "Contemporaneous and between matrices symmetric",
+    "Fixed temporal system has spectral radius below one"
+  ),
+  passed = c(
+    nrow(model_diagnostics) == 24L,
+    all(model_diagnostics$observations == 16598L),
+    all(model_diagnostics$groups == 209L),
+    all(model_diagnostics$optimizer_code == 0L),
+    all(!model_diagnostics$nonboundary_convergence_message),
+    all(model_diagnostics$finite_fixed_effects),
+    all(vapply(
+      matrices[c("temporal", "contemporaneous", "between")],
+      function(x) all(is.finite(x)), logical(1)
+    )),
+    isTRUE(all.equal(matrices$contemporaneous, t(matrices$contemporaneous), tolerance = 1e-8)) &&
+      isTRUE(all.equal(matrices$between, t(matrices$between), tolerance = 1e-8)),
+    is.finite(spectral_radius) && spectral_radius < 1
+  ),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(network_diagnostics, digits = 6)
+knitr::kable(model_diagnostics, digits = 6)
+knitr::kable(fatal_diagnostics)
+if (!all(fatal_diagnostics$passed)) {
+  print(fatal_diagnostics)
+  stop("S5.2 fatal diagnostic gate failed")
+}
+```
+
+Singular random-effect fits and boundary variance estimates are reported as model diagnostics. They do not by themselves prompt changes to a finite, converged orthogonal fixed network.
+A fixed-slope comparison is considered only if the model fails the checks above.
+
+# Save and disk-reload the canonical fitted object
+
+```{r save-result}
+package_versions <- data.frame(
+  package = c("mlVAR", "lme4", "Matrix", "R"),
+  version = c(
+    as.character(utils::packageVersion("mlVAR")),
+    as.character(utils::packageVersion("lme4")),
+    as.character(utils::packageVersion("Matrix")),
+    paste(R.version$major, R.version$minor, sep = ".")
+  ),
+  stringsAsFactors = FALSE
+)
+
+provenance <- list(
+  input_file = "Res_2_Data_for_Analysis/dat_step5_mlvar.rda",
+  input_md5 = unname(tools::md5sum(input_file)),
+  generating_script = "Step_5_mlVAR_Network_Analysis/S5_2_PrimarymlVAR.Rmd",
+  helper_file = "Step_5_mlVAR_Network_Analysis/S5_0_mlVARHelpers.R",
+  helper_md5 = unname(tools::md5sum(helper_file)),
+  fitted = timing$finished,
+  missing_handling = paste(
+    "mlVAR na.rm=TRUE; lag construction on 90-row scaffold; complete",
+    "current-plus-lag augmented rows; no Kalman filtering/FIML/imputation"
+  ),
+  overnight_rule = "Retained through global occasion beep; no exclusion sensitivity planned",
+  storage_rule = paste(
+    "Canonical RDA retains mlVAR fixed/random result arrays, analyzed data,",
+    "residuals, inputs, and complete diagnostic tables; the 24 full lmer",
+    "objects are removed after diagnostics to avoid environment-heavy serialization"
+  )
+)
+
+compact_model <- primary_model
+compact_model$output <- NULL
+
+fit_s5_2_primary_mlvar <- list(
+  model = compact_model,
+  model_specification = model_specification,
+  input_audit = input_audit,
+  timing = timing,
+  model_diagnostics = model_diagnostics,
+  fixed_effect_covariance = fixed_effect_covariance,
+  network_diagnostics = network_diagnostics,
+  fatal_gate = fatal_diagnostics,
+  package_versions = package_versions,
+  provenance = provenance
+)
+
+save(fit_s5_2_primary_mlvar, file = result_file, version = 2)
+rm(fit_s5_2_primary_mlvar)
+fit_s5_2_primary_mlvar <- load_single_object(
+  result_file, "fit_s5_2_primary_mlvar"
+)
+
+stopifnot(
+  identical(
+    names(fit_s5_2_primary_mlvar),
+    c(
+      "model", "model_specification", "input_audit", "timing",
+      "model_diagnostics", "fixed_effect_covariance", "network_diagnostics", "fatal_gate",
+      "package_versions", "provenance"
+    )
+  ),
+  inherits(fit_s5_2_primary_mlvar$model, "mlVAR"),
+  is.null(fit_s5_2_primary_mlvar$model$output),
+  length(fit_s5_2_primary_mlvar$fixed_effect_covariance$temporal) == 12L,
+  length(fit_s5_2_primary_mlvar$fixed_effect_covariance$contemporaneous) == 12L,
+  all(fit_s5_2_primary_mlvar$fatal_gate$passed),
+  identical(fit_s5_2_primary_mlvar$model$input$temporal, "orthogonal"),
+  identical(fit_s5_2_primary_mlvar$model$input$beepvar, "occasion"),
+  identical(fit_s5_2_primary_mlvar$model$input$dayvar, "DAY"),
+  isTRUE(fit_s5_2_primary_mlvar$model$input$scaled),
+  identical(fit_s5_2_primary_mlvar$model$input$scaleWithin, FALSE)
+)
+
+result_audit <- data.frame(
+  output = "Res_2_Data_for_Analysis/fit_s5_2_primary_mlvar.rda",
+  object = "fit_s5_2_primary_mlvar",
+  bytes = file.info(result_file)$size,
+  md5 = unname(tools::md5sum(result_file)),
+  reload_passed = TRUE,
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(package_versions)
+knitr::kable(result_audit)
+```
+
+```{r validate-fit, include=FALSE}
+s5_2_acceptance <- rbind(
+  fatal_diagnostics,
+  data.frame(
+    criterion = c(
+      "Locked orthogonal temporal and contemporaneous settings",
+      "Global occasion beep and no supplied day boundary",
+      "Global scaling without person-specific SD scaling",
+      "Full lmer objects summarized then removed from canonical RDA",
+      "Sole-object fitted RDA disk reload"
+    ),
+    passed = c(
+      identical(fit_s5_2_primary_mlvar$model$input$temporal, "orthogonal"),
+      identical(fit_s5_2_primary_mlvar$model$input$beepvar, "occasion") &&
+        identical(fit_s5_2_primary_mlvar$model$input$dayvar, "DAY"),
+      isTRUE(fit_s5_2_primary_mlvar$model$input$scaled) &&
+        identical(fit_s5_2_primary_mlvar$model$input$scaleWithin, FALSE),
+      is.null(fit_s5_2_primary_mlvar$model$output) &&
+        nrow(fit_s5_2_primary_mlvar$model_diagnostics) == 24L,
+      file.exists(result_file)
+    ),
+    stringsAsFactors = FALSE
+  )
+)
+
+stopifnot(all(s5_2_acceptance$passed))
+```

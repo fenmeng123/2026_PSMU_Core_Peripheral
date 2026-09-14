@@ -1,0 +1,39 @@
+TITLE:
+! Author: Kunru Song
+! Step 3.3 Distress model without Engagement Time.
+! Concurrent association; Time and Day are within-level design controls.
+Raw strict-complete mean scores
+DATA:
+FILE = "F:/2026_[8]_PSMU_Daily_CorePeripheral/
+Step_3_Concurrent_Multilevel_Associations/mplus/s3_3/
+s3_3_unadjusted_distress_raw.dat"; 
+VARIABLE:
+NAMES = id dayc tm2 tm3 disw corew periw disb coreb perib; 
+ MISSING=.;
+ CLUSTER = id;
+WITHIN = disw corew periw dayc tm2 tm3;
+BETWEEN = disb coreb perib;
+ANALYSIS:
+TYPE = TWOLEVEL;
+ESTIMATOR = MLR;
+MODEL:
+%WITHIN%
+disw ON corew (wc);
+disw ON periw (wp);
+disw ON dayc;
+disw ON tm2;
+disw ON tm3;
+%BETWEEN%
+disb ON coreb (bc);
+disb ON perib (bp);
+MODEL CONSTRAINT:
+NEW(wdiff bdiff);
+wdiff = wc - wp;
+bdiff = bc - bp;
+OUTPUT:
+SAMPSTAT;
+STANDARDIZED(STDYX);
+CINTERVAL;
+RESIDUAL;
+TECH1;
+TECH4;

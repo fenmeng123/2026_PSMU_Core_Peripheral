@@ -1,0 +1,1069 @@
+---
+title: "S2.2.1 Baseline Trait PSMU CFA using WLSMV"
+author: "Kunru Song"
+date: "2026-07-18 16:49:00 +08:00"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+
+This report compares a general one-factor model with a correlated
+Core--Peripheral two-factor model for the 18 baseline Trait PSMU items. Mplus 8.7
+is the computation engine. R and `MplusAutomation` create the model inputs, run
+Mplus, parse and validate the outputs, save the canonical model-result RDA, and
+create the final Excel workbook and SVG figures.
+
+The baseline CFA is a supplementary trait-level replication. Its result does
+not determine the EMA within-person measurement structure.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA
+)
+
+required_packages <- c(
+  "bruceR",
+  "dplyr",
+  "ggplot2",
+  "knitr",
+  "MplusAutomation",
+  "openxlsx",
+  "rmarkdown",
+  "svglite",
+  "tibble",
+  "tidyr",
+  "zip",
+  "xml2"
+)
+package_available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(package_available)) {
+  stop(
+    "Missing required R packages: ",
+    paste(names(package_available)[!package_available], collapse = ", ")
+  )
+}
+
+locate_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(current)) current <- dirname(current)
+  repeat {
+    if (all(dir.exists(file.path(current, c(
+      "Step_1_Descriptive_and_Reliability", "Step_2_Measurement_Models"
+    ))))) return(current)
+    parent <- dirname(current)
+    if (identical(parent, current)) break
+    current <- parent
+  }
+  stop("Could not locate the project from its public Step directories")
+}
+
+input_path <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(if (is.null(input_path)) getwd() else input_path)
+knitr::opts_knit$set(root.dir = project_root)
+knitr::opts_chunk$set(dev = "svglite")
+
+input_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "dat_step2_measurement.rda"
+)
+model_result_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "fit_s2_2_1_baseline_cfa_wlsmv.rda"
+)
+table_file <- file.path(
+  project_root,
+  "Res_3_Results",
+  "Table_S2_2_1_BaselineCFA_PSMU18items_WLSMV.xlsx"
+)
+fit_figure_file <- file.path(
+  project_root,
+  "Res_3_Results",
+  "Figure_S2_2_1_BaselineCFA_PSMU18items_WLSMV_Fit.svg"
+)
+loading_figure_file <- file.path(
+  project_root,
+  "Res_3_Results",
+  "Figure_S2_2_1_BaselineCFA_PSMU18items_WLSMV_Loadings.svg"
+)
+mplus_directory <- file.path(
+  project_root,
+  "Step_2_Measurement_Models",
+  "mplus",
+  "s2_2_1"
+)
+dir.create(mplus_directory, recursive = TRUE, showWarnings = FALSE)
+
+mplus_command <- Sys.getenv(
+  "MPLUS_COMMAND",
+  unset = "D:/Program Files/Mplus/Mplus.exe"
+)
+
+if (!file.exists(input_file)) stop("Missing canonical Step 2 input RDA: ", input_file)
+if (!file.exists(mplus_command)) stop("Missing required local Mplus 8.7 executable: ", mplus_command)
+```
+
+# Load and validate the S2.1 entry data
+
+```{r load-and-validate-input}
+input_environment <- new.env(parent = emptyenv())
+loaded_objects <- load(input_file, envir = input_environment)
+
+if (!identical(loaded_objects, "dat_step2_measurement")) {
+  stop(
+    "S2.1 RDA must contain only dat_step2_measurement; found: ",
+    paste(loaded_objects, collapse = ", ")
+  )
+}
+
+dat_step2_measurement <- input_environment$dat_step2_measurement
+expected_components <- c("baseline", "ema", "item_map", "audit")
+
+if (!identical(names(dat_step2_measurement), expected_components)) {
+  stop("Unexpected dat_step2_measurement component structure.")
+}
+
+baseline_items <- paste0("V_BSMAS_", 1:18)
+expected_columns <- c("Name_ID", baseline_items)
+dat_baseline_cfa <- dat_step2_measurement$baseline |>
+  dplyr::select(dplyr::all_of(expected_columns)) |>
+  as.data.frame()
+
+stopifnot(
+  identical(names(dat_baseline_cfa), expected_columns),
+  nrow(dat_baseline_cfa) == 209L,
+  dplyr::n_distinct(dat_baseline_cfa$Name_ID) == 209L,
+  !anyNA(dat_baseline_cfa),
+  all(vapply(dat_baseline_cfa[baseline_items], is.numeric, logical(1))),
+  all(vapply(
+    dat_baseline_cfa[baseline_items],
+    function(x) all(x %in% 1:5),
+    logical(1)
+  ))
+)
+
+input_audit <- data.frame(
+  input_file = "Res_2_Data_for_Analysis/dat_step2_measurement.rda",
+  input_md5 = unname(tools::md5sum(input_file)),
+  generating_script = dat_step2_measurement$audit$generated_by,
+  participants = nrow(dat_baseline_cfa),
+  items = length(baseline_items),
+  missing_item_cells = sum(is.na(dat_baseline_cfa[baseline_items])),
+  observed_minimum = min(as.matrix(dat_baseline_cfa[baseline_items])),
+  observed_maximum = max(as.matrix(dat_baseline_cfa[baseline_items])),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(input_audit)
+```
+
+# Mplus-safe variables and item mapping
+
+Mplus receives short unique names (`bs1`--`bs18`). The mapping below is retained
+in the result RDA and every extracted table so no item identity is lost.
+
+```{r mplus-variable-map}
+mplus_item_names <- paste0("bs", 1:18)
+
+variable_map <- data.frame(
+  item_number = 1:18,
+  project_variable = baseline_items,
+  mplus_variable = toupper(mplus_item_names),
+  theoretical_group = ifelse(1:18 <= 6L, "Peripheral", "Core"),
+  stringsAsFactors = FALSE
+)
+
+mplus_data <- dat_baseline_cfa[baseline_items]
+names(mplus_data) <- mplus_item_names
+mplus_data <- as.data.frame(mplus_data)
+
+stopifnot(
+  identical(names(mplus_data), mplus_item_names),
+  nrow(mplus_data) == 209L,
+  !anyNA(mplus_data),
+  length(unique(substr(names(mplus_data), 1L, 8L))) == 18L
+)
+
+knitr::kable(variable_map)
+```
+
+# Model specifications
+
+Both models treat the 1--5 responses as ordered categorical and use Mplus
+WLSMV with the Delta parameterization. The first item of each factor is the
+marker indicator under the Mplus default identification rule. No item parcel,
+correlated residual, cross-loading, or post-hoc modification is added.
+
+```{r model-specifications}
+model_specs <- list(
+  B1_OneFactor = list(
+    label = "B1 One-factor",
+    stem = "s2_2_1_b1_one_factor",
+    title = "S2.2.1 WLSMV B1 one-factor baseline Trait PSMU CFA;",
+    model = "trait BY bs1-bs18;"
+  ),
+  B2_CorePeripheral = list(
+    label = "B2 Core-Peripheral",
+    stem = "s2_2_1_b2_core_peripheral",
+    title = "S2.2.1 WLSMV B2 correlated Core-Peripheral baseline Trait PSMU CFA;",
+    model = paste(
+      "periph BY bs1-bs6;",
+      "core BY bs7-bs18;",
+      "periph WITH core;",
+      sep = "\n"
+    )
+  )
+)
+
+model_plan <- dplyr::bind_rows(lapply(names(model_specs), function(model_id) {
+  specification <- model_specs[[model_id]]
+  data.frame(
+    model_id = model_id,
+    model_label = specification$label,
+    estimator = "WLSMV",
+    parameterization = "DELTA",
+    indicator_treatment = "Ordered categorical (1-5)",
+    categorical_items = 18L,
+    factors = ifelse(model_id == "B1_OneFactor", 1L, 2L),
+    mplus_input = paste0(specification$stem, ".inp"),
+    stringsAsFactors = FALSE
+  )
+}))
+
+knitr::kable(model_plan)
+```
+
+# Generate and run the Mplus 8.7 models
+
+The `.dat`, `.inp`, and `.out` files are regenerated by this Rmd.
+
+```{r run-mplus-models}
+run_mplus_cfa <- function(model_id, specification) {
+  model_stem <- specification$stem
+  data_path <- file.path(mplus_directory, paste0(model_stem, ".dat"))
+  input_path <- file.path(mplus_directory, paste0(model_stem, ".inp"))
+  output_path <- file.path(mplus_directory, paste0(model_stem, ".out"))
+
+  mplus_object <- MplusAutomation::mplusObject(
+    TITLE = paste(
+      "! Author: Kunru Song",
+      specification$title,
+      sep = "\n"
+    ),
+    VARIABLE = "CATEGORICAL = bs1-bs18;",
+    ANALYSIS = paste(
+      "ESTIMATOR = WLSMV;",
+      "PARAMETERIZATION = DELTA;",
+      sep = "\n"
+    ),
+    MODEL = specification$model,
+    OUTPUT = paste(
+      "SAMPSTAT;",
+      "STANDARDIZED(STDYX);",
+      "CINTERVAL;",
+      "RESIDUAL;",
+      "MODINDICES(10);",
+      "TECH1;",
+      "TECH4;",
+      sep = "\n"
+    ),
+    usevariables = mplus_item_names,
+    rdata = mplus_data,
+    autov = FALSE,
+    quiet = TRUE
+  )
+
+  modeler_result <- MplusAutomation::mplusModeler(
+    object = mplus_object,
+    dataout = data_path,
+    modelout = input_path,
+    run = 1L,
+    check = FALSE,
+    varwarnings = TRUE,
+    Mplus_command = mplus_command,
+    writeData = "always",
+    hashfilename = FALSE,
+    killOnFail = TRUE,
+    quiet = TRUE
+  )
+
+  if (!file.exists(output_path)) {
+    stop("Mplus did not create the expected output: ", output_path)
+  }
+
+  input_lines <- readLines(input_path, warn = FALSE)
+  output_lines <- readLines(output_path, warn = FALSE)
+  author_present <- any(trimws(input_lines) == "! Author: Kunru Song")
+  normal_termination <- any(grepl(
+    "THE MODEL ESTIMATION TERMINATED NORMALLY",
+    output_lines,
+    fixed = TRUE
+  ))
+
+  if (!author_present) stop("Missing required author text in: ", input_path)
+  if (!normal_termination) stop("Mplus model did not terminate normally: ", output_path)
+
+  parsed <- MplusAutomation::readModels(
+    target = output_path,
+    what = "all",
+    quiet = TRUE
+  )
+
+  list(
+    model_id = model_id,
+    model_label = specification$label,
+    model_syntax = specification$model,
+    paths = list(data = data_path, input = input_path, output = output_path),
+    author_present = author_present,
+    normal_termination = normal_termination,
+    parsed = parsed,
+    modeler_result = modeler_result
+  )
+}
+
+model_runs <- lapply(names(model_specs), function(model_id) {
+  run_mplus_cfa(model_id, model_specs[[model_id]])
+})
+names(model_runs) <- names(model_specs)
+```
+
+# Validate parsed Mplus output
+
+Technical admissibility is evaluated separately from global model fit. Poor fit
+does not cause a technically valid model run to be discarded.
+
+```{r validate-mplus-output}
+flatten_messages <- function(x) {
+  if (length(x) == 0L) return(NA_character_)
+  values <- unlist(x, recursive = TRUE, use.names = FALSE)
+  values <- trimws(as.character(values))
+  values <- values[nzchar(values)]
+  if (!length(values)) NA_character_ else paste(unique(values), collapse = " | ")
+}
+
+extract_loading_rows <- function(parsed) {
+  standard <- parsed$parameters$stdyx.standardized
+  standard[grepl("\\.BY$", standard$paramHeader), , drop = FALSE]
+}
+
+extract_factor_correlation_rows <- function(parsed) {
+  standard <- parsed$parameters$stdyx.standardized
+  standard[grepl("\\.WITH$", standard$paramHeader), , drop = FALSE]
+}
+
+technical_diagnostics <- dplyr::bind_rows(lapply(model_runs, function(run) {
+  parsed <- run$parsed
+  summary_row <- parsed$summaries[1, , drop = FALSE]
+  loading_rows <- extract_loading_rows(parsed)
+  factor_correlation_rows <- extract_factor_correlation_rows(parsed)
+  r2_rows <- parsed$parameters$r2
+
+  version_ok <- identical(as.character(summary_row$Mplus.version), "8.7")
+  estimator_ok <- identical(as.character(summary_row$Estimator), "WLSMV")
+  observations_ok <- identical(as.integer(summary_row$Observations), 209L)
+  errors_n <- length(parsed$errors)
+  warnings_n <- length(parsed$warnings)
+  loadings_admissible <- all(is.finite(loading_rows$est)) &&
+    all(abs(loading_rows$est) <= 1.001)
+  residuals_admissible <- !is.null(r2_rows) &&
+    all(is.finite(r2_rows$resid_var)) &&
+    all(r2_rows$resid_var >= -0.001)
+  correlations_admissible <- !nrow(factor_correlation_rows) ||
+    all(abs(factor_correlation_rows$est) < 1)
+
+  data.frame(
+    model_id = run$model_id,
+    model = run$model_label,
+    mplus_version = as.character(summary_row$Mplus.version),
+    estimator = as.character(summary_row$Estimator),
+    observations = as.integer(summary_row$Observations),
+    normal_termination = run$normal_termination,
+    author_present = run$author_present,
+    errors_n = errors_n,
+    warnings_n = warnings_n,
+    errors = flatten_messages(parsed$errors),
+    warnings = flatten_messages(parsed$warnings),
+    maximum_absolute_loading = max(abs(loading_rows$est)),
+    minimum_residual_variance = min(r2_rows$resid_var),
+    maximum_absolute_factor_correlation = if (nrow(factor_correlation_rows)) {
+      max(abs(factor_correlation_rows$est))
+    } else {
+      NA_real_
+    },
+    version_ok = version_ok,
+    estimator_ok = estimator_ok,
+    observations_ok = observations_ok,
+    loadings_admissible = loadings_admissible,
+    residuals_admissible = residuals_admissible,
+    correlations_admissible = correlations_admissible,
+    technical_checks_passed = all(c(
+      run$normal_termination,
+      run$author_present,
+      version_ok,
+      estimator_ok,
+      observations_ok,
+      errors_n == 0L,
+      loadings_admissible,
+      residuals_admissible,
+      correlations_admissible
+    )),
+    stringsAsFactors = FALSE
+  )
+}))
+
+if (!all(technical_diagnostics$technical_checks_passed)) {
+  stop(
+    "At least one Mplus CFA failed technical validation: ",
+    paste(
+      technical_diagnostics$model[!technical_diagnostics$technical_checks_passed],
+      collapse = ", "
+    )
+  )
+}
+
+knitr::kable(technical_diagnostics, digits = 3)
+```
+
+# Extract fit and parameter results
+
+```{r extract-results}
+extract_fit <- function(run) {
+  summary_row <- run$parsed$summaries[1, , drop = FALSE]
+  data.frame(
+    model_id = run$model_id,
+    model = run$model_label,
+    mplus_version = as.character(summary_row$Mplus.version),
+    estimator = as.character(summary_row$Estimator),
+    parameterization = "DELTA",
+    n = as.integer(summary_row$Observations),
+    free_parameters = as.integer(summary_row$Parameters),
+    chi_square = as.numeric(summary_row$ChiSqM_Value),
+    df = as.integer(summary_row$ChiSqM_DF),
+    p_value = as.numeric(summary_row$ChiSqM_PValue),
+    cfi = as.numeric(summary_row$CFI),
+    tli = as.numeric(summary_row$TLI),
+    rmsea = as.numeric(summary_row$RMSEA_Estimate),
+    rmsea_90ci_lower = as.numeric(summary_row$RMSEA_90CI_LB),
+    rmsea_90ci_upper = as.numeric(summary_row$RMSEA_90CI_UB),
+    rmsea_p_close = as.numeric(summary_row$RMSEA_pLT05),
+    srmr = as.numeric(summary_row$SRMR),
+    stringsAsFactors = FALSE
+  )
+}
+
+model_fit <- dplyr::bind_rows(lapply(model_runs, extract_fit)) |>
+  dplyr::mutate(
+    delta_cfi_vs_b1 = c(NA_real_, cfi[2] - cfi[1]),
+    delta_tli_vs_b1 = c(NA_real_, tli[2] - tli[1]),
+    delta_rmsea_vs_b1 = c(NA_real_, rmsea[2] - rmsea[1]),
+    delta_srmr_vs_b1 = c(NA_real_, srmr[2] - srmr[1])
+  )
+
+extract_loadings <- function(run) {
+  parsed <- run$parsed
+  standard <- extract_loading_rows(parsed)
+  standard_ci <- parsed$parameters$ci.stdyx.standardized
+  standard_ci <- standard_ci[
+    grepl("\\.BY$", standard_ci$paramHeader),
+    c("paramHeader", "param", "low2.5", "up2.5"),
+    drop = FALSE
+  ]
+  unstandard <- parsed$parameters$unstandardized
+  unstandard <- unstandard[
+    grepl("\\.BY$", unstandard$paramHeader),
+    c("paramHeader", "param", "est", "se"),
+    drop = FALSE
+  ]
+  names(unstandard)[3:4] <- c("unstandardized_loading", "unstandardized_se")
+  r2 <- parsed$parameters$r2[, c("param", "est", "resid_var"), drop = FALSE]
+  names(r2)[2] <- "r_squared"
+
+  result <- standard |>
+    dplyr::select(
+      paramHeader,
+      param,
+      standardized_loading = est,
+      standardized_se = se,
+      standardized_z = est_se,
+      standardized_p = pval
+    ) |>
+    dplyr::left_join(standard_ci, by = c("paramHeader", "param")) |>
+    dplyr::left_join(unstandard, by = c("paramHeader", "param")) |>
+    dplyr::left_join(r2, by = "param") |>
+    dplyr::left_join(variable_map, by = c("param" = "mplus_variable")) |>
+    dplyr::mutate(
+      model_id = run$model_id,
+      model = run$model_label,
+      factor = sub("\\.BY$", "", paramHeader),
+      standardized_ci_lower = low2.5,
+      standardized_ci_upper = up2.5
+    ) |>
+    dplyr::select(
+      model_id,
+      model,
+      factor,
+      item_number,
+      project_variable,
+      theoretical_group,
+      unstandardized_loading,
+      unstandardized_se,
+      standardized_loading,
+      standardized_se,
+      standardized_z,
+      standardized_p,
+      standardized_ci_lower,
+      standardized_ci_upper,
+      r_squared,
+      residual_variance = resid_var
+    ) |>
+    dplyr::arrange(item_number)
+
+  result
+}
+
+loadings <- dplyr::bind_rows(lapply(model_runs, extract_loadings))
+
+extract_factor_correlation <- function(run) {
+  standard <- extract_factor_correlation_rows(run$parsed)
+  if (!nrow(standard)) return(NULL)
+
+  standard_ci <- run$parsed$parameters$ci.stdyx.standardized
+  standard_ci <- standard_ci[
+    grepl("\\.WITH$", standard_ci$paramHeader),
+    c("paramHeader", "param", "low2.5", "up2.5"),
+    drop = FALSE
+  ]
+
+  standard |>
+    dplyr::select(
+      paramHeader,
+      param,
+      correlation = est,
+      se,
+      z = est_se,
+      p_value = pval
+    ) |>
+    dplyr::left_join(standard_ci, by = c("paramHeader", "param")) |>
+    dplyr::transmute(
+      model_id = run$model_id,
+      model = run$model_label,
+      factor_1 = sub("\\.WITH$", "", paramHeader),
+      factor_2 = param,
+      correlation = correlation,
+      se = se,
+      z = z,
+      p_value = p_value,
+      ci_lower = low2.5,
+      ci_upper = up2.5
+    )
+}
+
+factor_correlations <- dplyr::bind_rows(lapply(model_runs, extract_factor_correlation))
+
+loading_summary <- loadings |>
+  dplyr::group_by(model_id, model, factor) |>
+  dplyr::summarise(
+    items = dplyr::n(),
+    minimum_standardized_loading = min(standardized_loading),
+    mean_standardized_loading = mean(standardized_loading),
+    maximum_standardized_loading = max(standardized_loading),
+    minimum_r_squared = min(r_squared),
+    maximum_r_squared = max(r_squared),
+    .groups = "drop"
+  )
+
+knitr::kable(model_fit, digits = 3)
+knitr::kable(loading_summary, digits = 3)
+knitr::kable(factor_correlations, digits = 3)
+```
+
+# Save the canonical parsed model-result RDA
+
+```{r save-model-result}
+project_root_normalized <- normalizePath(project_root, winslash = "/", mustWork = TRUE)
+
+make_relative_path <- function(path) {
+  normalized <- normalizePath(path, winslash = "/", mustWork = TRUE)
+  root_prefix <- paste0(project_root_normalized, "/")
+  if (startsWith(normalized, root_prefix)) {
+    substring(normalized, nchar(root_prefix) + 1L)
+  } else {
+    normalized
+  }
+}
+
+mplus_file_manifest <- dplyr::bind_rows(lapply(model_runs, function(run) {
+  data.frame(
+    model_id = run$model_id,
+    model = run$model_label,
+    file_type = c("data", "input", "output"),
+    relative_path = vapply(run$paths, make_relative_path, character(1)),
+    md5 = unname(tools::md5sum(unlist(run$paths))),
+    stringsAsFactors = FALSE
+  )
+}))
+
+fit_s2_2_1_baseline_cfa_wlsmv <- list(
+  metadata = list(
+    generated_by = "Step_2_Measurement_Models/S2_2_1_BaselineCFA_PSMU18items_WLSMV.Rmd",
+    input_file = "Res_2_Data_for_Analysis/dat_step2_measurement.rda",
+    input_md5 = unname(tools::md5sum(input_file)),
+    mplus_executable = normalizePath(mplus_command, winslash = "/", mustWork = TRUE),
+    mplus_version = unique(technical_diagnostics$mplus_version),
+    mplusautomation_version = as.character(utils::packageVersion("MplusAutomation")),
+    estimator = "WLSMV",
+    parameterization = "DELTA"
+  ),
+  variable_map = variable_map,
+  model_plan = model_plan,
+  model_fit = model_fit,
+  loadings = loadings,
+  loading_summary = loading_summary,
+  factor_correlations = factor_correlations,
+  diagnostics = technical_diagnostics,
+  mplus_files = mplus_file_manifest,
+  parsed_models = lapply(model_runs, function(run) run$parsed)
+)
+
+save(fit_s2_2_1_baseline_cfa_wlsmv, file = model_result_file, compress = "xz", version = 3)
+
+verification_environment <- new.env(parent = emptyenv())
+verified_objects <- load(model_result_file, envir = verification_environment)
+stopifnot(
+  identical(verified_objects, "fit_s2_2_1_baseline_cfa_wlsmv"),
+  identical(
+    verification_environment$fit_s2_2_1_baseline_cfa_wlsmv$metadata$generated_by,
+    "Step_2_Measurement_Models/S2_2_1_BaselineCFA_PSMU18items_WLSMV.Rmd"
+  ),
+  all(verification_environment$fit_s2_2_1_baseline_cfa_wlsmv$diagnostics$technical_checks_passed)
+)
+```
+
+# Export the final result workbook in R
+
+```{r export-workbook}
+round_numeric_columns <- function(data, digits = 4L) {
+  data |>
+    dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, digits))) |>
+    dplyr::mutate(dplyr::across(where(is.factor), as.character))
+}
+
+workbook_sheets <- list(
+  Model_Fit = round_numeric_columns(model_fit),
+  Loadings = round_numeric_columns(loadings),
+  Factor_Correlation = round_numeric_columns(factor_correlations),
+  Diagnostics = round_numeric_columns(technical_diagnostics)
+)
+
+bruceR::export(
+  workbook_sheets,
+  file = table_file,
+  overwrite = TRUE,
+  verbose = FALSE
+)
+
+# Apply a reproducible scientific-results format in R after the required
+# bruceR export. This preserves typed numeric cells while improving reviewability.
+workbook <- openxlsx::loadWorkbook(table_file)
+header_style <- openxlsx::createStyle(
+  fontName = "Arial",
+  fontSize = 10,
+  fontColour = "#FFFFFF",
+  fgFill = "#1F4E78",
+  textDecoration = "bold",
+  halign = "center",
+  valign = "center",
+  wrapText = TRUE,
+  border = "bottom",
+  borderColour = "#163A5C"
+)
+decimal_style <- openxlsx::createStyle(numFmt = "0.000")
+integer_style <- openxlsx::createStyle(numFmt = "#,##0")
+
+integer_column_names <- c(
+  "n",
+  "df",
+  "free_parameters",
+  "item_number",
+  "errors_n",
+  "warnings_n",
+  "observations"
+)
+
+for (sheet_name in names(workbook_sheets)) {
+  sheet_data <- workbook_sheets[[sheet_name]]
+  n_rows <- nrow(sheet_data)
+  n_columns <- ncol(sheet_data)
+
+  openxlsx::addStyle(
+    workbook,
+    sheet = sheet_name,
+    style = header_style,
+    rows = 1,
+    cols = seq_len(n_columns),
+    gridExpand = TRUE,
+    stack = TRUE
+  )
+  openxlsx::setRowHeights(workbook, sheet_name, rows = 1, heights = 30)
+  openxlsx::freezePane(workbook, sheet_name, firstRow = TRUE)
+  openxlsx::addFilter(workbook, sheet_name, rows = 1, cols = seq_len(n_columns))
+  openxlsx::showGridLines(workbook, sheet_name, showGridLines = FALSE)
+
+  column_widths <- vapply(seq_len(n_columns), function(column_index) {
+    values <- c(names(sheet_data)[column_index], as.character(sheet_data[[column_index]]))
+    values[is.na(values)] <- ""
+    min(38, max(10, max(nchar(values), na.rm = TRUE) + 2))
+  }, numeric(1))
+  openxlsx::setColWidths(
+    workbook,
+    sheet = sheet_name,
+    cols = seq_len(n_columns),
+    widths = column_widths
+  )
+
+  if (n_rows > 0L) {
+    numeric_columns <- which(vapply(sheet_data, is.numeric, logical(1)))
+    integer_columns <- which(names(sheet_data) %in% integer_column_names)
+    decimal_columns <- setdiff(numeric_columns, integer_columns)
+
+    if (length(integer_columns)) {
+      openxlsx::addStyle(
+        workbook,
+        sheet = sheet_name,
+        style = integer_style,
+        rows = 2:(n_rows + 1L),
+        cols = integer_columns,
+        gridExpand = TRUE,
+        stack = TRUE
+      )
+    }
+    if (length(decimal_columns)) {
+      openxlsx::addStyle(
+        workbook,
+        sheet = sheet_name,
+        style = decimal_style,
+        rows = 2:(n_rows + 1L),
+        cols = decimal_columns,
+        gridExpand = TRUE,
+        stack = TRUE
+      )
+    }
+  }
+}
+
+openxlsx::saveWorkbook(workbook, table_file, overwrite = TRUE)
+
+# openxlsx can retain orphan drawing relationships introduced by the original
+# bruceR workbook even though no drawing parts are present. Excel tolerates
+# them, but stricter OOXML readers do not. Remove only those two orphan
+# relationship types, leaving worksheet data, styles, and printer settings
+# unchanged.
+repair_orphan_drawing_relationships <- function(xlsx_file) {
+  repair_dir <- tempfile("baseline_cfa_xlsx_repair_")
+  dir.create(repair_dir)
+  on.exit(unlink(repair_dir, recursive = TRUE, force = TRUE), add = TRUE)
+
+  members <- utils::unzip(xlsx_file, list = TRUE)$Name
+  # Reject unsafe archive paths before extracting a package.
+  unsafe_member <- function(path) {
+    parts <- strsplit(gsub("\\\\", "/", path), "/", fixed = TRUE)[[1L]]
+    grepl("^[/\\\\]|^[A-Za-z]:", path) || any(parts == "..")
+  }
+  stopifnot(length(members) > 0L, !anyDuplicated(members),
+            !any(vapply(members, unsafe_member, logical(1))))
+  utils::unzip(xlsx_file, exdir = repair_dir)
+  relationship_files <- list.files(
+    file.path(repair_dir, "xl", "worksheets", "_rels"),
+    pattern = "\\.rels$", full.names = TRUE
+  )
+  if (!length(relationship_files)) return(invisible(0L))
+
+  resolve_member <- function(target) {
+    target <- gsub("\\\\", "/", utils::URLdecode(target))
+    if (!nzchar(target) || grepl("^[A-Za-z][A-Za-z0-9+.-]*:", target)) {
+      stop("Invalid internal drawing target")
+    }
+    parts <- strsplit(target, "/", fixed = TRUE)[[1L]]
+    result <- if (startsWith(target, "/")) character() else c("xl", "worksheets")
+    for (part in parts) {
+      if (!nzchar(part) || part == ".") next
+      if (part == "..") {
+        if (!length(result)) stop("Drawing target escapes the workbook package")
+        result <- head(result, -1L)
+      } else result <- c(result, part)
+    }
+    paste(result, collapse = "/")
+  }
+  drawing_types <- paste0(
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/",
+    c("drawing", "vmlDrawing")
+  )
+  removed_relationships <- 0L
+  for (relationship_file in relationship_files) {
+    document <- xml2::read_xml(relationship_file, options = "NONET")
+    relationships <- xml2::xml_find_all(
+      document, "/*[local-name()='Relationships']/*[local-name()='Relationship']"
+    )
+    changed <- FALSE
+    for (relationship in relationships) {
+      type <- xml2::xml_attr(relationship, "Type")
+      external <- identical(xml2::xml_attr(relationship, "TargetMode"), "External")
+      if (!type %in% drawing_types || external) next
+      target <- xml2::xml_attr(relationship, "Target")
+      if (is.na(target)) stop("Drawing relationship is missing its Target")
+      if (!resolve_member(target) %in% members) {
+        xml2::xml_remove(relationship)
+        removed_relationships <- removed_relationships + 1L
+        changed <- TRUE
+      }
+    }
+    if (changed) xml2::write_xml(document, relationship_file)
+  }
+  if (removed_relationships == 0L) return(invisible(0L))
+
+  repaired_file <- tempfile(fileext = ".xlsx")
+  on.exit(unlink(repaired_file), add = TRUE)
+  archive_members <- list.files(
+    repair_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE
+  )
+  zip::zipr(
+    zipfile = repaired_file, files = archive_members, root = repair_dir,
+    include_directories = FALSE, mode = "mirror"
+  )
+  stopifnot(file.exists(repaired_file), file.info(repaired_file)$size > 0)
+  stopifnot(file.copy(repaired_file, xlsx_file, overwrite = TRUE))
+  invisible(removed_relationships)
+}
+
+orphan_relationships_removed <- repair_orphan_drawing_relationships(table_file)
+
+stopifnot(
+  file.exists(table_file),
+  identical(
+    openxlsx::getSheetNames(table_file),
+    names(workbook_sheets)
+  )
+)
+```
+
+# Visualize model fit and standardized loadings in R
+
+Reference lines indicate conventional fit guidelines; model selection also requires substantive and diagnostic assessment.
+
+```{r create-fit-figure}
+fit_plot_data <- model_fit |>
+  dplyr::select(model, cfi, tli, rmsea, srmr) |>
+  tidyr::pivot_longer(
+    cols = c(cfi, tli, rmsea, srmr),
+    names_to = "fit_index",
+    values_to = "value"
+  ) |>
+  dplyr::mutate(
+    fit_index = factor(
+      fit_index,
+      levels = c("cfi", "tli", "rmsea", "srmr"),
+      labels = c("CFI", "TLI", "RMSEA", "SRMR")
+    ),
+    model = factor(
+      model,
+      levels = c("B1 One-factor", "B2 Core-Peripheral")
+    )
+  )
+
+fit_references <- data.frame(
+  fit_index = factor(
+    c("CFI", "TLI", "RMSEA", "SRMR"),
+    levels = c("CFI", "TLI", "RMSEA", "SRMR")
+  ),
+  reference = c(.95, .95, .06, .08)
+)
+
+fit_figure <- ggplot2::ggplot(
+  fit_plot_data,
+  ggplot2::aes(x = model, y = value, color = model)
+) +
+  ggplot2::geom_hline(
+    data = fit_references,
+    ggplot2::aes(yintercept = reference),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    color = "grey45",
+    linewidth = .5
+  ) +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::geom_text(
+    ggplot2::aes(label = sprintf("%.3f", value)),
+    vjust = -1,
+    show.legend = FALSE,
+    size = 3.3
+  ) +
+  ggplot2::facet_wrap(~ fit_index, scales = "free_y", nrow = 1) +
+  ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(.05, .18))) +
+  ggplot2::scale_color_manual(values = c("#4C78A8", "#E45756")) +
+  ggplot2::labs(
+    title = "Baseline Trait PSMU CFA model fit",
+    subtitle = "Dashed lines are conventional descriptive references",
+    x = NULL,
+    y = "Fit-index value",
+    color = "Model"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 20, hjust = 1),
+    legend.position = "bottom",
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+ggplot2::ggsave(
+  filename = fit_figure_file,
+  plot = fit_figure,
+  device = "svg",
+  width = 10,
+  height = 4.8,
+  units = "in",
+  bg = "white"
+)
+
+fit_figure
+```
+
+```{r create-loading-figure}
+loading_plot_data <- loadings |>
+  dplyr::mutate(
+    item_label = factor(
+      paste0("Item ", item_number),
+      levels = rev(paste0("Item ", 1:18))
+    ),
+    model = factor(
+      model,
+      levels = c("B1 One-factor", "B2 Core-Peripheral")
+    )
+  )
+
+loading_figure <- ggplot2::ggplot(
+  loading_plot_data,
+  ggplot2::aes(
+    x = standardized_loading,
+    y = item_label,
+    color = theoretical_group
+  )
+) +
+  ggplot2::geom_vline(
+    xintercept = .40,
+    linetype = "dashed",
+    color = "grey50",
+    linewidth = .5
+  ) +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(
+      xmin = standardized_ci_lower,
+      xmax = standardized_ci_upper
+    ),
+    orientation = "y",
+    width = .20,
+    linewidth = .55
+  ) +
+  ggplot2::geom_point(size = 2.2) +
+  ggplot2::facet_wrap(~ model, nrow = 1) +
+  ggplot2::scale_color_manual(
+    values = c("Peripheral" = "#F2A541", "Core" = "#4C78A8")
+  ) +
+  ggplot2::coord_cartesian(xlim = c(0, 1)) +
+  ggplot2::labs(
+    title = "Standardized baseline CFA loadings",
+    subtitle = "Points are Mplus STDYX estimates; bars are 95% confidence intervals",
+    x = "Standardized loading",
+    y = NULL,
+    color = "Theoretical group"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+ggplot2::ggsave(
+  filename = loading_figure_file,
+  plot = loading_figure,
+  device = "svg",
+  width = 10,
+  height = 8.5,
+  units = "in",
+  bg = "white"
+)
+
+loading_figure
+```
+
+# Interpretation
+
+```{r validation-checks, include=FALSE}
+artifact_manifest <- data.frame(
+  role = c(
+    "Parsed model-result RDA",
+    "Final result workbook",
+    "Model-fit SVG",
+    "Standardized-loading SVG"
+  ),
+  relative_path = c(
+    "Res_2_Data_for_Analysis/fit_s2_2_1_baseline_cfa_wlsmv.rda",
+    "Res_3_Results/Table_S2_2_1_BaselineCFA_PSMU18items_WLSMV.xlsx",
+    "Res_3_Results/Figure_S2_2_1_BaselineCFA_PSMU18items_WLSMV_Fit.svg",
+    "Res_3_Results/Figure_S2_2_1_BaselineCFA_PSMU18items_WLSMV_Loadings.svg"
+  ),
+  exists = file.exists(c(
+    model_result_file,
+    table_file,
+    fit_figure_file,
+    loading_figure_file
+  )),
+  bytes = file.info(c(
+    model_result_file,
+    table_file,
+    fit_figure_file,
+    loading_figure_file
+  ))$size,
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  all(artifact_manifest$exists),
+  all(artifact_manifest$bytes > 0),
+  all(technical_diagnostics$technical_checks_passed),
+  all(model_fit$n == 209L),
+  nrow(loadings) == 36L,
+  nrow(factor_correlations) == 1L
+)
+
+
+```
+
+Both models were estimated by Mplus 8.7 with WLSMV and passed the prespecified
+technical checks. The one-factor model had CFI =
+`r sprintf("%.3f", model_fit$cfi[model_fit$model_id == "B1_OneFactor"])`, TLI =
+`r sprintf("%.3f", model_fit$tli[model_fit$model_id == "B1_OneFactor"])`, RMSEA =
+`r sprintf("%.3f", model_fit$rmsea[model_fit$model_id == "B1_OneFactor"])`, and
+SRMR = `r sprintf("%.3f", model_fit$srmr[model_fit$model_id == "B1_OneFactor"])`.
+The correlated Core--Peripheral model had CFI =
+`r sprintf("%.3f", model_fit$cfi[model_fit$model_id == "B2_CorePeripheral"])`,
+TLI = `r sprintf("%.3f", model_fit$tli[model_fit$model_id == "B2_CorePeripheral"])`,
+RMSEA = `r sprintf("%.3f", model_fit$rmsea[model_fit$model_id == "B2_CorePeripheral"])`,
+and SRMR = `r sprintf("%.3f", model_fit$srmr[model_fit$model_id == "B2_CorePeripheral"])`.
+Its standardized Core--Peripheral correlation was
+`r sprintf("%.3f", factor_correlations$correlation)` (95% CI
+[`r sprintf("%.3f", factor_correlations$ci_lower)`,
+`r sprintf("%.3f", factor_correlations$ci_upper)`]).
+
+The two-factor model improves all four reported fit indices relative to the
+one-factor model, but its absolute fit remains poor by conventional descriptive
+guides. The better relative fit does not establish that the two-factor model fits adequately. This supplementary baseline analysis does not determine the EMA measurement structure. No post-hoc residual correlation or cross-loading was
+added after observing the fit.

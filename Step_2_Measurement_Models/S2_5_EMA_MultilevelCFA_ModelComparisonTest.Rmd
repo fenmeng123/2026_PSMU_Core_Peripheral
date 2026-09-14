@@ -1,0 +1,1650 @@
+---
+title: "S2.5 EMA multilevel CFA with revised sequential model order"
+author: "Kunru Song"
+date: "2026-08-25 16:03:42 +08:00"
+params:
+  use_saved_results: false
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+<!-- Author: Kunru Song -->
+
+Existing RDA object identifiers are retained for compatibility. Mplus folders,
+run-file prefixes, reports, tables and figures use the current analysis numbering.
+
+# Purpose and model sequence
+
+This repository-only diagnostic compares the effect of a common residual
+constraint on three nested two-level CFA models. The final constrained sequence
+reported in the manuscript is presented in S2.6. The comparisons below examine the effect of the constraint:
+
+1. **Model 1 (1W1B):** one general factor within persons and one general factor
+   between persons;
+2. **Model 2 (1W2B):** one general factor within persons and correlated
+   Peripheral and Core factors between persons;
+3. **Model 3 (2W2B):** correlated Peripheral and Core factors at both levels,
+   corresponding to the unconstrained two-factor specification at both levels.
+
+All six EMA indicators are treated as continuous and estimated with MLR in
+Mplus 8.7. In the S2.5 constrained specification, the between-level residual variance of `P2` is fixed to zero in
+all three models. The script also refits the corresponding unconstrained
+models as a reproducible before-constraint reference. It therefore reports
+changes in the principal fit indices, every STDYX factor loading, and the two
+sequential Satorra--Bentler scaled likelihood-ratio tests. The tests retain the
+order Model 2 versus Model 1 and Model 3 versus Model 2. The calculation follows the official
+[Mplus guidance](https://www.statmodel.com/chidiff.shtml); ordinary subtraction
+of the reported MLR chi-square statistics is not used.
+
+<style>
+.table-scroll { overflow-x: auto; margin-bottom: 1.5em; }
+.table-scroll table { width: auto; min-width: 65%; }
+</style>
+
+```{r setup, include=FALSE}
+use_saved_results <- params$use_saved_results
+if (!is.logical(use_saved_results) || length(use_saved_results) != 1L ||
+    is.na(use_saved_results)) stop("use_saved_results must be TRUE or FALSE")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA
+)
+
+required_packages <- c(
+  "bruceR",
+  "dplyr",
+  "knitr",
+  "MplusAutomation",
+  "openxlsx",
+  "readxl",
+  "rmarkdown",
+  "tibble",
+  "zip",
+  "xml2"
+)
+package_available <- vapply(
+  required_packages,
+  requireNamespace,
+  logical(1),
+  quietly = TRUE
+)
+if (!all(package_available)) {
+  stop(
+    "Missing required R packages: ",
+    paste(names(package_available)[!package_available], collapse = ", ")
+  )
+}
+
+locate_project_root <- function(start = getwd()) {
+  candidate <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(candidate)) candidate <- dirname(candidate)
+  repeat {
+    if (all(dir.exists(file.path(candidate, c(
+      "Step_1_Descriptive_and_Reliability", "Step_2_Measurement_Models"
+    ))))) return(candidate)
+    parent <- dirname(candidate)
+    if (identical(parent, candidate)) break
+    candidate <- parent
+  }
+  stop("Could not identify the project root from the public Step folders")
+}
+
+input_context <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(
+  if (length(input_context) == 1L && !is.na(input_context) && nzchar(input_context)) {
+    input_context
+  } else getwd()
+)
+knitr::opts_knit$set(root.dir = project_root)
+
+input_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "dat_step2_measurement.rda"
+)
+result_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "fit_s2_9_multilevel_cfa_new_model_order.rda"
+)
+table_file <- file.path(
+  project_root,
+  "Res_3_Results",
+  "Table_S2_5_EMA_MultilevelCFA_ModelComparisonTest.xlsx"
+)
+table_export_file <- file.path(
+  "Res_3_Results",
+  "Table_S2_5_EMA_MultilevelCFA_ModelComparisonTest.xlsx"
+)
+mplus_directory <- file.path(
+  project_root,
+  "Step_2_Measurement_Models",
+  "mplus",
+  "s2_5"
+)
+mplus_candidates <- c(
+  Sys.getenv("MPLUS_COMMAND", unset = ""),
+  "D:/Program Files/Mplus/Mplus.exe"
+)
+mplus_candidates <- unique(mplus_candidates[nzchar(mplus_candidates)])
+mplus_hits <- mplus_candidates[file.exists(mplus_candidates)]
+if (!use_saved_results && !length(mplus_hits)) {
+  stop(
+    "Could not find Mplus. Set the MPLUS_COMMAND environment variable to ",
+    "the local Mplus 8.7 executable."
+  )
+}
+mplus_command <- if (length(mplus_hits)) mplus_hits[[1L]] else NA_character_
+
+if (!use_saved_results) {
+stopifnot(
+  file.exists(input_file),
+  file.exists(mplus_command)
+)
+dir.create(mplus_directory, recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(table_file), recursive = TRUE, showWarnings = FALSE)
+}
+
+public_diagnostics <- function(x) {
+  columns <- c("condition", "model_id", "normal_termination", "errors_n",
+    "warnings_n", "minimum_stdyx_residual_variance",
+    "minimum_unstandardized_residual_variance", "negative_variance_flag",
+    "theta_warning")
+  stopifnot(is.data.frame(x), all(columns %in% names(x)))
+  x[, columns, drop = FALSE]
+}
+read_saved_report <- function(path, input_path) {
+  local_scope <- new.env(parent = emptyenv())
+  loaded <- load(path, envir = local_scope)
+  stopifnot(identical(loaded, "fit_s2_9_multilevel_cfa_new_model_order"))
+  x <- local_scope[[loaded]]
+  ids <- c("M1_1W1B", "M2_1W2B", "M3_2W2B")
+  stopifnot(is.list(x), isTRUE(x$metadata$s2_9_passed),
+    identical(x$metadata$input_md5, unname(tools::md5sum(input_path))),
+    identical(x$metadata$mplus_version, "8.7"),
+    identical(x$metadata$estimator, "MLR"),
+    identical(x$metadata$analysis_type, "TWOLEVEL"),
+    identical(as.character(x$model_plan$model_id), ids),
+    identical(as.character(x$fit_change$model_id), ids),
+    identical(names(x$loading_change), ids),
+    identical(as.character(x$sequential_test_change$comparison),
+      c("Model 2 vs Model 1", "Model 3 vs Model 2")),
+    nrow(x$sample_audit) == 1L, ncol(x$sample_audit) == 8L,
+    x$sample_audit$scheduled_rows == 18810L,
+    x$sample_audit$participants == 209L,
+    x$sample_audit$outcome_informative_rows == 17759L,
+    nrow(x$variable_map) == 6L, ncol(x$variable_map) == 4L,
+    nrow(x$model_plan) == 3L, ncol(x$model_plan) == 10L,
+    nrow(x$fit_change) == 3L, ncol(x$fit_change) == 39L,
+    nrow(x$sequential_test_change) == 2L,
+    ncol(x$sequential_test_change) == 13L,
+    all(vapply(x$loading_change, nrow, integer(1)) == 12L),
+    all(vapply(x$loading_change, ncol, integer(1)) == 13L))
+  for (fit in list(x$reference_model_fit, x$model_fit)) {
+    stopifnot(nrow(fit) == 3L, identical(as.character(fit$model_id), ids),
+      all(fit$normal_termination), all(fit$mplus_version == "8.7"),
+      all(fit$estimator == "MLR"), all(fit$observations == 17759L),
+      all(fit$clusters == 209L))
+  }
+  diagnostic <- dplyr::bind_rows(public_diagnostics(x$reference_diagnostics),
+    public_diagnostics(x$diagnostics))
+  stopifnot(nrow(diagnostic) == 6L, all(diagnostic$normal_termination),
+    all(diagnostic$errors_n == 0L),
+    all(is.finite(diagnostic$warnings_n)), all(diagnostic$warnings_n >= 0L),
+    !anyNA(diagnostic$negative_variance_flag), !anyNA(diagnostic$theta_warning),
+    identical(as.character(diagnostic$model_id), rep(ids, 2L)),
+    identical(as.character(diagnostic$condition), rep(c("Before P2@0", "After P2@0"), each = 3L)))
+  # Only aggregate display objects leave this function; parsed models, raw
+  # warnings, identifiers, Mplus paths and provenance environments stay private.
+  list(sample_audit = x$sample_audit, variable_map = x$variable_map,
+    model_plan = x$model_plan, fit_change = x$fit_change,
+    sequential_test_change = x$sequential_test_change,
+    loading_change = x$loading_change, diagnostics = diagnostic)
+}
+report_table <- function(x, digits = 4L) {
+  cat('<div class="table-scroll">\n')
+  print(knitr::kable(x, format = "html", digits = digits, row.names = FALSE))
+  cat('</div>\n\n')
+}
+```
+
+```{r load-saved-results, include=FALSE, eval=use_saved_results}
+saved_results <- read_saved_report(result_file, input_file)
+```
+
+```{r saved-mode-note, echo=FALSE, results='asis', eval=use_saved_results}
+cat("This report displays accepted, saved results. No model was rerun. The date above is the original analysis date.\n\n")
+```
+
+# Load and validate the S2.1 measurement data
+
+```{r load-and-validate-input, eval=!use_saved_results}
+input_environment <- new.env(parent = emptyenv())
+loaded_objects <- load(input_file, envir = input_environment)
+stopifnot(identical(loaded_objects, "dat_step2_measurement"))
+
+dat_step2_measurement <- input_environment$dat_step2_measurement
+dat_ema_cfa <- as.data.frame(dat_step2_measurement$ema)
+ema_items <- paste0("PMU", 1:6)
+required_columns <- c("Name_ID", "Day", "Time", ema_items)
+stopifnot(all(required_columns %in% names(dat_ema_cfa)))
+
+observed_item_count <- rowSums(!is.na(dat_ema_cfa[ema_items]))
+sample_audit <- data.frame(
+  scheduled_rows = nrow(dat_ema_cfa),
+  participants = dplyr::n_distinct(dat_ema_cfa$Name_ID),
+  days = dplyr::n_distinct(dat_ema_cfa$Day),
+  duplicate_prompt_keys = sum(duplicated(
+    dat_ema_cfa[c("Name_ID", "Day", "Time")]
+  )),
+  complete_six_item_rows = sum(observed_item_count == 6L),
+  partially_observed_rows = sum(observed_item_count > 0L & observed_item_count < 6L),
+  all_six_missing_rows = sum(observed_item_count == 0L),
+  outcome_informative_rows = sum(observed_item_count > 0L),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  sample_audit$scheduled_rows == 18810L,
+  sample_audit$participants == 209L,
+  sample_audit$days == 30L,
+  sample_audit$duplicate_prompt_keys == 0L,
+  sample_audit$complete_six_item_rows == 17758L,
+  sample_audit$partially_observed_rows == 1L,
+  sample_audit$all_six_missing_rows == 1051L,
+  sample_audit$outcome_informative_rows == 17759L,
+  all(vapply(dat_ema_cfa[required_columns], is.numeric, logical(1))),
+  all(vapply(dat_ema_cfa[ema_items], function(x) {
+    all(is.na(x) | x %in% 1:5)
+  }, logical(1)))
+)
+
+```
+
+```{r sample-table, echo=FALSE, results='asis'}
+report_table(if (use_saved_results) saved_results$sample_audit else sample_audit)
+```
+
+# Prepare the reversible Mplus data map
+
+```{r prepare-mplus-data, eval=!use_saved_results}
+mplus_item_names <- paste0("p", 1:6)
+variable_map <- data.frame(
+  item_number = 1:6,
+  project_variable = ema_items,
+  mplus_variable = toupper(mplus_item_names),
+  theoretical_group = c(rep("Peripheral", 2L), rep("Core", 4L)),
+  stringsAsFactors = FALSE
+)
+
+mplus_data <- data.frame(
+  cluster = as.numeric(dat_ema_cfa$Name_ID),
+  dat_ema_cfa[ema_items],
+  check.names = FALSE
+)
+names(mplus_data) <- c("cluster", mplus_item_names)
+
+stopifnot(
+  nrow(mplus_data) == 18810L,
+  dplyr::n_distinct(mplus_data$cluster) == 209L,
+  identical(names(mplus_data), c("cluster", mplus_item_names))
+)
+
+```
+
+```{r variable-map-table, echo=FALSE, results='asis'}
+report_table(if (use_saved_results) saved_results$variable_map else variable_map)
+```
+
+# Define the revised three-model sequence and the before-constraint reference
+
+`FW`, `PW`, and `CW` denote within-person general, Peripheral, and Core
+factors; `FB`, `PB`, and `CB` denote the corresponding between-person factors.
+
+```{r model-specifications, eval=!use_saved_results}
+reference_model_specs <- list(
+  M1_1W1B = list(
+    order = 1L,
+    label = "Model 1: 1W1B",
+    stem = "s2_5_m1_1w1b",
+    title = "S2.5 Model 1 before P2 residual constraint;",
+    within_structure = "General PSMU",
+    between_structure = "General PSMU",
+    model = paste(
+      "%WITHIN%",
+      "fw BY p1-p6;",
+      "%BETWEEN%",
+      "fb BY p1-p6;",
+      sep = "\n"
+    )
+  ),
+  M2_1W2B = list(
+    order = 2L,
+    label = "Model 2: 1W2B",
+    stem = "s2_5_m2_1w2b",
+    title = "S2.5 Model 2 before P2 residual constraint;",
+    within_structure = "General PSMU",
+    between_structure = "Peripheral + Core",
+    model = paste(
+      "%WITHIN%",
+      "fw BY p1-p6;",
+      "%BETWEEN%",
+      "pb BY p1-p2;",
+      "cb BY p3-p6;",
+      "pb WITH cb;",
+      sep = "\n"
+    )
+  ),
+  M3_2W2B = list(
+    order = 3L,
+    label = "Model 3: 2W2B (original M3a)",
+    stem = "s2_5_m3_2w2b",
+    title = "S2.5 Model 3 before P2 residual constraint;",
+    within_structure = "Peripheral + Core",
+    between_structure = "Peripheral + Core",
+    model = paste(
+      "%WITHIN%",
+      "pw BY p1-p2;",
+      "cw BY p3-p6;",
+      "pw WITH cw;",
+      "%BETWEEN%",
+      "pb BY p1-p2;",
+      "cb BY p3-p6;",
+      "pb WITH cb;",
+      sep = "\n"
+    )
+  )
+)
+
+model_specs <- list(
+  M1_1W1B = list(
+    order = 1L,
+    label = "Model 1: 1W1B with P2@0",
+    stem = "s2_5_m1_1w1b_p2_between_residual0",
+    title = "S2.5 Model 1 with between-level P2 residual fixed to zero;",
+    within_structure = "General PSMU",
+    between_structure = "General PSMU",
+    model = paste(
+      "%WITHIN%",
+      "fw BY p1-p6;",
+      "%BETWEEN%",
+      "fb BY p1-p6;",
+      "p2@0;",
+      sep = "\n"
+    )
+  ),
+  M2_1W2B = list(
+    order = 2L,
+    label = "Model 2: 1W2B with P2@0",
+    stem = "s2_5_m2_1w2b_p2_between_residual0",
+    title = "S2.5 Model 2 with between-level P2 residual fixed to zero;",
+    within_structure = "General PSMU",
+    between_structure = "Peripheral + Core",
+    model = paste(
+      "%WITHIN%",
+      "fw BY p1-p6;",
+      "%BETWEEN%",
+      "pb BY p1-p2;",
+      "cb BY p3-p6;",
+      "pb WITH cb;",
+      "p2@0;",
+      sep = "\n"
+    )
+  ),
+  M3_2W2B = list(
+    order = 3L,
+    label = "Model 3: 2W2B with P2@0",
+    stem = "s2_5_m3_2w2b_p2_between_residual0",
+    title = "S2.5 Model 3 with between-level P2 residual fixed to zero;",
+    within_structure = "Peripheral + Core",
+    between_structure = "Peripheral + Core",
+    model = paste(
+      "%WITHIN%",
+      "pw BY p1-p2;",
+      "cw BY p3-p6;",
+      "pw WITH cw;",
+      "%BETWEEN%",
+      "pb BY p1-p2;",
+      "cb BY p3-p6;",
+      "pb WITH cb;",
+      "p2@0;",
+      sep = "\n"
+    )
+  )
+)
+
+model_plan <- dplyr::bind_rows(lapply(names(model_specs), function(model_id) {
+  specification <- model_specs[[model_id]]
+  data.frame(
+    model_order = specification$order,
+    model_id = model_id,
+    model = specification$label,
+    within_structure = specification$within_structure,
+    between_structure = specification$between_structure,
+    between_p2_residual_variance = "Fixed to zero",
+    estimator = "MLR",
+    indicator_treatment = "Continuous (1-5)",
+    missing_method = "Mplus default FIML under MLR",
+    mplus_input = paste0(specification$stem, ".inp"),
+    stringsAsFactors = FALSE
+  )
+}))
+
+```
+
+```{r model-plan-table, echo=FALSE, results='asis'}
+report_table(if (use_saved_results) saved_results$model_plan else model_plan)
+```
+
+# Fit the three P2@0 models and their before-constraint references in Mplus 8.7
+
+```{r fit-mplus-models, eval=!use_saved_results}
+flatten_messages <- function(x) {
+  if (!length(x)) return(NA_character_)
+  values <- trimws(as.character(unlist(x, recursive = TRUE, use.names = FALSE)))
+  values <- values[nzchar(values)]
+  if (!length(values)) NA_character_ else paste(unique(values), collapse = " | ")
+}
+
+run_mplus_model <- function(
+  model_id,
+  specification,
+  condition,
+  require_p2_between_residual_zero
+) {
+  model_stem <- specification$stem
+  data_path <- file.path(mplus_directory, paste0(model_stem, ".dat"))
+  input_path <- file.path(mplus_directory, paste0(model_stem, ".inp"))
+  output_path <- file.path(mplus_directory, paste0(model_stem, ".out"))
+
+  mplus_object <- MplusAutomation::mplusObject(
+    TITLE = paste(
+      "! Author: Kunru Song",
+      "! Missing values are declared as . and handled by default MLR FIML.",
+      specification$title,
+      sep = "\n"
+    ),
+    VARIABLE = "CLUSTER = cluster;",
+    ANALYSIS = paste(
+      "TYPE = TWOLEVEL;",
+      "ESTIMATOR = MLR;",
+      sep = "\n"
+    ),
+    MODEL = specification$model,
+    OUTPUT = paste(
+      "SAMPSTAT;",
+      "STANDARDIZED(STDYX);",
+      "CINTERVAL;",
+      "RESIDUAL;",
+      "TECH1;",
+      "TECH4;",
+      sep = "\n"
+    ),
+    usevariables = c("cluster", mplus_item_names),
+    rdata = mplus_data,
+    autov = FALSE,
+    quiet = TRUE
+  )
+
+  MplusAutomation::mplusModeler(
+    object = mplus_object,
+    dataout = data_path,
+    modelout = input_path,
+    run = 1L,
+    check = FALSE,
+    varwarnings = TRUE,
+    Mplus_command = mplus_command,
+    writeData = "always",
+    hashfilename = FALSE,
+    killOnFail = TRUE,
+    quiet = TRUE
+  )
+
+  stopifnot(file.exists(input_path), file.exists(output_path))
+  input_lines <- readLines(input_path, warn = FALSE)
+  output_lines <- readLines(output_path, warn = FALSE)
+  p2_zero_count <- sum(grepl(
+    "^\\s*p2\\s*@\\s*0\\s*;\\s*$",
+    input_lines,
+    ignore.case = TRUE,
+    perl = TRUE
+  ))
+  other_indicator_zero_count <- sum(grepl(
+    "^\\s*p(1|3|4|5|6)\\s*@\\s*0\\s*;\\s*$",
+    input_lines,
+    ignore.case = TRUE,
+    perl = TRUE
+  ))
+  input_checks <- list(
+    author_present = any(trimws(input_lines) == "! Author: Kunru Song"),
+    missing_declared = any(grepl(
+      "MISSING\\s*=\\s*\\.;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    mlr_declared = any(grepl(
+      "ESTIMATOR\\s*=\\s*MLR;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    twolevel_declared = any(grepl(
+      "TYPE\\s*=\\s*TWOLEVEL;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    cluster_declared = any(grepl(
+      "CLUSTER\\s*=\\s*cluster;", input_lines, ignore.case = TRUE, perl = TRUE
+    )),
+    categorical_absent = !any(grepl(
+      "CATEGORICAL", input_lines, ignore.case = TRUE, fixed = TRUE
+    )),
+    p2_between_residual_constraint_matches_condition = if (
+      require_p2_between_residual_zero
+    ) p2_zero_count == 1L else p2_zero_count == 0L,
+    no_other_indicator_residual_zero_constraint = other_indicator_zero_count == 0L
+  )
+  stopifnot(all(unlist(input_checks, use.names = FALSE)))
+
+  normal_termination <- any(grepl(
+    "THE MODEL ESTIMATION TERMINATED NORMALLY",
+    output_lines,
+    fixed = TRUE
+  ))
+  parsed <- MplusAutomation::readModels(
+    target = output_path,
+    what = "all",
+    quiet = TRUE
+  )
+
+  list(
+    model_id = model_id,
+    model_label = specification$label,
+    model_order = specification$order,
+    condition = condition,
+    specification = specification,
+    model_syntax = specification$model,
+    paths = list(data = data_path, input = input_path, output = output_path),
+    input_checks = input_checks,
+    normal_termination = normal_termination,
+    parsed = parsed
+  )
+}
+
+reference_model_runs <- lapply(names(reference_model_specs), function(model_id) {
+  run_mplus_model(
+    model_id,
+    reference_model_specs[[model_id]],
+    condition = "Before P2@0",
+    require_p2_between_residual_zero = FALSE
+  )
+})
+names(reference_model_runs) <- names(reference_model_specs)
+
+model_runs <- lapply(names(model_specs), function(model_id) {
+  run_mplus_model(
+    model_id,
+    model_specs[[model_id]],
+    condition = "After P2@0",
+    require_p2_between_residual_zero = TRUE
+  )
+})
+names(model_runs) <- names(model_specs)
+
+all_model_runs <- c(reference_model_runs, model_runs)
+if (!all(vapply(all_model_runs, `[[`, logical(1), "normal_termination"))) {
+  stop("At least one S2.5 before/after Mplus model did not terminate normally.")
+}
+```
+
+# Extract complete model-fit information
+
+```{r extract-model-fit, eval=!use_saved_results}
+summary_value <- function(summary_row, candidates, type = c("numeric", "character")) {
+  type <- match.arg(type)
+  available <- candidates[candidates %in% names(summary_row)]
+  if (!length(available)) {
+    return(if (type == "numeric") NA_real_ else NA_character_)
+  }
+  value <- summary_row[[available[1L]]][1L]
+  if (type == "numeric") as.numeric(value) else as.character(value)
+}
+
+mplus_numeric <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+parse_output_integer <- function(path, pattern) {
+  lines <- readLines(path, warn = FALSE)
+  hit <- grep(pattern, lines, ignore.case = TRUE, value = TRUE, perl = TRUE)
+  if (!length(hit)) return(NA_integer_)
+  digits <- sub(".*?([0-9]+)\\s*$", "\\1", hit[1L], perl = TRUE)
+  suppressWarnings(as.integer(digits))
+}
+
+extract_model_fit <- function(run) {
+  summary_row <- run$parsed$summaries[1, , drop = FALSE]
+  specification <- run$specification
+  data.frame(
+    condition = run$condition,
+    model_order = run$model_order,
+    model_id = run$model_id,
+    model = run$model_label,
+    within_structure = specification$within_structure,
+    between_structure = specification$between_structure,
+    mplus_version = summary_value(summary_row, "Mplus.version", "character"),
+    estimator = summary_value(summary_row, "Estimator", "character"),
+    analysis_type = summary_value(summary_row, "AnalysisType", "character"),
+    observations = summary_value(summary_row, "Observations", "numeric"),
+    clusters = parse_output_integer(run$paths$output, "Number of clusters"),
+    free_parameters = summary_value(summary_row, "Parameters", "numeric"),
+    scaled_chi_square = summary_value(summary_row, "ChiSqM_Value", "numeric"),
+    df = summary_value(summary_row, "ChiSqM_DF", "numeric"),
+    chi_square_p = summary_value(summary_row, "ChiSqM_PValue", "numeric"),
+    robust_scaling_correction = summary_value(
+      summary_row, "ChiSqM_ScalingCorrection", "numeric"
+    ),
+    cfi = summary_value(summary_row, "CFI", "numeric"),
+    tli = summary_value(summary_row, "TLI", "numeric"),
+    rmsea = summary_value(summary_row, "RMSEA_Estimate", "numeric"),
+    srmr_within = summary_value(
+      summary_row,
+      c("SRMR.Within", "SRMR_Within", "SRMR_W", "SRMRWithin"),
+      "numeric"
+    ),
+    srmr_between = summary_value(
+      summary_row,
+      c("SRMR.Between", "SRMR_Between", "SRMR_B", "SRMRBetween"),
+      "numeric"
+    ),
+    loglikelihood = summary_value(summary_row, "LL", "numeric"),
+    aic = summary_value(summary_row, "AIC", "numeric"),
+    bic = summary_value(summary_row, "BIC", "numeric"),
+    adjusted_bic = summary_value(summary_row, "aBIC", "numeric"),
+    normal_termination = run$normal_termination,
+    warnings = flatten_messages(run$parsed$warnings),
+    errors = flatten_messages(run$parsed$errors),
+    stringsAsFactors = FALSE
+  )
+}
+
+reference_model_fit <- dplyr::bind_rows(lapply(reference_model_runs, extract_model_fit)) |>
+  dplyr::arrange(model_order) |>
+  dplyr::mutate(
+    delta_cfi = c(NA_real_, diff(cfi)),
+    delta_tli = c(NA_real_, diff(tli)),
+    delta_rmsea = c(NA_real_, diff(rmsea)),
+    delta_srmr_within = c(NA_real_, diff(srmr_within)),
+    delta_srmr_between = c(NA_real_, diff(srmr_between))
+  )
+
+model_fit <- dplyr::bind_rows(lapply(model_runs, extract_model_fit)) |>
+  dplyr::arrange(model_order) |>
+  dplyr::mutate(
+    delta_cfi = c(NA_real_, diff(cfi)),
+    delta_tli = c(NA_real_, diff(tli)),
+    delta_rmsea = c(NA_real_, diff(rmsea)),
+    delta_srmr_within = c(NA_real_, diff(srmr_within)),
+    delta_srmr_between = c(NA_real_, diff(srmr_between))
+  )
+
+if (!all(c(reference_model_fit$mplus_version, model_fit$mplus_version) == "8.7")) {
+  stop(
+    "S2.5 is authorized for local Mplus 8.7, but the selected executable reported ",
+    paste(unique(c(reference_model_fit$mplus_version, model_fit$mplus_version)), collapse = ", "),
+    ": ", mplus_command,
+    ". Set MPLUS_COMMAND to the Mplus 8.7 executable and rerun."
+  )
+}
+
+stopifnot(
+  nrow(reference_model_fit) == 3L,
+  nrow(model_fit) == 3L,
+  all(reference_model_fit$normal_termination),
+  all(model_fit$normal_termination),
+  all(reference_model_fit$estimator == "MLR"),
+  all(model_fit$estimator == "MLR"),
+  all(reference_model_fit$observations == 17759L),
+  all(model_fit$observations == 17759L),
+  all(reference_model_fit$clusters == 209L),
+  all(model_fit$clusters == 209L),
+  all(is.finite(reference_model_fit$scaled_chi_square)),
+  all(is.finite(model_fit$scaled_chi_square)),
+  all(is.finite(reference_model_fit$robust_scaling_correction)),
+  all(is.finite(model_fit$robust_scaling_correction)),
+  all(reference_model_fit$robust_scaling_correction > 0),
+  all(model_fit$robust_scaling_correction > 0)
+)
+
+principal_fit_metrics <- c(
+  "scaled_chi_square", "df", "robust_scaling_correction", "cfi", "tli",
+  "rmsea", "srmr_within", "srmr_between", "loglikelihood", "aic", "bic",
+  "adjusted_bic"
+)
+
+fit_change <- reference_model_fit |>
+  dplyr::select(model_order, model_id, model, dplyr::all_of(principal_fit_metrics)) |>
+  dplyr::rename_with(~ paste0(.x, "_before"), dplyr::all_of(principal_fit_metrics)) |>
+  dplyr::left_join(
+    model_fit |>
+      dplyr::select(model_id, dplyr::all_of(principal_fit_metrics)) |>
+      dplyr::rename_with(~ paste0(.x, "_after"), dplyr::all_of(principal_fit_metrics)),
+    by = "model_id"
+  )
+
+for (metric in principal_fit_metrics) {
+  fit_change[[paste0(metric, "_change")]] <-
+    fit_change[[paste0(metric, "_after")]] -
+    fit_change[[paste0(metric, "_before")]]
+}
+
+```
+
+```{r fit-change-tables, echo=FALSE, results='asis'}
+display_fit <- if (use_saved_results) saved_results$fit_change else fit_change
+display_metrics <- sub("_before$", "", grep("_before$", names(display_fit), value = TRUE))
+for (i in seq_len(nrow(display_fit))) {
+  cat("\n\n## ", display_fit$model_id[i], "\n\n", sep = "")
+  report_table(data.frame(
+    Metric = display_metrics,
+    Before = vapply(display_metrics, function(m) display_fit[[paste0(m, "_before")]][i], numeric(1)),
+    After = vapply(display_metrics, function(m) display_fit[[paste0(m, "_after")]][i], numeric(1)),
+    Change = vapply(display_metrics, function(m) display_fit[[paste0(m, "_change")]][i], numeric(1))
+  ))
+}
+```
+
+# Sequential Satorra--Bentler scaled likelihood-ratio tests
+
+For the more restrictive model 0 and less restrictive model 1, the official
+MLR calculation is
+
+\[
+c_d = \frac{d_0c_0-d_1c_1}{d_0-d_1}, \qquad
+T_{Rd} = \frac{T_0c_0-T_1c_1}{c_d}.
+\]
+
+Here, \(T\), \(d\), and \(c\) are the Mplus-reported scaled chi-square,
+degrees of freedom, and scaling correction factor, respectively.
+
+```{r sequential-scaled-tests, eval=!use_saved_results}
+get_fit_row <- function(fit_table, model_id) {
+  row <- fit_table[fit_table$model_id == model_id, , drop = FALSE]
+  if (nrow(row) != 1L) stop("Could not find a unique fit row for ", model_id)
+  row
+}
+
+scaled_mlr_difference <- function(
+  fit_table,
+  condition,
+  order,
+  comparison,
+  h0_id,
+  h1_id,
+  tested_split
+) {
+  h0 <- get_fit_row(fit_table, h0_id)
+  h1 <- get_fit_row(fit_table, h1_id)
+  difference_df <- h0$df - h1$df
+  if (!is.finite(difference_df) || difference_df <= 0) {
+    stop("Invalid nested-model degrees-of-freedom difference for ", comparison)
+  }
+  difference_scaling_correction <- (
+    h0$df * h0$robust_scaling_correction -
+      h1$df * h1$robust_scaling_correction
+  ) / difference_df
+  scaled_difference_chi_square <- (
+    h0$scaled_chi_square * h0$robust_scaling_correction -
+      h1$scaled_chi_square * h1$robust_scaling_correction
+  ) / difference_scaling_correction
+  difference_p <- stats::pchisq(
+    scaled_difference_chi_square,
+    df = difference_df,
+    lower.tail = FALSE
+  )
+
+  data.frame(
+    condition = condition,
+    comparison_order = order,
+    comparison = comparison,
+    tested_split = tested_split,
+    more_restrictive_h0 = h0_id,
+    less_restrictive_h1 = h1_id,
+    h0_scaled_chi_square = h0$scaled_chi_square,
+    h0_df = h0$df,
+    h0_scaling_correction = h0$robust_scaling_correction,
+    h1_scaled_chi_square = h1$scaled_chi_square,
+    h1_df = h1$df,
+    h1_scaling_correction = h1$robust_scaling_correction,
+    difference_scaling_correction = difference_scaling_correction,
+    scaled_difference_chi_square = scaled_difference_chi_square,
+    difference_df = difference_df,
+    difference_p = difference_p,
+    conclusion = ifelse(
+      difference_p < .05,
+      paste0(h1_id, " fits significantly better than ", h0_id),
+      paste0(h1_id, " does not fit significantly better than ", h0_id)
+    ),
+    stringsAsFactors = FALSE
+  )
+}
+
+build_sequential_tests <- function(fit_table, condition) dplyr::bind_rows(
+  scaled_mlr_difference(
+    fit_table = fit_table,
+    condition = condition,
+    order = 1L,
+    comparison = "Model 2 vs Model 1",
+    h0_id = "M1_1W1B",
+    h1_id = "M2_1W2B",
+    tested_split = "Between-person General factor versus Peripheral + Core"
+  ),
+  scaled_mlr_difference(
+    fit_table = fit_table,
+    condition = condition,
+    order = 2L,
+    comparison = "Model 3 vs Model 2",
+    h0_id = "M2_1W2B",
+    h1_id = "M3_2W2B",
+    tested_split = "Within-person General factor versus Peripheral + Core"
+  )
+)
+
+reference_sequential_tests <- build_sequential_tests(
+  reference_model_fit,
+  "Before P2@0"
+)
+sequential_tests <- build_sequential_tests(model_fit, "After P2@0")
+
+stopifnot(
+  nrow(reference_sequential_tests) == 2L,
+  nrow(sequential_tests) == 2L,
+  all(reference_sequential_tests$difference_df > 0),
+  all(sequential_tests$difference_df > 0),
+  all(reference_sequential_tests$difference_scaling_correction > 0),
+  all(sequential_tests$difference_scaling_correction > 0),
+  all(reference_sequential_tests$scaled_difference_chi_square >= 0),
+  all(sequential_tests$scaled_difference_chi_square >= 0),
+  all(reference_sequential_tests$difference_p >= 0 &
+        reference_sequential_tests$difference_p <= 1),
+  all(sequential_tests$difference_p >= 0 & sequential_tests$difference_p <= 1)
+)
+
+sequential_test_change <- reference_sequential_tests |>
+  dplyr::select(
+    comparison_order, comparison, tested_split,
+    difference_scaling_correction_before = difference_scaling_correction,
+    scaled_difference_chi_square_before = scaled_difference_chi_square,
+    difference_df_before = difference_df,
+    difference_p_before = difference_p
+  ) |>
+  dplyr::left_join(
+    sequential_tests |>
+      dplyr::select(
+        comparison,
+        difference_scaling_correction_after = difference_scaling_correction,
+        scaled_difference_chi_square_after = scaled_difference_chi_square,
+        difference_df_after = difference_df,
+        difference_p_after = difference_p
+      ),
+    by = "comparison"
+  ) |>
+  dplyr::mutate(
+    scaled_difference_chi_square_change =
+      scaled_difference_chi_square_after - scaled_difference_chi_square_before,
+    difference_p_change = difference_p_after - difference_p_before
+  )
+
+```
+
+```{r sequential-test-table, echo=FALSE, results='asis'}
+report_table(if (use_saved_results) saved_results$sequential_test_change else sequential_test_change)
+```
+
+# Extract complete STDYX results for each model
+
+```{r extract-stdyx, eval=!use_saved_results}
+factor_labels <- c(
+  FW = "Within General PSMU",
+  PW = "Within Peripheral",
+  CW = "Within Core",
+  FB = "Between General PSMU",
+  PB = "Between Peripheral",
+  CB = "Between Core"
+)
+item_labels <- setNames(ema_items, toupper(mplus_item_names))
+
+label_parameter <- function(x) {
+  x <- as.character(x)
+  factor_hit <- x %in% names(factor_labels)
+  item_hit <- x %in% names(item_labels)
+  x[factor_hit] <- unname(factor_labels[x[factor_hit]])
+  x[item_hit] <- unname(item_labels[x[item_hit]])
+  x
+}
+
+extract_stdyx <- function(run) {
+  standard <- run$parsed$parameters$stdyx.standardized |>
+    dplyr::mutate(dplyr::across(
+      dplyr::any_of(c("est", "se", "est_se", "pval")),
+      mplus_numeric
+    ))
+  standard_ci <- run$parsed$parameters$ci.stdyx.standardized |>
+    dplyr::mutate(dplyr::across(
+      dplyr::any_of(c("low2.5", "up2.5")),
+      mplus_numeric
+    )) |>
+    dplyr::select(
+      paramHeader,
+      param,
+      BetweenWithin,
+      ci_lower = low2.5,
+      ci_upper = up2.5
+    )
+
+  standard |>
+    dplyr::left_join(
+      standard_ci,
+      by = c("paramHeader", "param", "BetweenWithin")
+    ) |>
+    dplyr::mutate(
+      parameter_group = dplyr::case_when(
+        grepl("\\.BY$", paramHeader) ~ "Factor loading",
+        grepl("\\.WITH$", paramHeader) ~ "Factor covariance/correlation",
+        paramHeader == "Variances" ~ "Latent variance",
+        paramHeader == "Residual.Variances" ~ "Residual variance",
+        paramHeader == "Intercepts" ~ "Indicator intercept",
+        TRUE ~ paramHeader
+      ),
+      lhs_code = dplyr::case_when(
+        grepl("\\.(BY|WITH)$", paramHeader) ~ sub("\\.(BY|WITH)$", "", paramHeader),
+        TRUE ~ param
+      ),
+      operator = dplyr::case_when(
+        grepl("\\.BY$", paramHeader) ~ "BY",
+        grepl("\\.WITH$", paramHeader) ~ "WITH",
+        paramHeader == "Variances" ~ "VAR",
+        paramHeader == "Residual.Variances" ~ "RESIDUAL_VAR",
+        paramHeader == "Intercepts" ~ "INTERCEPT",
+        TRUE ~ paramHeader
+      ),
+      rhs_code = dplyr::case_when(
+        grepl("\\.(BY|WITH)$", paramHeader) ~ param,
+        TRUE ~ NA_character_
+      ),
+      lhs = label_parameter(lhs_code),
+      rhs = label_parameter(rhs_code),
+      fixed_or_not_tested = is.na(pval) | pval >= 900 | se == 0,
+      se_clean = ifelse(fixed_or_not_tested, NA_real_, se),
+      z_clean = ifelse(fixed_or_not_tested, NA_real_, est_se),
+      p_clean = ifelse(fixed_or_not_tested, NA_real_, pval),
+      ci_lower_clean = ifelse(abs(ci_lower) >= 998, NA_real_, ci_lower),
+      ci_upper_clean = ifelse(abs(ci_upper) >= 998, NA_real_, ci_upper)
+    ) |>
+    dplyr::transmute(
+      condition = run$condition,
+      model_order = run$model_order,
+      model_id = run$model_id,
+      model = run$model_label,
+      level = BetweenWithin,
+      parameter_group,
+      lhs,
+      operator,
+      rhs,
+      mplus_parameter_header = paramHeader,
+      mplus_parameter = param,
+      stdyx_estimate = est,
+      stdyx_se = se_clean,
+      stdyx_z = z_clean,
+      stdyx_p = p_clean,
+      ci_95_lower = ci_lower_clean,
+      ci_95_upper = ci_upper_clean,
+      fixed_or_not_tested
+    ) |>
+    dplyr::arrange(
+      factor(level, levels = c("Within", "Between")),
+      factor(parameter_group, levels = c(
+        "Factor loading",
+        "Factor covariance/correlation",
+        "Latent variance",
+        "Indicator intercept",
+        "Residual variance"
+      )),
+      lhs,
+      rhs
+    )
+}
+
+reference_stdyx_results <- lapply(reference_model_runs, extract_stdyx)
+names(reference_stdyx_results) <- names(reference_model_runs)
+stdyx_results <- lapply(model_runs, extract_stdyx)
+names(stdyx_results) <- names(model_runs)
+
+stopifnot(
+  length(reference_stdyx_results) == 3L,
+  length(stdyx_results) == 3L,
+  all(vapply(reference_stdyx_results, nrow, integer(1)) > 0L),
+  all(vapply(stdyx_results, nrow, integer(1)) > 0L),
+  all(vapply(reference_stdyx_results, function(x) {
+    all(is.finite(x$stdyx_estimate))
+  }, logical(1))),
+  all(vapply(stdyx_results, function(x) {
+    all(is.finite(x$stdyx_estimate))
+  }, logical(1)))
+)
+
+parameter_keys <- c(
+  "model_order", "model_id", "level", "parameter_group", "lhs", "operator",
+  "rhs", "mplus_parameter_header", "mplus_parameter"
+)
+comparison_metrics <- c(
+  "stdyx_estimate", "stdyx_se", "stdyx_z", "stdyx_p",
+  "ci_95_lower", "ci_95_upper", "fixed_or_not_tested"
+)
+
+build_stdyx_change <- function(model_id) {
+  before <- reference_stdyx_results[[model_id]] |>
+    dplyr::select(dplyr::all_of(parameter_keys), dplyr::all_of(comparison_metrics)) |>
+    dplyr::rename_with(~ paste0(.x, "_before"), dplyr::all_of(comparison_metrics))
+  after <- stdyx_results[[model_id]] |>
+    dplyr::select(dplyr::all_of(parameter_keys), dplyr::all_of(comparison_metrics)) |>
+    dplyr::rename_with(~ paste0(.x, "_after"), dplyr::all_of(comparison_metrics))
+
+  dplyr::full_join(before, after, by = parameter_keys) |>
+    dplyr::mutate(
+      stdyx_estimate_change = stdyx_estimate_after - stdyx_estimate_before,
+      model = model_specs[[.env$model_id]]$label,
+      .after = model_id
+    ) |>
+    dplyr::arrange(
+      factor(level, levels = c("Within", "Between")),
+      factor(parameter_group, levels = c(
+        "Factor loading", "Factor covariance/correlation", "Latent variance",
+        "Indicator intercept", "Residual variance"
+      )),
+      lhs,
+      rhs
+    )
+}
+
+stdyx_change <- lapply(names(model_specs), build_stdyx_change)
+names(stdyx_change) <- names(model_specs)
+loading_change <- lapply(stdyx_change, function(x) {
+  x |>
+    dplyr::filter(parameter_group == "Factor loading") |>
+    dplyr::select(
+      model_order, model_id, model, level, factor = lhs, item = rhs,
+      stdyx_loading_before = stdyx_estimate_before,
+      stdyx_loading_after = stdyx_estimate_after,
+      stdyx_loading_change = stdyx_estimate_change,
+      ci_95_lower_before, ci_95_upper_before,
+      ci_95_lower_after, ci_95_upper_after
+    )
+})
+
+stopifnot(
+  all(vapply(loading_change, nrow, integer(1)) == 12L),
+  all(vapply(loading_change, function(x) {
+    all(is.finite(x$stdyx_loading_before)) &&
+      all(is.finite(x$stdyx_loading_after)) &&
+      all(is.finite(x$stdyx_loading_change))
+  }, logical(1)))
+)
+
+```
+
+```{r loading-tables, echo=FALSE, results='asis'}
+display_loadings <- if (use_saved_results) saved_results$loading_change else loading_change
+for (model_id in names(display_loadings)) {
+  cat("\n\n## ", model_id, "\n\n", sep = "")
+  report_table(display_loadings[[model_id]])
+}
+```
+
+# Diagnostics
+
+The before-constraint diagnostics retain the prior negative-residual evidence.
+The revised primary models are expected to remove that issue by fixing the
+between-level `P2` residual variance to zero in every model.
+
+Raw warning text can contain participant-specific cluster lists and is omitted
+from this public display. Original warning/error counts, residual minima and
+admissibility flags remain visible. Normal termination is not evidence of
+acceptable fit or an admissible unconstrained solution.
+
+```{r diagnostics, eval=!use_saved_results}
+extract_diagnostics <- function(run) {
+  standard <- run$parsed$parameters$stdyx.standardized |>
+    dplyr::mutate(est = mplus_numeric(est))
+  residual_rows <- standard[
+    standard$paramHeader == "Residual.Variances",
+    ,
+    drop = FALSE
+  ]
+  unstandard <- run$parsed$parameters$unstandardized |>
+    dplyr::mutate(est = mplus_numeric(est))
+  residual_unstandardized <- unstandard[
+    unstandard$paramHeader == "Residual.Variances",
+    ,
+    drop = FALSE
+  ]
+  warnings_text <- flatten_messages(run$parsed$warnings)
+  errors_text <- flatten_messages(run$parsed$errors)
+
+  data.frame(
+    condition = run$condition,
+    model_id = run$model_id,
+    normal_termination = run$normal_termination,
+    errors_n = length(run$parsed$errors),
+    warnings_n = length(run$parsed$warnings),
+    errors = errors_text,
+    warnings = warnings_text,
+    minimum_stdyx_residual_variance = if (nrow(residual_rows)) {
+      min(residual_rows$est, na.rm = TRUE)
+    } else NA_real_,
+    minimum_unstandardized_residual_variance = if (nrow(residual_unstandardized)) {
+      min(residual_unstandardized$est, na.rm = TRUE)
+    } else NA_real_,
+    negative_variance_flag = if (nrow(residual_unstandardized)) {
+      any(residual_unstandardized$est < 0, na.rm = TRUE)
+    } else FALSE,
+    theta_warning = !is.na(warnings_text) && grepl(
+      "THETA.*NOT POSITIVE DEFINITE",
+      warnings_text,
+      ignore.case = TRUE
+    ),
+    stringsAsFactors = FALSE
+  )
+}
+
+reference_diagnostics <- dplyr::bind_rows(lapply(
+  reference_model_runs,
+  extract_diagnostics
+))
+diagnostics <- dplyr::bind_rows(lapply(model_runs, extract_diagnostics))
+stopifnot(
+  all(reference_diagnostics$normal_termination),
+  all(reference_diagnostics$errors_n == 0L),
+  all(diagnostics$normal_termination),
+  all(diagnostics$errors_n == 0L),
+  !any(diagnostics$negative_variance_flag),
+  !any(diagnostics$theta_warning)
+)
+```
+
+```{r diagnostics-table, echo=FALSE, results='asis'}
+report_table(if (use_saved_results) saved_results$diagnostics else
+  public_diagnostics(dplyr::bind_rows(reference_diagnostics, diagnostics)))
+```
+
+```{r export-workbook, include=FALSE, eval=!use_saved_results}
+round_numeric_columns <- function(data, digits = 4L) {
+  data |>
+    dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, digits))) |>
+    dplyr::mutate(dplyr::across(where(is.factor), as.character))
+}
+
+fit_metric_labels <- c(
+  scaled_chi_square = "Scaled chi-square",
+  df = "Degrees of freedom",
+  robust_scaling_correction = "MLR scaling correction",
+  cfi = "CFI",
+  tli = "TLI",
+  rmsea = "RMSEA",
+  srmr_within = "SRMR within",
+  srmr_between = "SRMR between",
+  loglikelihood = "Loglikelihood",
+  aic = "AIC",
+  bic = "BIC",
+  adjusted_bic = "Adjusted BIC"
+)
+
+fit_rows <- dplyr::bind_rows(lapply(names(fit_metric_labels), function(metric) {
+  data.frame(
+    section = "Model fit before versus after P2@0",
+    order = fit_change$model_order,
+    model_or_comparison = fit_change$model,
+    tested_split = NA_character_,
+    metric = unname(fit_metric_labels[[metric]]),
+    estimate_before = fit_change[[paste0(metric, "_before")]],
+    estimate_after = fit_change[[paste0(metric, "_after")]],
+    change = fit_change[[paste0(metric, "_change")]],
+    df_before = NA_real_,
+    df_after = NA_real_,
+    p_before = NA_real_,
+    p_after = NA_real_,
+    scaling_correction_before = NA_real_,
+    scaling_correction_after = NA_real_,
+    scaling_correction_change = NA_real_,
+    conclusion = "All before and after models terminated normally",
+    stringsAsFactors = FALSE
+  )
+}))
+
+comparison_rows <- sequential_test_change |>
+  dplyr::transmute(
+    section = "Sequential scaled MLR test before versus after P2@0",
+    order = comparison_order,
+    model_or_comparison = comparison,
+    tested_split,
+    metric = "Scaled MLR difference chi-square",
+    estimate_before = scaled_difference_chi_square_before,
+    estimate_after = scaled_difference_chi_square_after,
+    change = scaled_difference_chi_square_change,
+    df_before = difference_df_before,
+    df_after = difference_df_after,
+    p_before = difference_p_before,
+    p_after = difference_p_after,
+    scaling_correction_before = difference_scaling_correction_before,
+    scaling_correction_after = difference_scaling_correction_after,
+    scaling_correction_change =
+      difference_scaling_correction_after - difference_scaling_correction_before,
+    conclusion = ifelse(
+      difference_p_after < .05,
+      "After P2@0: less restrictive model fits significantly better",
+      "After P2@0: no significant improvement"
+    )
+  )
+
+fit_and_comparisons <- dplyr::bind_rows(fit_rows, comparison_rows) |>
+  dplyr::arrange(factor(section, levels = c(
+    "Model fit before versus after P2@0",
+    "Sequential scaled MLR test before versus after P2@0"
+  )), order, metric)
+
+workbook_sheets <- list(
+  Fit_and_Comparisons = round_numeric_columns(fit_and_comparisons),
+  Model1_STDYX = round_numeric_columns(stdyx_change$M1_1W1B),
+  Model2_STDYX = round_numeric_columns(stdyx_change$M2_1W2B),
+  Model3_STDYX = round_numeric_columns(stdyx_change$M3_2W2B)
+)
+
+bruceR::export(
+  workbook_sheets,
+  file = table_export_file,
+  overwrite = TRUE,
+  verbose = FALSE
+)
+
+workbook <- openxlsx::loadWorkbook(table_file)
+header_style <- openxlsx::createStyle(
+  fontName = "Arial",
+  fontSize = 10,
+  fontColour = "#FFFFFF",
+  fgFill = "#1F4E78",
+  textDecoration = "bold",
+  halign = "center",
+  valign = "center",
+  wrapText = TRUE,
+  border = "bottom",
+  borderColour = "#163A5C"
+)
+body_style <- openxlsx::createStyle(fontName = "Arial", fontSize = 9)
+decimal_style <- openxlsx::createStyle(numFmt = "0.0000")
+integer_style <- openxlsx::createStyle(numFmt = "0")
+comparison_style <- openxlsx::createStyle(fgFill = "#EAF2F8")
+
+for (sheet_name in names(workbook_sheets)) {
+  sheet_data <- workbook_sheets[[sheet_name]]
+  n_rows <- nrow(sheet_data)
+  n_columns <- ncol(sheet_data)
+  openxlsx::addStyle(
+    workbook,
+    sheet = sheet_name,
+    style = header_style,
+    rows = 1,
+    cols = seq_len(n_columns),
+    gridExpand = TRUE,
+    stack = TRUE
+  )
+  if (n_rows > 0L) {
+    openxlsx::addStyle(
+      workbook,
+      sheet = sheet_name,
+      style = body_style,
+      rows = 2:(n_rows + 1L),
+      cols = seq_len(n_columns),
+      gridExpand = TRUE,
+      stack = TRUE
+    )
+    numeric_columns <- which(vapply(sheet_data, is.numeric, logical(1)))
+    integer_columns <- which(names(sheet_data) %in% c(
+      "order", "observations", "clusters", "free_parameters", "df",
+      "difference_df", "model_order", "df_before", "df_after", "df_change",
+      "difference_df_before", "difference_df_after"
+    ))
+    decimal_columns <- setdiff(numeric_columns, integer_columns)
+    if (length(integer_columns)) {
+      openxlsx::addStyle(
+        workbook, sheet_name, integer_style,
+        rows = 2:(n_rows + 1L), cols = integer_columns,
+        gridExpand = TRUE, stack = TRUE
+      )
+    }
+    if (length(decimal_columns)) {
+      openxlsx::addStyle(
+        workbook, sheet_name, decimal_style,
+        rows = 2:(n_rows + 1L), cols = decimal_columns,
+        gridExpand = TRUE, stack = TRUE
+      )
+    }
+  }
+  widths <- vapply(seq_len(n_columns), function(index) {
+    values <- c(names(sheet_data)[index], as.character(sheet_data[[index]]))
+    values[is.na(values)] <- ""
+    min(42, max(10, max(nchar(values), na.rm = TRUE) + 2))
+  }, numeric(1))
+  openxlsx::setColWidths(
+    workbook,
+    sheet = sheet_name,
+    cols = seq_len(n_columns),
+    widths = widths
+  )
+  openxlsx::setRowHeights(workbook, sheet_name, rows = 1, heights = 32)
+  openxlsx::freezePane(workbook, sheet_name, firstRow = TRUE)
+  openxlsx::addFilter(workbook, sheet_name, rows = 1, cols = seq_len(n_columns))
+  openxlsx::showGridLines(workbook, sheet_name, showGridLines = FALSE)
+  openxlsx::pageSetup(
+    workbook,
+    sheet = sheet_name,
+    orientation = "landscape",
+    fitToWidth = 1,
+    fitToHeight = 0
+  )
+}
+
+comparison_excel_rows <- which(
+  workbook_sheets$Fit_and_Comparisons$section ==
+    "Sequential scaled MLR test before versus after P2@0"
+) + 1L
+openxlsx::addStyle(
+  workbook,
+  sheet = "Fit_and_Comparisons",
+  style = comparison_style,
+  rows = comparison_excel_rows,
+  cols = seq_len(ncol(workbook_sheets$Fit_and_Comparisons)),
+  gridExpand = TRUE,
+  stack = TRUE
+)
+
+openxlsx::saveWorkbook(workbook, table_file, overwrite = TRUE)
+
+repair_orphan_drawing_relationships <- function(xlsx_file) {
+  repair_dir <- tempfile("baseline_cfa_xlsx_repair_")
+  dir.create(repair_dir)
+  on.exit(unlink(repair_dir, recursive = TRUE, force = TRUE), add = TRUE)
+
+  members <- utils::unzip(xlsx_file, list = TRUE)$Name
+  # Reject unsafe archive paths before extracting a package.
+  unsafe_member <- function(path) {
+    parts <- strsplit(gsub("\\\\", "/", path), "/", fixed = TRUE)[[1L]]
+    grepl("^[/\\\\]|^[A-Za-z]:", path) || any(parts == "..")
+  }
+  stopifnot(length(members) > 0L, !anyDuplicated(members),
+            !any(vapply(members, unsafe_member, logical(1))))
+  utils::unzip(xlsx_file, exdir = repair_dir)
+  relationship_files <- list.files(
+    file.path(repair_dir, "xl", "worksheets", "_rels"),
+    pattern = "\\.rels$", full.names = TRUE
+  )
+  if (!length(relationship_files)) return(invisible(0L))
+
+  resolve_member <- function(target) {
+    target <- gsub("\\\\", "/", utils::URLdecode(target))
+    if (!nzchar(target) || grepl("^[A-Za-z][A-Za-z0-9+.-]*:", target)) {
+      stop("Invalid internal drawing target")
+    }
+    parts <- strsplit(target, "/", fixed = TRUE)[[1L]]
+    result <- if (startsWith(target, "/")) character() else c("xl", "worksheets")
+    for (part in parts) {
+      if (!nzchar(part) || part == ".") next
+      if (part == "..") {
+        if (!length(result)) stop("Drawing target escapes the workbook package")
+        result <- head(result, -1L)
+      } else result <- c(result, part)
+    }
+    paste(result, collapse = "/")
+  }
+  drawing_types <- paste0(
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/",
+    c("drawing", "vmlDrawing")
+  )
+  removed_relationships <- 0L
+  for (relationship_file in relationship_files) {
+    document <- xml2::read_xml(relationship_file, options = "NONET")
+    relationships <- xml2::xml_find_all(
+      document, "/*[local-name()='Relationships']/*[local-name()='Relationship']"
+    )
+    changed <- FALSE
+    for (relationship in relationships) {
+      type <- xml2::xml_attr(relationship, "Type")
+      external <- identical(xml2::xml_attr(relationship, "TargetMode"), "External")
+      if (!type %in% drawing_types || external) next
+      target <- xml2::xml_attr(relationship, "Target")
+      if (is.na(target)) stop("Drawing relationship is missing its Target")
+      if (!resolve_member(target) %in% members) {
+        xml2::xml_remove(relationship)
+        removed_relationships <- removed_relationships + 1L
+        changed <- TRUE
+      }
+    }
+    if (changed) xml2::write_xml(document, relationship_file)
+  }
+  if (removed_relationships == 0L) return(invisible(0L))
+
+  repaired_file <- tempfile(fileext = ".xlsx")
+  on.exit(unlink(repaired_file), add = TRUE)
+  archive_members <- list.files(
+    repair_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE
+  )
+  zip::zipr(
+    zipfile = repaired_file, files = archive_members, root = repair_dir,
+    include_directories = FALSE, mode = "mirror"
+  )
+  stopifnot(file.exists(repaired_file), file.info(repaired_file)$size > 0)
+  stopifnot(file.copy(repaired_file, xlsx_file, overwrite = TRUE))
+  invisible(removed_relationships)
+}
+
+orphan_relationships_removed <- repair_orphan_drawing_relationships(table_file)
+stopifnot(
+  file.exists(table_file),
+  file.info(table_file)$size > 0,
+  identical(openxlsx::getSheetNames(table_file), names(workbook_sheets))
+)
+```
+
+```{r save-result-bundle, include=FALSE, eval=!use_saved_results}
+project_root_normalized <- normalizePath(project_root, winslash = "/", mustWork = TRUE)
+make_relative_path <- function(path) {
+  normalized <- normalizePath(path, winslash = "/", mustWork = TRUE)
+  prefix <- paste0(project_root_normalized, "/")
+  if (startsWith(normalized, prefix)) {
+    substring(normalized, nchar(prefix) + 1L)
+  } else normalized
+}
+
+mplus_file_manifest <- dplyr::bind_rows(lapply(all_model_runs, function(run) {
+  paths <- unlist(run$paths, use.names = TRUE)
+  data.frame(
+    condition = run$condition,
+    model_id = run$model_id,
+    file_type = names(paths),
+    relative_path = vapply(paths, make_relative_path, character(1)),
+    md5 = unname(tools::md5sum(paths)),
+    stringsAsFactors = FALSE
+  )
+}))
+
+workbook_reload <- lapply(names(workbook_sheets), function(sheet_name) {
+  as.data.frame(readxl::read_excel(table_file, sheet = sheet_name))
+})
+names(workbook_reload) <- names(workbook_sheets)
+workbook_audit <- data.frame(
+  sheet = names(workbook_reload),
+  rows = vapply(workbook_reload, nrow, integer(1)),
+  columns = vapply(workbook_reload, ncol, integer(1)),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  identical(readxl::excel_sheets(table_file), names(workbook_sheets)),
+  identical(workbook_audit$rows, c(
+    nrow(fit_and_comparisons),
+    nrow(stdyx_change$M1_1W1B),
+    nrow(stdyx_change$M2_1W2B),
+    nrow(stdyx_change$M3_2W2B)
+  )),
+  all(file.exists(file.path(project_root, mplus_file_manifest$relative_path))),
+  identical(
+    unname(tools::md5sum(file.path(project_root, mplus_file_manifest$relative_path))),
+    mplus_file_manifest$md5
+  )
+)
+
+fit_s2_9_multilevel_cfa_new_model_order <- list(
+  metadata = list(
+    generated_by = "Step_2_Measurement_Models/S2_5_EMA_MultilevelCFA_ModelComparisonTest.Rmd",
+    input_file = "Res_2_Data_for_Analysis/dat_step2_measurement.rda",
+    input_md5 = unname(tools::md5sum(input_file)),
+    mplus_executable = normalizePath(mplus_command, winslash = "/", mustWork = TRUE),
+    mplus_version = unique(model_fit$mplus_version),
+    mplusautomation_version = as.character(utils::packageVersion("MplusAutomation")),
+    estimator = "MLR",
+    analysis_type = "TWOLEVEL",
+    comparison_method = paste(
+      "Satorra-Bentler scaled MLR difference test following",
+      "https://www.statmodel.com/chidiff.shtml"
+    ),
+    model_order = names(model_specs),
+    between_p2_residual_variance =
+      "Fixed to zero in Models 1-3; unconstrained models refitted as reference",
+    workbook = "Res_3_Results/Table_S2_5_EMA_MultilevelCFA_ModelComparisonTest.xlsx",
+    workbook_md5 = unname(tools::md5sum(table_file)),
+    s2_9_passed = all(model_fit$normal_termination) &&
+      nrow(sequential_tests) == 2L &&
+      length(stdyx_results) == 3L
+  ),
+  sample_audit = sample_audit,
+  variable_map = variable_map,
+  model_plan = model_plan,
+  reference_model_syntax = lapply(reference_model_specs, `[[`, "model"),
+  model_syntax = lapply(model_specs, `[[`, "model"),
+  reference_model_fit = reference_model_fit,
+  model_fit = model_fit,
+  fit_change = fit_change,
+  reference_sequential_tests = reference_sequential_tests,
+  sequential_tests = sequential_tests,
+  sequential_test_change = sequential_test_change,
+  reference_stdyx_results = reference_stdyx_results,
+  stdyx_results = stdyx_results,
+  stdyx_change = stdyx_change,
+  loading_change = loading_change,
+  reference_diagnostics = reference_diagnostics,
+  diagnostics = diagnostics,
+  workbook_audit = workbook_audit,
+  orphan_relationships_removed = orphan_relationships_removed,
+  mplus_files = mplus_file_manifest,
+  reference_parsed_models = lapply(reference_model_runs, `[[`, "parsed"),
+  parsed_models = lapply(model_runs, `[[`, "parsed")
+)
+
+save(
+  fit_s2_9_multilevel_cfa_new_model_order,
+  file = result_file,
+  compress = "xz",
+  version = 3
+)
+
+verification_environment <- new.env(parent = emptyenv())
+verified_objects <- load(result_file, envir = verification_environment)
+verified_result <- verification_environment$fit_s2_9_multilevel_cfa_new_model_order
+stopifnot(
+  identical(verified_objects, "fit_s2_9_multilevel_cfa_new_model_order"),
+  isTRUE(verified_result$metadata$s2_9_passed),
+  identical(verified_result$metadata$input_md5, unname(tools::md5sum(input_file))),
+  identical(verified_result$metadata$workbook_md5, unname(tools::md5sum(table_file))),
+  nrow(verified_result$model_fit) == 3L,
+  nrow(verified_result$reference_model_fit) == 3L,
+  nrow(verified_result$sequential_tests) == 2L,
+  nrow(verified_result$reference_sequential_tests) == 2L,
+  length(verified_result$stdyx_results) == 3L,
+  length(verified_result$loading_change) == 3L
+)
+
+```
+
+# Interpretation
+
+```{r validation-checks, include=FALSE, eval=!use_saved_results}
+validation_checks <- data.frame(
+  check = c(
+    "S2.1 measurement input reloaded as its sole expected object",
+    "Three P2@0 models and three before-constraint references ran in Mplus 8.7",
+    "Every Mplus input contains the exact author text and correct constraint status",
+    "All six models terminated normally with 17,759 observations and 209 clusters",
+    "Every revised model fixes only the between-level P2 residual variance to zero",
+    "Before/after sequential scaled MLR tests were computed in the requested order",
+    "Before/after fit and loading changes were calculated for all three models",
+    "The four-sheet workbook reloaded with the expected sheet names and dimensions",
+    "The canonical S2.5 RDA reloaded as its sole expected object",
+    "All 18 Mplus audit files exist and match their stored MD5 hashes"
+  ),
+  passed = c(
+    identical(loaded_objects, "dat_step2_measurement"),
+    length(reference_model_runs) == 3L && length(model_runs) == 3L &&
+      all(c(reference_model_fit$mplus_version, model_fit$mplus_version) == "8.7"),
+    all(vapply(all_model_runs, function(x) {
+      all(unlist(x$input_checks))
+    }, logical(1))),
+    all(reference_model_fit$normal_termination) &&
+      all(reference_model_fit$observations == 17759L) &&
+      all(reference_model_fit$clusters == 209L) &&
+    all(model_fit$normal_termination) &&
+      all(model_fit$observations == 17759L) &&
+      all(model_fit$clusters == 209L),
+    all(vapply(model_specs, function(x) {
+      sum(grepl("^p2@0;$", strsplit(x$model, "\n", fixed = TRUE)[[1L]],
+                ignore.case = TRUE)) == 1L
+    }, logical(1))) &&
+      all(vapply(reference_model_specs, function(x) {
+        !any(grepl("@0;", strsplit(x$model, "\n", fixed = TRUE)[[1L]],
+                   fixed = TRUE))
+      }, logical(1))),
+    identical(
+      sequential_tests$comparison,
+      c("Model 2 vs Model 1", "Model 3 vs Model 2")
+    ) && identical(reference_sequential_tests$comparison,
+                   sequential_tests$comparison),
+    nrow(fit_change) == 3L && nrow(sequential_test_change) == 2L &&
+      all(vapply(loading_change, nrow, integer(1)) == 12L),
+    identical(readxl::excel_sheets(table_file), names(workbook_sheets)) &&
+      identical(workbook_audit$rows, c(
+        nrow(fit_and_comparisons),
+        nrow(stdyx_change$M1_1W1B),
+        nrow(stdyx_change$M2_1W2B),
+        nrow(stdyx_change$M3_2W2B)
+      )),
+    identical(verified_objects, "fit_s2_9_multilevel_cfa_new_model_order"),
+    nrow(mplus_file_manifest) == 18L &&
+      all(file.exists(file.path(project_root, mplus_file_manifest$relative_path))) &&
+      identical(
+        unname(tools::md5sum(file.path(project_root, mplus_file_manifest$relative_path))),
+        mplus_file_manifest$md5
+      )
+  ),
+  stringsAsFactors = FALSE
+)
+
+if (!all(validation_checks$passed)) {
+  stop(
+    "S2.5 validation failed: ",
+    paste(validation_checks$check[!validation_checks$passed], collapse = "; ")
+  )
+}
+
+
+```
+
+S2.5 reports how fixing the between-level `P2` residual variance to zero in all
+three models changes comparative fit, STDYX factor loadings, and the sequential scaled MLR tests. A significant test indicates that the added
+level-specific Core--Peripheral distinction improves fit relative to the
+immediately preceding model; it does not by itself establish good absolute fit.

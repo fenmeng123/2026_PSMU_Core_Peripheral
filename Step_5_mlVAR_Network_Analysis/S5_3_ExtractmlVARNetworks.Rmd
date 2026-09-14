@@ -1,0 +1,511 @@
+---
+title: "S5.3 Extract primary mlVAR networks"
+author: "Kunru Song"
+date: "2026-07-23"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+
+This report extracts the full-precision temporal, contemporaneous, and
+between-person networks from the accepted S5.2 fit. It retains complete
+unthresholded matrices, creates raw-p-thresholded sparse display matrices,
+tests the prespecified Core-Peripheral temporal average-edge contrasts, and
+exports the canonical edge workbook. It does not draw the networks or
+calculate centrality. No FDR or other multiplicity correction is applied; the sparse display is therefore
+exploratory and uses the unadjusted two-sided threshold `p < .05`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  collapse = FALSE, comment = NA
+)
+
+required_packages <- c(
+  "bruceR", "dplyr", "knitr", "openxlsx", "readxl",
+  "rmarkdown", "tibble", "tidyr"
+)
+available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(available)) {
+  stop("Missing required R packages: ", paste(names(available)[!available], collapse = ", "))
+}
+
+report_file <- knitr::current_input(dir = TRUE)
+report_directory <- if (length(report_file) == 1L && file.exists(report_file)) {
+  dirname(normalizePath(report_file, winslash = "/", mustWork = TRUE))
+} else getwd()
+helper_candidates <- c(
+  file.path(report_directory, "S5_0_mlVARHelpers.R"),
+  file.path(getwd(), "S5_0_mlVARHelpers.R"),
+  file.path(getwd(), "Step_5_mlVAR_Network_Analysis", "S5_0_mlVARHelpers.R"),
+  file.path(dirname(getwd()), "Step_5_mlVAR_Network_Analysis", "S5_0_mlVARHelpers.R")
+)
+helper_file <- helper_candidates[file.exists(helper_candidates)][1L]
+if (is.na(helper_file)) stop("Could not locate S5_0_mlVARHelpers.R")
+source(helper_file, encoding = "UTF-8")
+
+project_root <- locate_project_root(dirname(helper_file))
+knitr::opts_knit$set(root.dir = project_root)
+
+data_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "dat_step5_mlvar.rda"
+)
+fit_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "fit_s5_2_primary_mlvar.rda"
+)
+result_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "results_s5_3_mlvar_networks.rda"
+)
+table_file <- file.path(
+  project_root, "Res_3_Results", "Table_S5_3_mlVARNetworks.xlsx"
+)
+
+stopifnot(file.exists(data_file), file.exists(fit_file), file.exists(helper_file))
+dir.create(dirname(result_file), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(table_file), recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load and validate accepted upstream objects
+
+```{r load-upstream}
+dat_step5_mlvar <- load_single_object(data_file, "dat_step5_mlvar")
+fit_s5_2_primary_mlvar <- load_single_object(
+  fit_file, "fit_s5_2_primary_mlvar"
+)
+
+fit <- fit_s5_2_primary_mlvar$model
+node_map <- dat_step5_mlvar$node_map
+node_names <- node_map$node
+
+stopifnot(
+  length(node_names) == 12L,
+  inherits(fit, "mlVAR"),
+  is.null(fit$output),
+  all(fit_s5_2_primary_mlvar$fatal_gate$passed),
+  identical(fit$input$vars, node_names),
+  nrow(fit$data) == 16598L,
+  length(fit_s5_2_primary_mlvar$fixed_effect_covariance$temporal) == 12L
+)
+
+input_audit <- data.frame(
+  input = c("S5.1 data", "S5.2 fitted result"),
+  file = c(
+    "Res_2_Data_for_Analysis/dat_step5_mlvar.rda",
+    "Res_2_Data_for_Analysis/fit_s5_2_primary_mlvar.rda"
+  ),
+  md5 = c(
+    unname(tools::md5sum(data_file)), unname(tools::md5sum(fit_file))
+  ),
+  accepted = TRUE,
+  stringsAsFactors = FALSE
+)
+knitr::kable(input_audit)
+```
+
+# Full network matrices and edge tables
+
+The directed temporal matrix is oriented as row = source at `t-1` and column =
+target at `t`. The two undirected matrices contain symmetric partial
+correlations and have structural zero diagonals.
+
+```{r extract-full-networks}
+raw_matrices <- extract_mlvar_matrices(fit)
+
+full_matrices <- list(
+  temporal = raw_matrices$temporal,
+  contemporaneous = raw_matrices$contemporaneous,
+  between = raw_matrices$between
+)
+diag(full_matrices$contemporaneous) <- 0
+diag(full_matrices$between) <- 0
+
+validate_network_matrix(full_matrices$temporal, node_names, symmetric = FALSE)
+validate_network_matrix(full_matrices$contemporaneous, node_names, symmetric = TRUE)
+validate_network_matrix(full_matrices$between, node_names, symmetric = TRUE)
+
+temporal_edges <- edge_table_directed(
+  full_matrices$temporal,
+  raw_matrices$temporal_se,
+  raw_matrices$temporal_p,
+  node_map
+) |>
+  dplyr::mutate(
+    network = "Temporal",
+    family = ifelse(self_loop, "Autoregressive self-loops", "Cross-lagged edges"),
+    supported_p05 = is.finite(p) & p < .05,
+    sign = dplyr::case_when(
+      estimate > 0 ~ "Positive", estimate < 0 ~ "Negative", TRUE ~ "Zero"
+    ),
+    edge_id = paste0(from, " -> ", to)
+  ) |>
+  dplyr::select(
+    network, edge_id, from, to, from_label, to_label,
+    from_community, to_community, from_subgroup, to_subgroup,
+    estimate, se, ci_lower, ci_upper, p, supported_p05,
+    self_loop, family, sign
+  )
+
+contemporaneous_edges <- edge_table_undirected(
+  full_matrices$contemporaneous,
+  raw_matrices$contemporaneous_gamma_p,
+  node_map
+) |>
+  dplyr::mutate(
+    network = "Contemporaneous",
+    supported_p05 = is.finite(p_and) & p_and < .05,
+    sign = dplyr::case_when(
+      estimate > 0 ~ "Positive", estimate < 0 ~ "Negative", TRUE ~ "Zero"
+    ),
+    edge_id = paste(node1, "--", node2)
+  ) |>
+  dplyr::select(
+    network, edge_id, node1, node2, node1_label, node2_label,
+    node1_community, node2_community, node1_subgroup, node2_subgroup,
+    estimate, p_node1_on_node2, p_node2_on_node1, p_and, p_or,
+    supported_p05, sign
+  )
+
+between_edges <- edge_table_undirected(
+  full_matrices$between,
+  raw_matrices$between_gamma_p,
+  node_map
+) |>
+  dplyr::mutate(
+    network = "Between-person",
+    supported_p05 = is.finite(p_and) & p_and < .05,
+    sign = dplyr::case_when(
+      estimate > 0 ~ "Positive", estimate < 0 ~ "Negative", TRUE ~ "Zero"
+    ),
+    edge_id = paste(node1, "--", node2)
+  ) |>
+  dplyr::select(
+    network, edge_id, node1, node2, node1_label, node2_label,
+    node1_community, node2_community, node1_subgroup, node2_subgroup,
+    estimate, p_node1_on_node2, p_node2_on_node1, p_and, p_or,
+    supported_p05, sign
+  )
+
+stopifnot(
+  nrow(temporal_edges) == 144L,
+  sum(temporal_edges$self_loop) == 12L,
+  nrow(contemporaneous_edges) == 66L,
+  nrow(between_edges) == 66L,
+  all(is.finite(as.matrix(temporal_edges[c("estimate", "se", "p")]))),
+  all(is.finite(as.matrix(contemporaneous_edges[c("estimate", "p_and")]))),
+  all(is.finite(as.matrix(between_edges[c("estimate", "p_and")])))
+)
+
+knitr::kable(head(temporal_edges, 12), digits = 4)
+knitr::kable(head(contemporaneous_edges, 12), digits = 4)
+knitr::kable(head(between_edges, 12), digits = 4)
+```
+
+# Sparse inferential display matrices
+
+The sparse matrices set unsupported edges to zero only for display and the
+prespecified sparse-centrality sensitivity. They never replace the complete
+unthresholded numerical result.
+
+```{r sparse-matrices}
+sparse_matrices <- lapply(full_matrices, function(x) {
+  matrix(0, nrow(x), ncol(x), dimnames = dimnames(x))
+})
+
+for (row in seq_len(nrow(temporal_edges))) {
+  edge <- temporal_edges[row, ]
+  if (edge$supported_p05) {
+    sparse_matrices$temporal[edge$from, edge$to] <- edge$estimate
+  }
+}
+for (row in seq_len(nrow(contemporaneous_edges))) {
+  edge <- contemporaneous_edges[row, ]
+  if (edge$supported_p05) {
+    sparse_matrices$contemporaneous[edge$node1, edge$node2] <- edge$estimate
+    sparse_matrices$contemporaneous[edge$node2, edge$node1] <- edge$estimate
+  }
+}
+for (row in seq_len(nrow(between_edges))) {
+  edge <- between_edges[row, ]
+  if (edge$supported_p05) {
+    sparse_matrices$between[edge$node1, edge$node2] <- edge$estimate
+    sparse_matrices$between[edge$node2, edge$node1] <- edge$estimate
+  }
+}
+
+stopifnot(
+  all(sparse_matrices$temporal[temporal_edges |>
+    dplyr::filter(!supported_p05) |>
+    dplyr::select(from, to) |>
+    as.matrix()] == 0),
+  isTRUE(all.equal(
+    sparse_matrices$contemporaneous,
+    t(sparse_matrices$contemporaneous), tolerance = 1e-12
+  )),
+  isTRUE(all.equal(
+    sparse_matrices$between,
+    t(sparse_matrices$between), tolerance = 1e-12
+  ))
+)
+```
+
+# Prespecified direct temporal contrasts
+
+For every Distress-domain outcome, the contrast is the mean of the four Core
+manifestation lag coefficients minus the mean of the two Peripheral
+manifestation lag coefficients. For every Engagement outcome, the complementary
+research-question contrast is mean Peripheral minus mean Core. Each contrast is
+computed inside one outcome equation using its full fixed-effect covariance
+matrix; significance is never inferred from separate edge p values.
+
+```{r direct-contrasts}
+contrast_for_outcome <- function(outcome, positive_nodes, negative_nodes, label) {
+  submodel <- fit$model |>
+    dplyr::filter(dep == outcome, type == "within")
+  covariance <- fit_s5_2_primary_mlvar$fixed_effect_covariance$temporal[[outcome]]
+
+  coefficient_map <- submodel |>
+    dplyr::select(pred, predID)
+  positive_ids <- coefficient_map$predID[match(positive_nodes, coefficient_map$pred)]
+  negative_ids <- coefficient_map$predID[match(negative_nodes, coefficient_map$pred)]
+  stopifnot(!anyNA(positive_ids), !anyNA(negative_ids))
+
+  weights <- stats::setNames(rep(0, ncol(covariance)), colnames(covariance))
+  weights[positive_ids] <- 1 / length(positive_ids)
+  weights[negative_ids] <- -1 / length(negative_ids)
+
+  estimate <- mean(full_matrices$temporal[positive_nodes, outcome]) -
+    mean(full_matrices$temporal[negative_nodes, outcome])
+  se <- sqrt(as.numeric(t(weights) %*% as.matrix(covariance) %*% weights))
+  z <- estimate / se
+
+  data.frame(
+    outcome = outcome,
+    contrast = label,
+    positive_group = paste(positive_nodes, collapse = ", "),
+    negative_group = paste(negative_nodes, collapse = ", "),
+    estimate = estimate,
+    se = se,
+    z = z,
+    p = 2 * stats::pnorm(-abs(z)),
+    ci_lower = estimate - stats::qnorm(.975) * se,
+    ci_upper = estimate + stats::qnorm(.975) * se,
+    stringsAsFactors = FALSE
+  )
+}
+
+core_nodes <- paste0("PMU", 3:6)
+peripheral_nodes <- paste0("PMU", 1:2)
+distress_nodes <- c("DepressiveAffect", "Anxiety", "Stress")
+engagement_nodes <- c("InteractiveLog", "ActiveLog", "PassiveLog")
+
+planned_contrasts <- dplyr::bind_rows(
+  lapply(distress_nodes, function(outcome) {
+    contrast_for_outcome(
+      outcome, core_nodes, peripheral_nodes,
+      "Mean Core-to-Distress minus mean Peripheral-to-Distress"
+    )
+  }),
+  lapply(engagement_nodes, function(outcome) {
+    contrast_for_outcome(
+      outcome, peripheral_nodes, core_nodes,
+      "Mean Peripheral-to-Engagement minus mean Core-to-Engagement"
+    )
+  })
+) |>
+  dplyr::mutate(
+    family = ifelse(outcome %in% distress_nodes, "Distress-domain contrasts", "Engagement contrasts"),
+    supported_p05 = is.finite(p) & p < .05
+  )
+
+stopifnot(
+  nrow(planned_contrasts) == 6L,
+  all(is.finite(as.matrix(planned_contrasts[c("estimate", "se", "p")]))),
+  all(planned_contrasts$se > 0)
+)
+
+knitr::kable(planned_contrasts, digits = 4)
+```
+
+# Network summaries
+
+```{r summaries}
+network_summary <- dplyr::bind_rows(
+  temporal_edges |>
+    dplyr::group_by(network, family) |>
+    dplyr::summarise(
+      possible_edges = dplyr::n(), supported_edges = sum(supported_p05),
+      supported_positive = sum(supported_p05 & estimate > 0),
+      supported_negative = sum(supported_p05 & estimate < 0),
+      mean_absolute_weight = mean(abs(estimate)),
+      maximum_absolute_weight = max(abs(estimate)), .groups = "drop"
+    ),
+  contemporaneous_edges |>
+    dplyr::group_by(network) |>
+    dplyr::summarise(
+      family = "Unique undirected edges", possible_edges = dplyr::n(),
+      supported_edges = sum(supported_p05),
+      supported_positive = sum(supported_p05 & estimate > 0),
+      supported_negative = sum(supported_p05 & estimate < 0),
+      mean_absolute_weight = mean(abs(estimate)),
+      maximum_absolute_weight = max(abs(estimate)), .groups = "drop"
+    ),
+  between_edges |>
+    dplyr::group_by(network) |>
+    dplyr::summarise(
+      family = "Unique undirected edges", possible_edges = dplyr::n(),
+      supported_edges = sum(supported_p05),
+      supported_positive = sum(supported_p05 & estimate > 0),
+      supported_negative = sum(supported_p05 & estimate < 0),
+      mean_absolute_weight = mean(abs(estimate)),
+      maximum_absolute_weight = max(abs(estimate)), .groups = "drop"
+    )
+)
+
+stopifnot(
+  sum(network_summary$possible_edges) == 276L,
+  all(network_summary$supported_edges >= 0L),
+  all(network_summary$supported_edges <= network_summary$possible_edges)
+)
+knitr::kable(network_summary, digits = 4)
+```
+
+# Save canonical results and export the workbook
+
+```{r save-and-export}
+provenance <- list(
+  data_input = "Res_2_Data_for_Analysis/dat_step5_mlvar.rda",
+  data_md5 = unname(tools::md5sum(data_file)),
+  model_input = "Res_2_Data_for_Analysis/fit_s5_2_primary_mlvar.rda",
+  model_md5 = unname(tools::md5sum(fit_file)),
+  generating_script = "Step_5_mlVAR_Network_Analysis/S5_3_ExtractmlVARNetworks.Rmd",
+  helper_md5 = unname(tools::md5sum(helper_file)),
+  edge_rule = paste(
+    "Temporal Wald p values; contemporaneous/between conservative AND p",
+    "using max of the two node-wise p values; no multiplicity correction"
+  ),
+  sparse_rule = paste(
+    "Unadjusted two-sided p < .05 display threshold; full matrices remain",
+    "canonical; sparse display is exploratory"
+  ),
+  rounding_rule = "Workbook display rounded to four decimals; RDA retains full precision"
+)
+
+results_s5_3_mlvar_networks <- list(
+  full_matrices = full_matrices,
+  sparse_matrices = sparse_matrices,
+  edge_tables = list(
+    temporal = temporal_edges,
+    contemporaneous = contemporaneous_edges,
+    between = between_edges
+  ),
+  planned_contrasts = planned_contrasts,
+  network_summary = network_summary,
+  node_map = node_map,
+  layout = dat_step5_mlvar$layout,
+  input_audit = input_audit,
+  provenance = provenance
+)
+
+save(results_s5_3_mlvar_networks, file = result_file, version = 2)
+rm(results_s5_3_mlvar_networks)
+results_s5_3_mlvar_networks <- load_single_object(
+  result_file, "results_s5_3_mlvar_networks"
+)
+
+workbook_sheets <- list(
+  Network_Summary = round_numeric_columns(network_summary),
+  Planned_Contrasts = round_numeric_columns(planned_contrasts),
+  Temporal_Edges = round_numeric_columns(temporal_edges),
+  Contemporaneous_Edges = round_numeric_columns(contemporaneous_edges),
+  Between_Edges = round_numeric_columns(between_edges),
+  Node_Map = node_map |>
+    dplyr::select(order, node, label, community, subgroup, source, scoring),
+  Model_Diagnostics = round_numeric_columns(
+    fit_s5_2_primary_mlvar$model_diagnostics
+  )
+)
+
+bruceR::export(workbook_sheets, file = table_file, overwrite = TRUE)
+style_and_sanitize_workbook(table_file, workbook_sheets)
+
+sheet_names <- readxl::excel_sheets(table_file)
+reloaded_sheets <- stats::setNames(
+  lapply(sheet_names, function(sheet) {
+    as.data.frame(readxl::read_excel(table_file, sheet = sheet))
+  }),
+  sheet_names
+)
+
+formula_errors <- sum(vapply(reloaded_sheets, function(data) {
+  sum(vapply(data, function(column) {
+    sum(grepl("^#(REF!|VALUE!|NAME\\?|DIV/0!|N/A)", as.character(column)))
+  }, integer(1)))
+}, integer(1)))
+
+workbook_audit <- data.frame(
+  file = "Res_3_Results/Table_S5_3_mlVARNetworks.xlsx",
+  sheets = length(sheet_names),
+  exact_sheet_names = identical(sheet_names, names(workbook_sheets)),
+  formula_errors = formula_errors,
+  bytes = file.info(table_file)$size,
+  md5 = unname(tools::md5sum(table_file)),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  identical(
+    names(results_s5_3_mlvar_networks),
+    c(
+      "full_matrices", "sparse_matrices", "edge_tables",
+      "planned_contrasts", "network_summary", "node_map", "layout",
+      "input_audit", "provenance"
+    )
+  ),
+  identical(sheet_names, names(workbook_sheets)),
+  formula_errors == 0L,
+  nrow(reloaded_sheets$Temporal_Edges) == 144L,
+  nrow(reloaded_sheets$Contemporaneous_Edges) == 66L,
+  nrow(reloaded_sheets$Between_Edges) == 66L,
+  nrow(reloaded_sheets$Planned_Contrasts) == 6L
+)
+
+knitr::kable(workbook_audit)
+```
+
+```{r validate-network-results, include=FALSE}
+s5_3_acceptance <- data.frame(
+  criterion = c(
+    "Full temporal matrix and 144 directed edges",
+    "Full contemporaneous matrix and 66 unique edges",
+    "Full between-person matrix and 66 unique edges",
+    "Raw p-values with conservative AND rule for undirected edges",
+    "Sparse display matrices preserve only unadjusted p < .05 edges",
+    "Six direct planned contrasts use within-equation covariance",
+    "Sole result RDA reload",
+    "Excel workbook reload, exact sheets, and zero formula errors"
+  ),
+  passed = c(
+    nrow(temporal_edges) == 144L && all(is.finite(full_matrices$temporal)),
+    nrow(contemporaneous_edges) == 66L &&
+      isTRUE(all.equal(full_matrices$contemporaneous, t(full_matrices$contemporaneous))),
+    nrow(between_edges) == 66L &&
+      isTRUE(all.equal(full_matrices$between, t(full_matrices$between))),
+    all(contemporaneous_edges$p_and >= contemporaneous_edges$p_or) &&
+      all(between_edges$p_and >= between_edges$p_or),
+    all(sparse_matrices$temporal[temporal_edges |>
+      dplyr::filter(!supported_p05) |>
+      dplyr::select(from, to) |>
+      as.matrix()] == 0),
+    nrow(planned_contrasts) == 6L && all(planned_contrasts$se > 0),
+    file.exists(result_file),
+    workbook_audit$exact_sheet_names && workbook_audit$formula_errors == 0L
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(all(s5_3_acceptance$passed))
+```

@@ -1,0 +1,46 @@
+TITLE:
+! Author: Kunru Song
+! Step 3.4 complete Distress model with raw-minute Engagement Time.
+! Concurrent association; engagement adjustment is not mediation.
+Raw same-variable-set duration paths fixed to zero
+DATA:
+FILE = "F:/2026_[8]_PSMU_Daily_CorePeripheral/
+Step_3_Concurrent_Multilevel_Associations/mplus/s3_4/
+s3_4_distress_restricted_raw.dat"; 
+VARIABLE:
+NAMES = id dayc tm2 tm3 disw corew periw intw actw pasw disb coreb perib intb actb
+     pasb; 
+ MISSING=.;
+ CLUSTER = id;
+WITHIN = disw corew periw intw actw pasw dayc tm2 tm3;
+BETWEEN = disb coreb perib intb actb pasb;
+ANALYSIS:
+TYPE = TWOLEVEL;
+ESTIMATOR = MLR;
+MODEL:
+%WITHIN%
+disw ON corew (wc);
+disw ON periw (wp);
+disw ON intw@0;
+disw ON actw@0;
+disw ON pasw@0;
+disw ON dayc;
+disw ON tm2;
+disw ON tm3;
+%BETWEEN%
+disb ON coreb (bc);
+disb ON perib (bp);
+disb ON intb@0;
+disb ON actb@0;
+disb ON pasb@0;
+MODEL CONSTRAINT:
+NEW(wdiff bdiff);
+wdiff = wc - wp;
+bdiff = bc - bp;
+OUTPUT:
+SAMPSTAT;
+STANDARDIZED(STDYX);
+CINTERVAL;
+RESIDUAL;
+TECH1;
+TECH4;

@@ -1,0 +1,46 @@
+TITLE:
+! Author: Kunru Song
+! Step 3.4 complete Distress model with raw-minute Engagement Time.
+! Concurrent association; engagement adjustment is not mediation.
+Level-standardized full focal model
+DATA:
+FILE = "F:/2026_[8]_PSMU_Daily_CorePeripheral/
+Step_3_Concurrent_Multilevel_Associations/mplus/s3_4/
+s3_4_distress_full_standardized.dat"; 
+VARIABLE:
+NAMES = id dayc tm2 tm3 diswz corewz periwz intwz actwz paswz disbz corebz peribz
+     intbz actbz pasbz; 
+ MISSING=.;
+ CLUSTER = id;
+WITHIN = diswz corewz periwz intwz actwz paswz dayc tm2 tm3;
+BETWEEN = disbz corebz peribz intbz actbz pasbz;
+ANALYSIS:
+TYPE = TWOLEVEL;
+ESTIMATOR = MLR;
+MODEL:
+%WITHIN%
+diswz ON corewz (wc);
+diswz ON periwz (wp);
+diswz ON intwz (wi);
+diswz ON actwz (wa);
+diswz ON paswz (wb);
+diswz ON dayc;
+diswz ON tm2;
+diswz ON tm3;
+%BETWEEN%
+disbz ON corebz (bc);
+disbz ON peribz (bp);
+disbz ON intbz (bi);
+disbz ON actbz (ba);
+disbz ON pasbz (bb);
+MODEL CONSTRAINT:
+NEW(wdiff bdiff);
+wdiff = wc - wp;
+bdiff = bc - bp;
+OUTPUT:
+SAMPSTAT;
+STANDARDIZED(STDYX);
+CINTERVAL;
+RESIDUAL;
+TECH1;
+TECH4;

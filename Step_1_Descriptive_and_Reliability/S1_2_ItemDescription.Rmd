@@ -1,0 +1,510 @@
+---
+title: "S1.2 Focal-variable selection, merge, and item descriptives"
+author: "Kunru Song"
+params:
+  write_artifacts: true
+date: "2026-07-17 22:35:08 +08:00"
+output:
+  html_document:
+    md_extensions: "-markdown_in_html_blocks"
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+<!-- Report date: earliest retained HTML CreationTime; not a verified analysis-start log. Keep fixed on re-render. -->
+
+<style>
+/* Keep wide audit/correlation tables within the report column. */
+.main-container table.table { display: block; max-width: 100%; overflow-x: auto; }
+.main-container table.table th, .main-container table.table td { padding: 6px 9px; }
+.main-container table.table td { white-space: nowrap; }
+.main-container table.table th:first-child, .main-container table.table td:first-child { min-width: 140px; }
+.main-container table.item-description-table td:nth-child(3) { white-space: normal; min-width: 320px; max-width: 320px; }
+.main-container table.table caption { text-align: left; font-weight: 600; color: #333; }
+</style>
+
+This report uses the focal-variable mappings listed below. It selects the baseline sample-description variables, baseline focal items, and
+EMA focal items; merges baseline information onto prompt-level EMA rows; and
+saves the single analysis-entry RDA file used by later stages.
+
+No scale total, scale mean, reverse-scored item, day-level aggregation, or other
+composite is created here. Item descriptives are calculated separately at the
+baseline participant level and EMA prompt level.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA
+)
+
+required_packages <- c("dplyr", "knitr", "psych", "rmarkdown", "tidyr")
+package_available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(package_available)) {
+  stop("Missing required R packages: ", paste(names(package_available)[!package_available], collapse = ", "))
+}
+
+locate_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(current)) current <- dirname(current)
+  repeat {
+    if (all(dir.exists(file.path(current, c(
+      "Step_1_Descriptive_and_Reliability", "Step_2_Measurement_Models"
+    ))))) return(current)
+    parent <- dirname(current)
+    if (identical(parent, current)) break
+    current <- parent
+  }
+  stop("Could not locate the project from its public Step directories")
+}
+
+input_path <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(if (is.null(input_path)) getwd() else input_path)
+knitr::opts_knit$set(root.dir = project_root)
+
+input_file <- file.path(project_root, "Res_2_Data_for_Analysis", "dat_clean_components.rda")
+output_file <- file.path(project_root, "Res_2_Data_for_Analysis", "dat_focal_analysis.rda")
+
+if (!file.exists(input_file)) stop("Missing S1.1 input RDA: ", input_file)
+```
+
+# Variable specification
+
+The study's original variable specification defines four EMA item groups and
+four baseline item groups. Their full mappings are encoded here; the original
+Word reference is not required to run the analysis.
+
+```{r variable-specification}
+sample_description_vars <- c(
+  "AgeInYears",
+  "Gender",
+  "Grade",
+  "FamilyResidence",
+  "ParentsMaritalStatus",
+  "ParentsHighestEdu",
+  "TotalFamilyIncome",
+  "SiblingStructure"
+)
+
+baseline_item_map <- dplyr::bind_rows(
+  data.frame(variable = paste0("V_BSMAS_", 1:18), construct = "Trait PSMU (BSMAS)", expected_min = 1, expected_max = 5, reverse_keyed = FALSE),
+  data.frame(variable = paste0("K_CESD_", 1:7), construct = "Depression (CES-D selected items)", expected_min = 1, expected_max = 4, reverse_keyed = FALSE),
+  # The Word document states 0-3, whereas the clean RDA is coded 1-4.
+  data.frame(variable = paste0("L_DASS_", 1:7), construct = "Anxiety (DASS selected items)", expected_min = 0, expected_max = 3, reverse_keyed = FALSE),
+  data.frame(
+    variable = paste0("M_PSS_", 1:10),
+    construct = "Perceived stress (PSS-10)",
+    expected_min = 1,
+    expected_max = 5,
+    reverse_keyed = 1:10 %in% c(4, 5, 7, 8)
+  )
+)
+
+ema_item_map <- dplyr::bind_rows(
+  # The Word document states 1-300, whereas the clean RDA includes zero.
+  data.frame(variable = paste0("mu_time", 1:3), construct = "Social media use time", expected_min = 1, expected_max = 300, reverse_keyed = FALSE),
+  data.frame(variable = paste0("mu_frequency", 1:3), construct = "Social media use frequency", expected_min = 1, expected_max = 4, reverse_keyed = FALSE),
+  data.frame(variable = paste0("PMU", 1:6), construct = "Momentary problematic social media use", expected_min = 1, expected_max = 5, reverse_keyed = FALSE),
+  # The Word document does not state response anchors for momentary DASS items.
+  data.frame(variable = paste0("DASS", 1:6), construct = "Momentary depression/anxiety/stress", expected_min = NA_real_, expected_max = NA_real_, reverse_keyed = FALSE)
+)
+
+baseline_focal_vars <- baseline_item_map$variable
+ema_focal_vars <- ema_item_map$variable
+
+baseline_item_map |>
+  knitr::kable(
+    format = "html",
+    caption = "Variable specification",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+ema_item_map |>
+  knitr::kable(
+    format = "html",
+    caption = "Variable specification (2)",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Load and validate S1.1 data
+
+```{r load-and-validate}
+input_environment <- new.env(parent = emptyenv())
+loaded_objects <- load(input_file, envir = input_environment)
+required_objects <- c("dat_baseline", "dat_ema")
+if (!all(required_objects %in% loaded_objects)) {
+  stop("Input RDA is missing objects: ", paste(setdiff(required_objects, loaded_objects), collapse = ", "))
+}
+dat_baseline <- input_environment[["dat_baseline"]]
+dat_ema <- input_environment[["dat_ema"]]
+
+required_baseline_vars <- c("Name_ID", sample_description_vars, baseline_focal_vars)
+required_ema_vars <- c("Data_ID", "Name_ID", "Day", "Time", ema_focal_vars)
+
+missing_baseline_vars <- setdiff(required_baseline_vars, names(dat_baseline))
+missing_ema_vars <- setdiff(required_ema_vars, names(dat_ema))
+if (length(missing_baseline_vars)) {
+  stop("Missing baseline variables: ", paste(missing_baseline_vars, collapse = ", "))
+}
+if (length(missing_ema_vars)) {
+  stop("Missing EMA variables: ", paste(missing_ema_vars, collapse = ", "))
+}
+
+baseline_duplicate_ids <- dat_baseline |>
+  dplyr::count(Name_ID, name = "n") |>
+  dplyr::filter(n > 1L)
+
+ema_duplicate_prompt_keys <- dat_ema |>
+  dplyr::count(Name_ID, Day, Time, name = "n") |>
+  dplyr::filter(n > 1L)
+
+stopifnot(
+  nrow(baseline_duplicate_ids) == 0L,
+  nrow(ema_duplicate_prompt_keys) == 0L,
+  !anyNA(dat_baseline$Name_ID),
+  !anyNA(dat_ema[c("Name_ID", "Day", "Time")])
+)
+
+data.frame(
+  source = c("Baseline", "EMA"),
+  rows = c(nrow(dat_baseline), nrow(dat_ema)),
+  participants = c(dplyr::n_distinct(dat_baseline$Name_ID), dplyr::n_distinct(dat_ema$Name_ID)),
+  duplicate_key_groups = c(nrow(baseline_duplicate_ids), nrow(ema_duplicate_prompt_keys))
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "Load and validate",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Helper functions
+
+```{r helpers}
+variable_label <- function(x) {
+  label <- attr(x, "label", exact = TRUE)
+  if (is.null(label)) NA_character_ else as.character(label)
+}
+
+item_descriptives <- function(data, item_map) {
+  dplyr::bind_rows(lapply(seq_len(nrow(item_map)), function(i) {
+    variable <- item_map$variable[[i]]
+    x <- data[[variable]]
+    observed <- x[!is.na(x)]
+    description <- if (length(observed) >= 3L) psych::describe(observed, fast = FALSE) else NULL
+    data.frame(
+      construct = item_map$construct[[i]],
+      variable = variable,
+      item_label = variable_label(x),
+      n_total = length(x),
+      n_valid = length(observed),
+      n_missing = sum(is.na(x)),
+      missing_percent = 100 * mean(is.na(x)),
+      mean = if (length(observed)) mean(observed) else NA_real_,
+      sd = if (length(observed) > 1L) stats::sd(observed) else NA_real_,
+      median = if (length(observed)) stats::median(observed) else NA_real_,
+      minimum = if (length(observed)) min(observed) else NA_real_,
+      maximum = if (length(observed)) max(observed) else NA_real_,
+      skewness = if (is.null(description)) NA_real_ else description$skew,
+      kurtosis = if (is.null(description)) NA_real_ else description$kurtosis,
+      reverse_keyed = item_map$reverse_keyed[[i]],
+      stringsAsFactors = FALSE
+    )
+  }))
+}
+
+range_audit <- function(descriptives, item_map) {
+  descriptives |>
+    dplyr::select(variable, observed_min = minimum, observed_max = maximum) |>
+    dplyr::left_join(
+      item_map |>
+        dplyr::select(variable, expected_min, expected_max),
+      by = "variable"
+    ) |>
+    dplyr::mutate(
+      documented_range_available = !is.na(expected_min) & !is.na(expected_max),
+      within_documented_range = dplyr::if_else(
+        documented_range_available,
+        observed_min >= expected_min & observed_max <= expected_max,
+        NA
+      ),
+      note = dplyr::case_when(
+        grepl("^L_DASS_", variable) & !within_documented_range ~ "Word document: 0-3; clean RDA: 1-4. Original coding retained.",
+        grepl("^mu_time", variable) & !within_documented_range ~ "Word document: 1-300; clean RDA includes 0. Original coding retained.",
+        !documented_range_available ~ "Response range not stated in the focal-variable Word document.",
+        within_documented_range ~ "Observed values fall within the documented range.",
+        TRUE ~ "Observed values fall outside the documented range; inspect before modeling."
+      )
+    )
+}
+
+categorical_descriptives <- function(data, variables) {
+  dplyr::bind_rows(lapply(variables, function(variable) {
+    values <- data[[variable]]
+    tab <- table(values, useNA = "ifany")
+    data.frame(
+      variable = variable,
+      category = names(tab),
+      n = as.integer(tab),
+      percent_of_sample = 100 * as.integer(tab) / length(values),
+      stringsAsFactors = FALSE
+    )
+  }))
+}
+```
+
+# Baseline section
+
+Baseline descriptives are computed once per participant from `dat_baseline`,
+before baseline variables are repeated across EMA prompts in the merged file.
+
+## Sample description
+
+```{r baseline-sample-description}
+baseline_sample <- dat_baseline |>
+  dplyr::select(Name_ID, dplyr::all_of(sample_description_vars))
+
+baseline_sample |>
+  dplyr::summarise(
+    participants = dplyr::n_distinct(Name_ID),
+    age_n = sum(!is.na(AgeInYears)),
+    age_missing = sum(is.na(AgeInYears)),
+    age_mean = mean(AgeInYears, na.rm = TRUE),
+    age_sd = stats::sd(AgeInYears, na.rm = TRUE),
+    age_median = stats::median(AgeInYears, na.rm = TRUE),
+    age_minimum = min(AgeInYears, na.rm = TRUE),
+    age_maximum = max(AgeInYears, na.rm = TRUE)
+  ) |>
+  knitr::kable(
+    format = "html",
+    caption = "Baseline sample description",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+
+baseline_categorical_descriptives <- categorical_descriptives(
+  baseline_sample,
+  setdiff(sample_description_vars, "AgeInYears")
+)
+baseline_categorical_descriptives |>
+  dplyr::mutate(percent_of_sample = round(percent_of_sample, 2)) |>
+  knitr::kable(
+    format = "html",
+    caption = "Baseline sample description (2)",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+## Baseline focal-item descriptives
+
+No baseline scale total, mean, or reverse-scored value is computed. The
+`reverse_keyed` column records the Word document's PSS key for later scoring
+only.
+
+```{r baseline-item-descriptives}
+baseline_item_descriptives <- item_descriptives(dat_baseline, baseline_item_map)
+
+baseline_item_descriptives |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 3))) |>
+  knitr::kable(
+    format = "html",
+    caption = "Baseline item descriptives",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed item-description-table"'
+  )
+```
+
+## Baseline range audit
+
+```{r baseline-range-audit}
+baseline_range_audit <- range_audit(baseline_item_descriptives, baseline_item_map)
+baseline_range_audit |>
+  knitr::kable(
+    format = "html",
+    caption = "Baseline range audit",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# EMA section
+
+EMA descriptives are computed at the prompt level. No prompt-to-day aggregation
+or scale construction is performed.
+
+## EMA observation structure
+
+```{r ema-observation-structure}
+dat_ema |>
+  dplyr::summarise(
+    participants = dplyr::n_distinct(Name_ID),
+    person_days = dplyr::n_distinct(paste(Name_ID, Day)),
+    prompts = dplyr::n(),
+    minimum_day = min(Day, na.rm = TRUE),
+    maximum_day = max(Day, na.rm = TRUE)
+  ) |>
+  knitr::kable(
+    format = "html",
+    caption = "Ema observation structure",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+
+dat_ema |>
+  dplyr::count(Time, name = "scheduled_rows") |>
+  dplyr::arrange(Time) |>
+  knitr::kable(
+    format = "html",
+    caption = "Ema observation structure (2)",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+## EMA focal-item descriptives
+
+```{r ema-item-descriptives}
+ema_item_descriptives <- item_descriptives(dat_ema, ema_item_map)
+
+ema_item_descriptives |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 3))) |>
+  knitr::kable(
+    format = "html",
+    caption = "Ema item descriptives",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed item-description-table"'
+  )
+```
+
+## EMA range audit
+
+```{r ema-range-audit}
+ema_range_audit <- range_audit(ema_item_descriptives, ema_item_map)
+ema_range_audit |>
+  knitr::kable(
+    format = "html",
+    caption = "Ema range audit",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```
+
+# Merge and save the single analysis-entry RDA
+
+The merged data remain at EMA prompt level. Baseline fields are attached by the
+unique participant key `Name_ID` using an explicitly validated many-to-one join.
+
+```{r merge-and-save}
+dat_baseline_focal <- dat_baseline |>
+  dplyr::select(
+    Name_ID,
+    dplyr::all_of(sample_description_vars),
+    dplyr::all_of(baseline_focal_vars)
+  )
+
+dat_ema_focal <- dat_ema |>
+  dplyr::select(
+    Data_ID,
+    Name_ID,
+    Day,
+    Time,
+    dplyr::all_of(ema_focal_vars)
+  )
+
+baseline_ids_missing_from_ema <- setdiff(dat_baseline_focal$Name_ID, dat_ema_focal$Name_ID)
+ema_ids_missing_from_baseline <- setdiff(dat_ema_focal$Name_ID, dat_baseline_focal$Name_ID)
+
+if (length(ema_ids_missing_from_baseline)) {
+  stop("EMA participants missing from baseline: ", length(ema_ids_missing_from_baseline))
+}
+
+dat_focal_analysis <- dat_ema_focal |>
+  dplyr::left_join(
+    dat_baseline_focal,
+    by = "Name_ID",
+    relationship = "many-to-one"
+  ) |>
+  dplyr::select(
+    Data_ID,
+    Name_ID,
+    Day,
+    Time,
+    dplyr::all_of(sample_description_vars),
+    dplyr::all_of(baseline_focal_vars),
+    dplyr::all_of(ema_focal_vars)
+  ) |>
+  dplyr::arrange(Name_ID, Day, Time)
+
+expected_columns <- c(
+  "Data_ID", "Name_ID", "Day", "Time",
+  sample_description_vars,
+  baseline_focal_vars,
+  ema_focal_vars
+)
+
+stopifnot(
+  nrow(dat_focal_analysis) == nrow(dat_ema_focal),
+  identical(names(dat_focal_analysis), expected_columns),
+  dplyr::n_distinct(dat_focal_analysis$Name_ID) == dplyr::n_distinct(dat_ema_focal$Name_ID),
+  nrow(dat_focal_analysis) == dplyr::n_distinct(paste(dat_focal_analysis$Name_ID, dat_focal_analysis$Day, dat_focal_analysis$Time)),
+  !anyNA(dat_focal_analysis[c("Name_ID", "Day", "Time")])
+)
+
+if (isTRUE(params$write_artifacts)) {
+  save(dat_focal_analysis, file = output_file, compress = "xz")
+}
+
+data.frame(
+  output_file = "Res_2_Data_for_Analysis/dat_focal_analysis.rda",
+  object = "dat_focal_analysis",
+  rows = nrow(dat_focal_analysis),
+  columns = ncol(dat_focal_analysis),
+  participants = dplyr::n_distinct(dat_focal_analysis$Name_ID),
+  bytes = file.info(output_file)$size,
+  stringsAsFactors = FALSE
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "Merge and save",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+
+id_audit <- list(
+  baseline_ids_missing_from_ema = baseline_ids_missing_from_ema,
+  ema_ids_missing_from_baseline = ema_ids_missing_from_baseline
+)
+
+data.frame(
+  comparison = names(id_audit),
+  unmatched_count = lengths(id_audit),
+  stringsAsFactors = FALSE
+) |>
+  knitr::kable(
+    format = "html",
+    caption = "Merge and save (2)",
+    row.names = FALSE,
+    escape = TRUE,
+    table.attr = 'class="table table-striped table-condensed"'
+  )
+```

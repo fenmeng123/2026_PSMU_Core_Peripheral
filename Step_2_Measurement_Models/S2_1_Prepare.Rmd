@@ -1,0 +1,939 @@
+---
+title: "S2.1 Prepare Step 2 measurement data"
+author: "Kunru Song"
+date: "2026-07-18 18:05:15 +08:00"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+
+This report creates the stage-specific item-level data entry for all Step 2
+measurement analyses. It extracts raw baseline Trait PSMU, depression, anxiety,
+and perceived-stress responses plus raw EMA PSMU manifestation responses from
+the prepared `dat_focal_analysis.rda` entry, keeps the participant and prompt
+observation levels separate, and saves one RDA containing one stable top-level
+object.
+
+No item is reversed or rescaled. No total, mean, factor score, person mean, or
+day-level aggregate is stored in the output object. The descriptive summaries at the end of this report check the saved data and are not added to the canonical Step 2 RDA.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA
+)
+
+required_packages <- c(
+  "dplyr",
+  "ggplot2",
+  "knitr",
+  "lme4",
+  "psych",
+  "rmarkdown",
+  "svglite",
+  "tibble",
+  "tidyr"
+)
+package_available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(package_available)) {
+  stop(
+    "Missing required R packages: ",
+    paste(names(package_available)[!package_available], collapse = ", ")
+  )
+}
+
+locate_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  if (!dir.exists(current)) current <- dirname(current)
+  repeat {
+    if (all(dir.exists(file.path(current, c(
+      "Step_1_Descriptive_and_Reliability", "Step_2_Measurement_Models"
+    ))))) return(current)
+    parent <- dirname(current)
+    if (identical(parent, current)) break
+    current <- parent
+  }
+  stop("Could not locate the project from its public Step directories")
+}
+
+input_path <- knitr::current_input(dir = TRUE)
+project_root <- locate_project_root(if (is.null(input_path)) getwd() else input_path)
+knitr::opts_knit$set(root.dir = project_root)
+knitr::opts_chunk$set(dev = "svglite")
+
+input_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "dat_focal_analysis.rda"
+)
+output_file <- file.path(
+  project_root,
+  "Res_2_Data_for_Analysis",
+  "dat_step2_measurement.rda"
+)
+
+if (!file.exists(input_file)) {
+  stop("Missing prepared input RDA: ", input_file)
+}
+```
+
+# Variable specification
+
+The extraction is deliberately limited to items used in Step 2. Baseline BSMAS
+Items 1--6 and EMA `PMU1`--`PMU2` are mapped to Peripheral; baseline BSMAS
+Items 7--18 and EMA `PMU3`--`PMU6` are mapped to Core. The baseline depression,
+anxiety, and perceived-stress items are retained for the S2.4 latent SEM. These
+are theoretical item-group labels, not factor scores.
+
+```{r variable-specification}
+baseline_items <- paste0("V_BSMAS_", 1:18)
+depression_items <- paste0("K_CESD_", 1:7)
+anxiety_items <- paste0("L_DASS_", 1:7)
+stress_items <- paste0("M_PSS_", 1:10)
+baseline_outcome_items <- c(depression_items, anxiety_items, stress_items)
+baseline_all_items <- c(baseline_items, baseline_outcome_items)
+ema_items <- paste0("PMU", 1:6)
+
+baseline_required <- c("Name_ID", baseline_all_items)
+ema_required <- c("Data_ID", "Name_ID", "Day", "Time", ema_items)
+
+item_label <- function(x) {
+  value <- attr(x, "label", exact = TRUE)
+  if (is.null(value)) NA_character_ else as.character(value)
+}
+```
+
+# Load the prepared analysis entry
+
+The entry is loaded into a controlled environment and must contain only
+`dat_focal_analysis`. Baseline rows are recovered by selecting the required
+fields and keeping distinct rows; conflicting baseline responses within a
+participant will fail the uniqueness checks below. EMA rows are not collapsed.
+No raw data, private correction file or other Step 1 component RDA is needed.
+
+```{r load-inputs}
+input_environment <- new.env(parent = emptyenv())
+loaded_objects <- load(input_file, envir = input_environment)
+if (!identical(loaded_objects, "dat_focal_analysis")) {
+  stop("Input RDA must contain only dat_focal_analysis")
+}
+dat_focal_source <- input_environment$dat_focal_analysis
+
+missing_baseline_variables <- setdiff(baseline_required, names(dat_focal_source))
+missing_ema_variables <- setdiff(ema_required, names(dat_focal_source))
+
+if (length(missing_baseline_variables)) {
+  stop(
+    "Baseline input is missing required variables: ",
+    paste(missing_baseline_variables, collapse = ", ")
+  )
+}
+if (length(missing_ema_variables)) {
+  stop(
+    "EMA input is missing required variables: ",
+    paste(missing_ema_variables, collapse = ", ")
+  )
+}
+
+dat_baseline_source <- dat_focal_source |>
+  dplyr::select(dplyr::all_of(baseline_required)) |>
+  dplyr::distinct()
+dat_ema_source <- dat_focal_source |>
+  dplyr::select(dplyr::all_of(ema_required))
+
+input_overview <- data.frame(
+  source = c("Baseline fields from prepared entry", "EMA fields from prepared entry"),
+  object = c("dat_focal_analysis", "dat_focal_analysis"),
+  rows = c(nrow(dat_baseline_source), nrow(dat_ema_source)),
+  columns = c(ncol(dat_baseline_source), ncol(dat_ema_source)),
+  participants = c(
+    dplyr::n_distinct(dat_baseline_source$Name_ID),
+    dplyr::n_distinct(dat_ema_source$Name_ID)
+  ),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(input_overview)
+```
+
+# Validate source structure and coding
+
+These checks implement the verified 209-participant, 30-day, three-prompt design
+and fail before any output is written if the structural invariants are broken.
+
+```{r validate-source-structure}
+baseline_duplicate_ids <- dat_baseline_source |>
+  dplyr::count(Name_ID, name = "n") |>
+  dplyr::filter(n > 1L)
+
+ema_duplicate_prompt_keys <- dat_ema_source |>
+  dplyr::count(Name_ID, Day, Time, name = "n") |>
+  dplyr::filter(n > 1L)
+
+ema_duplicate_data_ids <- dat_ema_source |>
+  dplyr::count(Data_ID, name = "n") |>
+  dplyr::filter(n > 1L)
+
+prompts_per_participant <- dat_ema_source |>
+  dplyr::count(Name_ID, name = "scheduled_prompts")
+
+days_per_participant <- dat_ema_source |>
+  dplyr::distinct(Name_ID, Day) |>
+  dplyr::count(Name_ID, name = "scheduled_days")
+
+prompts_per_person_day <- dat_ema_source |>
+  dplyr::count(Name_ID, Day, name = "scheduled_prompts")
+
+baseline_ids <- sort(unique(dat_baseline_source$Name_ID))
+ema_ids <- sort(unique(dat_ema_source$Name_ID))
+
+all_baseline_items_numeric <- all(vapply(
+  dat_baseline_source[baseline_all_items],
+  is.numeric,
+  logical(1)
+))
+all_ema_items_numeric <- all(vapply(
+  dat_ema_source[ema_items],
+  is.numeric,
+  logical(1)
+))
+
+count_out_of_range <- function(data, items, valid_values) {
+  sum(vapply(
+    data[items],
+    function(x) sum(!is.na(x) & !(x %in% valid_values)),
+    integer(1)
+  ))
+}
+
+baseline_out_of_range <-
+  count_out_of_range(dat_baseline_source, baseline_items, 1:5) +
+  count_out_of_range(dat_baseline_source, depression_items, 1:4) +
+  count_out_of_range(dat_baseline_source, anxiety_items, 1:4) +
+  count_out_of_range(dat_baseline_source, stress_items, 1:5)
+ema_out_of_range <- sum(vapply(
+  dat_ema_source[ema_items],
+  function(x) sum(!is.na(x) & !(x %in% 1:5)),
+  integer(1)
+))
+
+stopifnot(
+  nrow(dat_baseline_source) == 209L,
+  nrow(dat_ema_source) == 18810L,
+  length(baseline_ids) == 209L,
+  length(ema_ids) == 209L,
+  identical(baseline_ids, ema_ids),
+  nrow(baseline_duplicate_ids) == 0L,
+  nrow(ema_duplicate_prompt_keys) == 0L,
+  nrow(ema_duplicate_data_ids) == 0L,
+  !anyNA(dat_baseline_source$Name_ID),
+  !anyNA(dat_ema_source[c("Data_ID", "Name_ID", "Day", "Time")]),
+  identical(sort(unique(dat_ema_source$Day)), 1:30),
+  identical(sort(unique(dat_ema_source$Time)), 1:3),
+  all(prompts_per_participant$scheduled_prompts == 90L),
+  all(days_per_participant$scheduled_days == 30L),
+  all(prompts_per_person_day$scheduled_prompts == 3L),
+  all_baseline_items_numeric,
+  all_ema_items_numeric,
+  baseline_out_of_range == 0L,
+  ema_out_of_range == 0L
+)
+
+structural_checks <- data.frame(
+  check = c(
+    "Baseline rows",
+    "EMA scheduled rows",
+    "Shared participants",
+    "Duplicate baseline IDs",
+    "Duplicate EMA prompt keys",
+    "Duplicate EMA Data_ID values",
+    "Days per participant",
+    "Prompts per participant",
+    "Prompts per person-day",
+    "Baseline out-of-range item cells",
+    "EMA out-of-range item cells"
+  ),
+  observed = c(
+    nrow(dat_baseline_source),
+    nrow(dat_ema_source),
+    length(intersect(baseline_ids, ema_ids)),
+    nrow(baseline_duplicate_ids),
+    nrow(ema_duplicate_prompt_keys),
+    nrow(ema_duplicate_data_ids),
+    paste(range(days_per_participant$scheduled_days), collapse = "-"),
+    paste(range(prompts_per_participant$scheduled_prompts), collapse = "-"),
+    paste(range(prompts_per_person_day$scheduled_prompts), collapse = "-"),
+    baseline_out_of_range,
+    ema_out_of_range
+  ),
+  expected = c(
+    "209",
+    "18810",
+    "209",
+    "0",
+    "0",
+    "0",
+    "30",
+    "90",
+    "3",
+    "0",
+    "0"
+  ),
+  passed = TRUE,
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(structural_checks)
+```
+
+# Extract the Step 2 item data
+
+Baseline and EMA rows remain separate in a single list object. Sorting makes the
+saved order deterministic without changing the prepared source RDA.
+
+```{r extract-data}
+dat_step2_baseline <- dat_baseline_source |>
+  dplyr::select(dplyr::all_of(baseline_required)) |>
+  dplyr::arrange(Name_ID) |>
+  as.data.frame()
+
+dat_step2_ema <- dat_ema_source |>
+  dplyr::select(dplyr::all_of(ema_required)) |>
+  dplyr::arrange(Name_ID, Day, Time) |>
+  as.data.frame()
+
+item_map <- dplyr::bind_rows(
+  data.frame(
+    level = "Baseline",
+    variable = baseline_items,
+    item_number = 1:18,
+    factor_group = ifelse(1:18 <= 6L, "Peripheral", "Core"),
+    construct = "Trait PSMU",
+    expected_min = 1,
+    expected_max = 5,
+    source_label = vapply(
+      dat_step2_baseline[baseline_items],
+      item_label,
+      character(1)
+    ),
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    level = "Baseline",
+    variable = depression_items,
+    item_number = 1:7,
+    factor_group = "Depression",
+    construct = "Baseline depression",
+    expected_min = 1,
+    expected_max = 4,
+    source_label = vapply(
+      dat_step2_baseline[depression_items],
+      item_label,
+      character(1)
+    ),
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    level = "Baseline",
+    variable = anxiety_items,
+    item_number = 1:7,
+    factor_group = "Anxiety",
+    construct = "Baseline anxiety",
+    expected_min = 1,
+    expected_max = 4,
+    source_label = vapply(
+      dat_step2_baseline[anxiety_items],
+      item_label,
+      character(1)
+    ),
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    level = "Baseline",
+    variable = stress_items,
+    item_number = 1:10,
+    factor_group = "Stress",
+    construct = "Baseline perceived stress",
+    expected_min = 1,
+    expected_max = 5,
+    source_label = vapply(
+      dat_step2_baseline[stress_items],
+      item_label,
+      character(1)
+    ),
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    level = "EMA",
+    variable = ema_items,
+    item_number = 1:6,
+    factor_group = ifelse(1:6 <= 2L, "Peripheral", "Core"),
+    construct = "State PSMU manifestation",
+    expected_min = 1,
+    expected_max = 5,
+    source_label = vapply(
+      dat_step2_ema[ema_items],
+      item_label,
+      character(1)
+    ),
+    stringsAsFactors = FALSE
+  )
+) |>
+  dplyr::arrange(
+    factor(level, levels = c("Baseline", "EMA")),
+    factor(
+      construct,
+      levels = c(
+        "Trait PSMU",
+        "Baseline depression",
+        "Baseline anxiety",
+        "Baseline perceived stress",
+        "State PSMU manifestation"
+      )
+    ),
+    item_number
+  ) |>
+  as.data.frame()
+
+knitr::kable(item_map)
+```
+
+# Build and save the canonical Step 2 object
+
+The audit stores only compact provenance and structural facts. Temporary
+descriptive summaries calculated later in this report are intentionally not
+stored in the RDA.
+
+```{r save-output}
+source_files <- data.frame(
+  role = "Prepared baseline and EMA source",
+  file = "Res_2_Data_for_Analysis/dat_focal_analysis.rda",
+  object = "dat_focal_analysis",
+  md5 = unname(tools::md5sum(input_file)),
+  stringsAsFactors = FALSE
+)
+
+output_structure <- data.frame(
+  component = c("baseline", "ema", "item_map"),
+  observation_level = c("Participant", "Scheduled EMA prompt", "Item mapping"),
+  rows = c(nrow(dat_step2_baseline), nrow(dat_step2_ema), nrow(item_map)),
+  columns = c(ncol(dat_step2_baseline), ncol(dat_step2_ema), ncol(item_map)),
+  stringsAsFactors = FALSE
+)
+
+dat_step2_audit <- list(
+  generated_by = "Step_2_Measurement_Models/S2_1_Prepare.Rmd",
+  output_file = "Res_2_Data_for_Analysis/dat_step2_measurement.rda",
+  source_files = source_files,
+  structure = output_structure,
+  checks = structural_checks
+)
+
+dat_step2_measurement <- list(
+  baseline = dat_step2_baseline,
+  ema = dat_step2_ema,
+  item_map = item_map,
+  audit = dat_step2_audit
+)
+
+stopifnot(
+  identical(names(dat_step2_measurement), c("baseline", "ema", "item_map", "audit")),
+  identical(names(dat_step2_measurement$baseline), baseline_required),
+  identical(names(dat_step2_measurement$ema), ema_required),
+  nrow(dat_step2_measurement$baseline) == 209L,
+  nrow(dat_step2_measurement$ema) == 18810L,
+  nrow(dat_step2_measurement$item_map) == 48L
+)
+
+save(dat_step2_measurement, file = output_file, compress = "xz", version = 3)
+
+verification_environment <- new.env(parent = emptyenv())
+verified_objects <- load(output_file, envir = verification_environment)
+
+if (!identical(verified_objects, "dat_step2_measurement")) {
+  stop(
+    "Output RDA must contain only dat_step2_measurement; found: ",
+    paste(verified_objects, collapse = ", ")
+  )
+}
+
+verified_step2 <- verification_environment$dat_step2_measurement
+
+stopifnot(
+  identical(verified_step2$baseline, dat_step2_baseline),
+  identical(verified_step2$ema, dat_step2_ema),
+  identical(verified_step2$item_map, item_map),
+  identical(verified_step2$audit, dat_step2_audit)
+)
+
+output_manifest <- data.frame(
+  file = "Res_2_Data_for_Analysis/dat_step2_measurement.rda",
+  top_level_object = verified_objects,
+  components = paste(names(verified_step2), collapse = ", "),
+  bytes = file.info(output_file)$size,
+  md5 = unname(tools::md5sum(output_file)),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(output_structure)
+knitr::kable(output_manifest)
+```
+
+# Descriptive checks of the saved Step 2 data
+
+All tables and plots below use the object reloaded from the saved RDA. Numeric
+summaries treat the 1--5 responses as numbers only to detect extraction or
+coding anomalies. S2.2.1 uses ordinal WLSMV; S2.2.2 and the EMA multilevel
+comparisons treat the indicators as continuous with MLR.
+
+## Missingness and usable EMA prompts
+
+```{r descriptive-missingness}
+baseline_check <- verified_step2$baseline
+ema_check <- verified_step2$ema
+
+item_missingness <- function(data, items, level) {
+  dplyr::bind_rows(lapply(items, function(item) {
+    data.frame(
+      level = level,
+      item = item,
+      n_total = nrow(data),
+      n_observed = sum(!is.na(data[[item]])),
+      n_missing = sum(is.na(data[[item]])),
+      missing_percent = 100 * mean(is.na(data[[item]])),
+      stringsAsFactors = FALSE
+    )
+  }))
+}
+
+missingness_table <- dplyr::bind_rows(
+  item_missingness(baseline_check, baseline_all_items, "Baseline"),
+  item_missingness(ema_check, ema_items, "EMA")
+)
+
+ema_observed_item_count <- rowSums(!is.na(ema_check[ema_items]))
+
+ema_prompt_patterns <- data.frame(
+  pattern = c(
+    "Complete on all 6 PMU items",
+    "Partially complete on 1-5 PMU items",
+    "Missing all 6 PMU items"
+  ),
+  prompts = c(
+    sum(ema_observed_item_count == 6L),
+    sum(ema_observed_item_count %in% 1:5),
+    sum(ema_observed_item_count == 0L)
+  ),
+  percent = 100 * c(
+    mean(ema_observed_item_count == 6L),
+    mean(ema_observed_item_count %in% 1:5),
+    mean(ema_observed_item_count == 0L)
+  ),
+  stringsAsFactors = FALSE
+)
+
+ema_check_with_complete <- ema_check |>
+  dplyr::mutate(complete_pmu = ema_observed_item_count == 6L)
+
+complete_by_time <- ema_check_with_complete |>
+  dplyr::group_by(Time) |>
+  dplyr::summarise(
+    scheduled_prompts = dplyr::n(),
+    complete_pmu_prompts = sum(complete_pmu),
+    complete_percent = 100 * mean(complete_pmu),
+    .groups = "drop"
+  )
+
+complete_by_participant <- ema_check_with_complete |>
+  dplyr::group_by(Name_ID) |>
+  dplyr::summarise(
+    scheduled_prompts = dplyr::n(),
+    complete_pmu_prompts = sum(complete_pmu),
+    complete_percent = 100 * mean(complete_pmu),
+    .groups = "drop"
+  )
+
+participant_completeness_summary <- data.frame(
+  statistic = c("Participants", "Mean", "SD", "Median", "Minimum", "Maximum"),
+  complete_pmu_percent = c(
+    nrow(complete_by_participant),
+    mean(complete_by_participant$complete_percent),
+    stats::sd(complete_by_participant$complete_percent),
+    stats::median(complete_by_participant$complete_percent),
+    min(complete_by_participant$complete_percent),
+    max(complete_by_participant$complete_percent)
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(
+  all(missingness_table$n_missing[missingness_table$level == "Baseline"] == 0L),
+  sum(ema_prompt_patterns$prompts) == nrow(ema_check),
+  ema_prompt_patterns$prompts[ema_prompt_patterns$pattern == "Complete on all 6 PMU items"] > 0L,
+  nrow(complete_by_participant) == 209L,
+  all(complete_by_participant$complete_pmu_prompts > 0L)
+)
+
+knitr::kable(missingness_table, digits = 3)
+knitr::kable(ema_prompt_patterns, digits = 3)
+knitr::kable(complete_by_time, digits = 3)
+knitr::kable(participant_completeness_summary, digits = 3)
+```
+
+## Item distributions
+
+```{r descriptive-item-distributions}
+item_descriptives <- function(data, items, level) {
+  description <- psych::describe(data[items], fast = FALSE)
+  data.frame(
+    level = level,
+    item = rownames(description),
+    n_observed = description$n,
+    mean = description$mean,
+    sd = description$sd,
+    median = description$median,
+    minimum = description$min,
+    maximum = description$max,
+    skewness = description$skew,
+    excess_kurtosis = description$kurtosis,
+    stringsAsFactors = FALSE,
+    row.names = NULL
+  )
+}
+
+baseline_descriptives <- dplyr::bind_rows(
+  item_descriptives(baseline_check, baseline_items, "Baseline Trait PSMU"),
+  item_descriptives(baseline_check, depression_items, "Baseline depression"),
+  item_descriptives(baseline_check, anxiety_items, "Baseline anxiety"),
+  item_descriptives(baseline_check, stress_items, "Baseline perceived stress")
+)
+ema_descriptives <- item_descriptives(
+  ema_check,
+  ema_items,
+  "EMA"
+)
+
+descriptive_table <- dplyr::bind_rows(
+  baseline_descriptives,
+  ema_descriptives
+)
+
+descriptive_table <- descriptive_table |>
+  dplyr::mutate(
+    expected_maximum = dplyr::case_when(
+      item %in% c(depression_items, anxiety_items) ~ 4,
+      TRUE ~ 5
+    )
+  )
+
+stopifnot(
+  all(descriptive_table$minimum == 1),
+  all(descriptive_table$maximum == descriptive_table$expected_maximum),
+  all(is.finite(descriptive_table$mean)),
+  all(descriptive_table$sd > 0)
+)
+
+knitr::kable(baseline_descriptives, digits = 3)
+knitr::kable(ema_descriptives, digits = 3)
+```
+
+## Response-category coverage
+
+```{r descriptive-category-coverage}
+category_frequencies <- function(data, items, level, responses) {
+  data |>
+    dplyr::select(dplyr::all_of(items)) |>
+    tidyr::pivot_longer(
+      cols = dplyr::everything(),
+      names_to = "item",
+      values_to = "response"
+    ) |>
+    dplyr::filter(!is.na(response)) |>
+    dplyr::mutate(response = as.integer(response)) |>
+    dplyr::count(item, response, name = "n") |>
+    tidyr::complete(
+      item = items,
+      response = responses,
+      fill = list(n = 0L)
+    ) |>
+    dplyr::group_by(item) |>
+    dplyr::mutate(percent_observed = 100 * n / sum(n)) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(
+      level = level,
+      item = factor(item, levels = items)
+    ) |>
+    dplyr::arrange(item, response)
+}
+
+baseline_category_frequency <- dplyr::bind_rows(
+  category_frequencies(baseline_check, baseline_items, "Baseline Trait PSMU", 1:5),
+  category_frequencies(baseline_check, depression_items, "Baseline depression", 1:4),
+  category_frequencies(baseline_check, anxiety_items, "Baseline anxiety", 1:4),
+  category_frequencies(baseline_check, stress_items, "Baseline perceived stress", 1:5)
+)
+ema_category_frequency <- category_frequencies(
+  ema_check,
+  ema_items,
+  "EMA",
+  1:5
+)
+
+category_coverage <- dplyr::bind_rows(
+  baseline_category_frequency,
+  ema_category_frequency
+) |>
+  dplyr::group_by(level, item) |>
+  dplyr::summarise(
+    categories_observed = sum(n > 0L),
+    smallest_category_n = min(n),
+    largest_category_n = max(n),
+    .groups = "drop"
+  )
+
+category_coverage <- category_coverage |>
+  dplyr::mutate(
+    expected_categories = dplyr::case_when(
+      as.character(item) %in% c(depression_items, anxiety_items) ~ 4L,
+      TRUE ~ 5L
+    )
+  )
+
+stopifnot(all(category_coverage$categories_observed == category_coverage$expected_categories))
+
+knitr::kable(category_coverage)
+```
+
+```{r category-distribution-plots, fig.width=11, fig.height=9}
+ggplot2::ggplot(
+  dplyr::filter(
+    baseline_category_frequency,
+    as.character(item) %in% baseline_items
+  ),
+  ggplot2::aes(x = factor(response), y = percent_observed)
+) +
+  ggplot2::geom_col(fill = "#4C78A8", width = 0.8) +
+  ggplot2::facet_wrap(~ item, ncol = 6, scales = "free_y") +
+  ggplot2::labs(
+    title = "Baseline Trait PSMU item response distributions",
+    x = "Response category",
+    y = "Percent of observed responses"
+  ) +
+  ggplot2::theme_minimal(base_size = 10)
+
+ggplot2::ggplot(
+  ema_category_frequency,
+  ggplot2::aes(x = factor(response), y = percent_observed)
+) +
+  ggplot2::geom_col(fill = "#F58518", width = 0.8) +
+  ggplot2::facet_wrap(~ item, ncol = 3, scales = "free_y") +
+  ggplot2::labs(
+    title = "EMA PSMU item response distributions",
+    x = "Response category",
+    y = "Percent of observed responses"
+  ) +
+  ggplot2::theme_minimal(base_size = 10)
+```
+
+## Scale-level and correlation checks
+
+The following means and totals are calculated only inside this report to check
+that the extracted items reproduce the expected scale distributions. They are
+not written into `dat_step2_measurement.rda` and do not replace the planned CFA.
+
+```{r descriptive-temporary-scale-checks}
+stress_scored <- baseline_check[stress_items]
+stress_reverse_items <- c("M_PSS_4", "M_PSS_5", "M_PSS_7", "M_PSS_8")
+stress_scored[stress_reverse_items] <- lapply(
+  stress_scored[stress_reverse_items],
+  function(x) 6 - x
+)
+
+baseline_temporary <- data.frame(
+  trait_psmu_total = rowSums(baseline_check[baseline_items]),
+  trait_peripheral_mean = rowMeans(baseline_check[baseline_items[1:6]]),
+  trait_core_mean = rowMeans(baseline_check[baseline_items[7:18]]),
+  depression_total = rowSums(baseline_check[depression_items]),
+  anxiety_total_0_3 = rowSums(
+    as.data.frame(lapply(baseline_check[anxiety_items], function(x) x - 1))
+  ),
+  perceived_stress_total = rowSums(stress_scored)
+)
+
+ema_complete_rows <- stats::complete.cases(ema_check[ema_items])
+ema_complete <- ema_check[ema_complete_rows, , drop = FALSE]
+ema_temporary <- data.frame(
+  state_psmu_mean = rowMeans(ema_complete[ema_items]),
+  state_peripheral_mean = rowMeans(ema_complete[ema_items[1:2]]),
+  state_core_mean = rowMeans(ema_complete[ema_items[3:6]])
+)
+
+temporary_summary <- function(data, level) {
+  description <- psych::describe(data, fast = FALSE)
+  data.frame(
+    level = level,
+    temporary_score = rownames(description),
+    n = description$n,
+    mean = description$mean,
+    sd = description$sd,
+    median = description$median,
+    minimum = description$min,
+    maximum = description$max,
+    skewness = description$skew,
+    excess_kurtosis = description$kurtosis,
+    stringsAsFactors = FALSE,
+    row.names = NULL
+  )
+}
+
+temporary_scale_summary <- dplyr::bind_rows(
+  temporary_summary(baseline_temporary, "Baseline"),
+  temporary_summary(ema_temporary, "EMA complete prompts")
+)
+
+baseline_item_correlations <- stats::cor(
+  baseline_check[baseline_all_items],
+  use = "complete.obs"
+)
+ema_item_correlations <- stats::cor(
+  ema_complete[ema_items],
+  use = "complete.obs"
+)
+
+off_diagonal_summary <- function(correlation_matrix, level) {
+  values <- correlation_matrix[lower.tri(correlation_matrix)]
+  data.frame(
+    level = level,
+    item_pairs = length(values),
+    minimum_correlation = min(values),
+    mean_correlation = mean(values),
+    maximum_correlation = max(values),
+    perfect_absolute_correlations = sum(abs(values) >= 0.999999),
+    stringsAsFactors = FALSE
+  )
+}
+
+correlation_sanity <- dplyr::bind_rows(
+  off_diagonal_summary(baseline_item_correlations, "Baseline"),
+  off_diagonal_summary(ema_item_correlations, "EMA complete prompts")
+)
+
+stopifnot(
+  all(is.finite(as.matrix(baseline_item_correlations))),
+  all(is.finite(as.matrix(ema_item_correlations))),
+  all(correlation_sanity$perfect_absolute_correlations == 0L)
+)
+
+knitr::kable(temporary_scale_summary, digits = 3)
+knitr::kable(correlation_sanity, digits = 3)
+```
+
+## EMA within- and between-person variation
+
+As a final descriptive diagnostic, a random-intercept model is fitted separately
+to each EMA item on the common six-item-complete prompt sample. The resulting
+variance components and ICCs are data checks only; treating the ordinal item as
+numeric here does not determine the estimator for the EMA CFA comparisons.
+
+```{r descriptive-multilevel-variation}
+ema_item_variation <- dplyr::bind_rows(lapply(ema_items, function(item) {
+  model_formula <- stats::as.formula(paste0(item, " ~ 1 + (1 | Name_ID)"))
+  fitted_model <- lme4::lmer(
+    formula = model_formula,
+    data = ema_complete,
+    REML = TRUE,
+    control = lme4::lmerControl(
+      check.conv.singular = "ignore",
+      optimizer = "bobyqa"
+    )
+  )
+
+  variance_components <- as.data.frame(lme4::VarCorr(fitted_model))
+  between_variance <- variance_components$vcov[variance_components$grp == "Name_ID"]
+  within_variance <- variance_components$vcov[variance_components$grp == "Residual"]
+
+  data.frame(
+    item = item,
+    prompts = stats::nobs(fitted_model),
+    participants = dplyr::n_distinct(ema_complete$Name_ID),
+    between_variance = between_variance,
+    within_variance = within_variance,
+    icc = between_variance / (between_variance + within_variance),
+    singular = lme4::isSingular(fitted_model, tol = 1e-5),
+    stringsAsFactors = FALSE
+  )
+}))
+
+stopifnot(
+  all(ema_item_variation$prompts == sum(ema_complete_rows)),
+  all(ema_item_variation$participants == 209L),
+  all(ema_item_variation$between_variance > 0),
+  all(ema_item_variation$within_variance > 0),
+  all(ema_item_variation$icc > 0 & ema_item_variation$icc < 1),
+  !any(ema_item_variation$singular)
+)
+
+knitr::kable(ema_item_variation, digits = 3)
+```
+
+```{r validation-checks, include=FALSE}
+validation_checks <- data.frame(
+  check = c(
+    "Saved RDA contains one top-level object",
+    "Saved object has baseline, ema, item_map, and audit components",
+    "Baseline contains 209 unique participants and 42 complete raw items",
+    "EMA preserves 18,810 scheduled prompts for 209 participants",
+    "Baseline and EMA participant sets are identical",
+    "All observed item responses follow their documented ranges",
+    "Every item uses every documented response category",
+    "No pair of extracted items is perfectly correlated",
+    "Every EMA item has positive within- and between-person variance",
+    "Temporary descriptive checks were not stored as output variables"
+  ),
+  passed = c(
+    identical(verified_objects, "dat_step2_measurement"),
+    identical(names(verified_step2), c("baseline", "ema", "item_map", "audit")),
+    nrow(baseline_check) == 209L &&
+      dplyr::n_distinct(baseline_check$Name_ID) == 209L &&
+      !anyNA(baseline_check[baseline_all_items]),
+    nrow(ema_check) == 18810L &&
+      dplyr::n_distinct(ema_check$Name_ID) == 209L,
+    identical(sort(unique(baseline_check$Name_ID)), sort(unique(ema_check$Name_ID))),
+    baseline_out_of_range == 0L && ema_out_of_range == 0L,
+    all(category_coverage$categories_observed == category_coverage$expected_categories),
+    all(correlation_sanity$perfect_absolute_correlations == 0L),
+    all(ema_item_variation$between_variance > 0) &&
+      all(ema_item_variation$within_variance > 0),
+    !any(c(
+      "trait_psmu_total",
+      "trait_peripheral_mean",
+      "trait_core_mean",
+      "depression_total",
+      "anxiety_total_0_3",
+      "perceived_stress_total"
+    ) %in% names(verified_step2$baseline)) &&
+      !any(c(
+        "state_psmu_mean",
+        "state_peripheral_mean",
+        "state_core_mean"
+      ) %in% names(verified_step2$ema))
+  ),
+  stringsAsFactors = FALSE
+)
+
+if (!all(validation_checks$passed)) {
+  stop(
+    "Step 2 data validation failed: ",
+    paste(validation_checks$check[!validation_checks$passed], collapse = "; ")
+  )
+}
+
+
+```

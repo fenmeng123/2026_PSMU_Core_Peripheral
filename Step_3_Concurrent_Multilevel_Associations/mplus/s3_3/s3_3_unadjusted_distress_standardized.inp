@@ -1,0 +1,39 @@
+TITLE:
+! Author: Kunru Song
+! Step 3.3 Distress model without Engagement Time.
+! Concurrent association; Time and Day are within-level design controls.
+Level-standardized focal model
+DATA:
+FILE = "F:/2026_[8]_PSMU_Daily_CorePeripheral/
+Step_3_Concurrent_Multilevel_Associations/mplus/s3_3/
+s3_3_unadjusted_distress_standardized.dat"; 
+VARIABLE:
+NAMES = id dayc tm2 tm3 diswz corewz periwz disbz corebz peribz; 
+ MISSING=.;
+ CLUSTER = id;
+WITHIN = diswz corewz periwz dayc tm2 tm3;
+BETWEEN = disbz corebz peribz;
+ANALYSIS:
+TYPE = TWOLEVEL;
+ESTIMATOR = MLR;
+MODEL:
+%WITHIN%
+diswz ON corewz (wc);
+diswz ON periwz (wp);
+diswz ON dayc;
+diswz ON tm2;
+diswz ON tm3;
+%BETWEEN%
+disbz ON corebz (bc);
+disbz ON peribz (bp);
+MODEL CONSTRAINT:
+NEW(wdiff bdiff);
+wdiff = wc - wp;
+bdiff = bc - bp;
+OUTPUT:
+SAMPSTAT;
+STANDARDIZED(STDYX);
+CINTERVAL;
+RESIDUAL;
+TECH1;
+TECH4;

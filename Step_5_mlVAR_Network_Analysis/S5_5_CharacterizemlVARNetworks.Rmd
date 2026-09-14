@@ -1,0 +1,732 @@
+---
+title: "S5.5 Characterize primary mlVAR networks"
+author: "Kunru Song"
+date: "2026-07-23"
+params:
+  use_saved_results: false
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!-- Author: Kunru Song -->
+
+This report characterizes the accepted S5.3 networks using the prespecified,
+network-specific measures. Temporal centrality is signed expected influence
+only; contemporaneous and between-person centrality is absolute strength only.
+Autoregressive self-loops and temporal predictability are reported separately.
+Signed, target-specific bridge expected influence for all three networks is
+reported in S6.2; undirected cross-community absolute-weight summaries are not
+part of this report.
+
+Set `use_saved_results = TRUE` when rendering an existing analysis report from
+its saved aggregate results and SVG figures. This mode performs no analysis or
+result export; the default mode runs the reproducible calculation and export
+code shown below.
+
+```{r setup, include=FALSE}
+stopifnot(is.logical(params$use_saved_results),
+          length(params$use_saved_results) == 1L, !is.na(params$use_saved_results))
+use_saved_results <- params$use_saved_results
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  collapse = FALSE, comment = NA, dev = "svglite"
+)
+
+required_packages <- c(
+  "bruceR", "dplyr", "ggplot2", "knitr", "openxlsx", "readxl",
+  "rmarkdown", "svglite", "tibble", "tidyr"
+)
+available <- vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(available)) {
+  stop("Missing required R packages: ", paste(names(available)[!available], collapse = ", "))
+}
+
+report_file <- knitr::current_input(dir = TRUE)
+report_directory <- if (length(report_file) == 1L && file.exists(report_file)) {
+  dirname(normalizePath(report_file, winslash = "/", mustWork = TRUE))
+} else getwd()
+helper_candidates <- c(
+  file.path(report_directory, "S5_0_mlVARHelpers.R"),
+  file.path(getwd(), "S5_0_mlVARHelpers.R"),
+  file.path(getwd(), "Step_5_mlVAR_Network_Analysis", "S5_0_mlVARHelpers.R"),
+  file.path(dirname(getwd()), "Step_5_mlVAR_Network_Analysis", "S5_0_mlVARHelpers.R")
+)
+helper_file <- helper_candidates[file.exists(helper_candidates)][1L]
+if (is.na(helper_file)) stop("Could not locate S5_0_mlVARHelpers.R")
+source(helper_file, local = TRUE, encoding = "UTF-8")
+
+project_root <- locate_project_root(dirname(helper_file))
+knitr::opts_knit$set(root.dir = project_root)
+
+data_file <- file.path(project_root, "Res_2_Data_for_Analysis", "dat_step5_mlvar.rda")
+fit_file <- file.path(project_root, "Res_2_Data_for_Analysis", "fit_s5_2_primary_mlvar.rda")
+network_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "results_s5_3_mlvar_networks.rda"
+)
+result_file <- file.path(
+  project_root, "Res_2_Data_for_Analysis", "results_s5_5_mlvar_characteristics.rda"
+)
+table_file <- file.path(project_root, "Res_3_Results", "Table_S5_5_mlVARCharacteristics.xlsx")
+figure_files <- c(
+  CentralityFull = file.path(
+    project_root, "Res_3_Results", "Figure_S5_5_mlVAR_CentralityFull.svg"
+  ),
+  CentralitySparse = file.path(
+    project_root, "Res_3_Results", "Figure_S5_5_mlVAR_CentralitySparse.svg"
+  ),
+  BridgeProfiles = file.path(
+    project_root, "Res_3_Results", "Figure_S5_5_mlVAR_BridgeProfiles.svg"
+  ),
+  Predictability = file.path(
+    project_root, "Res_3_Results", "Figure_S5_5_mlVAR_Predictability.svg"
+  )
+)
+
+stopifnot(all(file.exists(c(data_file, fit_file, network_file, helper_file))))
+if (!use_saved_results) {
+  dir.create(dirname(table_file), recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+```{r load-saved-results, include=FALSE, eval=use_saved_results}
+saved_results <- load_single_object(result_file, "results_s5_5_mlvar_characteristics")
+saved_input_hashes <- unlist(saved_results$provenance[c(
+  "data_md5", "fit_md5", "network_md5"
+)], use.names = FALSE)
+stopifnot(
+  identical(saved_input_hashes, unname(tools::md5sum(c(
+    data_file, fit_file, network_file
+  )))),
+  nrow(saved_results$centrality) == 144L,
+  nrow(saved_results$locked_metric_audit) == 6L,
+  nrow(saved_results$autoregressive_inertia) == 12L,
+  nrow(saved_results$temporal_predictability) == 12L,
+  all(file.exists(figure_files)), all(file.info(figure_files)$size > 1000)
+)
+locked_metric_audit <- saved_results$locked_metric_audit
+autoregressive_inertia <- saved_results$autoregressive_inertia
+temporal_predictability <- saved_results$temporal_predictability
+```
+
+```{r saved-mode-note, echo=FALSE, results='asis', eval=use_saved_results}
+cat("This report displays saved aggregate results and existing SVG figures; ",
+    "the analysis was not re-executed during this report refresh.\n\n", sep = "")
+```
+
+# Load accepted upstream objects
+
+```{r load-upstream, eval=!use_saved_results}
+dat_step5_mlvar <- load_single_object(data_file, "dat_step5_mlvar")
+fit_s5_2_primary_mlvar <- load_single_object(fit_file, "fit_s5_2_primary_mlvar")
+results_s5_3_mlvar_networks <- load_single_object(
+  network_file, "results_s5_3_mlvar_networks"
+)
+
+node_map <- dat_step5_mlvar$node_map
+node_names <- node_map$node
+full_matrices <- results_s5_3_mlvar_networks$full_matrices[c(
+  "temporal", "contemporaneous", "between"
+)]
+sparse_matrices <- results_s5_3_mlvar_networks$sparse_matrices
+edge_tables <- results_s5_3_mlvar_networks$edge_tables
+
+stopifnot(
+  nrow(node_map) == 12L,
+  identical(node_map$node, node_names),
+  identical(sort(unique(node_map$community)), sort(c(
+    "Engagement Time", "PSMU", "Distress"
+  ))),
+  sum(node_map$subgroup == "Core", na.rm = TRUE) == 4L,
+  sum(node_map$subgroup == "Peripheral", na.rm = TRUE) == 2L,
+  all(vapply(c(full_matrices, sparse_matrices), function(x) {
+    identical(dim(x), c(12L, 12L)) &&
+      identical(rownames(x), node_names) && identical(colnames(x), node_names) &&
+      all(is.finite(x))
+  }, logical(1)))
+)
+```
+
+# Centrality calculations
+
+All self-loops are set to zero before centrality calculation. The full matrices
+are canonical; the raw-p sparse matrices are a prespecified display-threshold
+sensitivity and are never used to choose a preferred ranking. Because this
+threshold uses unadjusted `p < .05`, the sparse version is exploratory.
+
+```{r centrality-functions, eval=!use_saved_results}
+node_metadata <- node_map |>
+  dplyr::select(node, label, short_label, community, subgroup)
+
+temporal_centrality <- function(matrix, version) {
+  matrix <- matrix[node_names, node_names, drop = FALSE]
+  diag(matrix) <- 0
+  community <- stats::setNames(node_map$community, node_map$node)
+
+  dplyr::bind_rows(lapply(node_names, function(node) {
+    other_community <- community != community[[node]]
+    data.frame(
+      version = version,
+      network = "Temporal",
+      node = node,
+      metric = c(
+        "Outgoing expected influence", "Incoming expected influence",
+        "Bridge outgoing expected influence", "Bridge incoming expected influence"
+      ),
+      value = c(
+        sum(matrix[node, ]),
+        sum(matrix[, node]),
+        sum(matrix[node, other_community]),
+        sum(matrix[other_community, node])
+      ),
+      stringsAsFactors = FALSE
+    )
+  })) |>
+    dplyr::left_join(node_metadata, by = "node")
+}
+
+undirected_centrality <- function(matrix, version, network) {
+  matrix <- matrix[node_names, node_names, drop = FALSE]
+  diag(matrix) <- 0
+  dplyr::bind_rows(lapply(node_names, function(node) {
+    data.frame(
+      version = version,
+      network = network,
+      node = node,
+      metric = "Strength",
+      value = sum(abs(matrix[node, ])),
+      stringsAsFactors = FALSE
+    )
+  })) |>
+    dplyr::left_join(node_metadata, by = "node")
+}
+
+centrality <- dplyr::bind_rows(
+  temporal_centrality(full_matrices$temporal, "Full"),
+  undirected_centrality(
+    full_matrices$contemporaneous, "Full", "Contemporaneous"
+  ),
+  undirected_centrality(full_matrices$between, "Full", "Between-person"),
+  temporal_centrality(sparse_matrices$temporal, "Raw-p sparse"),
+  undirected_centrality(
+    sparse_matrices$contemporaneous, "Raw-p sparse", "Contemporaneous"
+  ),
+  undirected_centrality(
+    sparse_matrices$between, "Raw-p sparse", "Between-person"
+  )
+) |>
+  dplyr::mutate(
+    network_metric = paste(network, metric, sep = ": "),
+    node = factor(node, levels = rev(node_names))
+  )
+
+locked_metric_audit <- centrality |>
+  dplyr::distinct(network, metric) |>
+  dplyr::arrange(network, metric)
+
+stopifnot(
+  nrow(centrality) == (12L * 4L + 12L + 12L) * 2L,
+  !any(grepl("strength", centrality$metric[
+    centrality$network == "Temporal"
+  ], ignore.case = TRUE)),
+  !any(grepl("expected influence", centrality$metric[
+    centrality$network != "Temporal"
+  ], ignore.case = TRUE)),
+  !any(grepl("closeness|betweenness", centrality$metric, ignore.case = TRUE)),
+  all(is.finite(centrality$value))
+)
+
+```
+
+```{r metric-table}
+knitr::kable(locked_metric_audit, format = "html", row.names = FALSE)
+```
+
+# Inertia and temporal predictability
+
+```{r inertia-predictability, eval=!use_saved_results}
+autoregressive_inertia <- data.frame(
+  node = node_names,
+  estimate_full = diag(full_matrices$temporal),
+  estimate_sparse = diag(sparse_matrices$temporal),
+  stringsAsFactors = FALSE
+) |>
+  dplyr::left_join(node_metadata, by = "node") |>
+  dplyr::mutate(supported_p05 = estimate_sparse != 0)
+
+model_data <- fit_s5_2_primary_mlvar$model$data
+model_residuals <- fit_s5_2_primary_mlvar$model$step1_residuals
+stopifnot(
+  nrow(model_data) == nrow(model_residuals),
+  all(node_names %in% names(model_data)),
+  all(node_names %in% names(model_residuals)),
+  "Name_ID" %in% names(model_data)
+)
+
+temporal_predictability <- dplyr::bind_rows(lapply(node_names, function(node) {
+  outcome <- model_data[[node]]
+  residual <- model_residuals[[node]]
+  person_mean <- ave(outcome, model_data$Name_ID, FUN = function(x) mean(x, na.rm = TRUE))
+  centered_outcome <- outcome - person_mean
+  denominator <- sum(centered_outcome^2, na.rm = TRUE)
+  residual_ss <- sum(residual^2, na.rm = TRUE)
+  data.frame(
+    node = node,
+    observations = sum(stats::complete.cases(centered_outcome, residual)),
+    within_total_ss = denominator,
+    conditional_residual_ss = residual_ss,
+    temporal_predictability_r2 = 1 - residual_ss / denominator,
+    stringsAsFactors = FALSE
+  )
+})) |>
+  dplyr::left_join(node_metadata, by = "node")
+
+stopifnot(
+  nrow(temporal_predictability) == 12L,
+  all(temporal_predictability$observations == nrow(model_data)),
+  all(is.finite(temporal_predictability$temporal_predictability_r2)),
+  all(temporal_predictability$temporal_predictability_r2 <= 1)
+)
+
+```
+
+```{r inertia-table}
+knitr::kable(round_numeric_columns(autoregressive_inertia), format = "html", row.names = FALSE)
+```
+
+```{r predictability-table}
+knitr::kable(round_numeric_columns(temporal_predictability), format = "html", row.names = FALSE)
+```
+
+# Network characteristics and edge categories
+
+```{r network-characteristics, eval=!use_saved_results}
+network_characteristics <- dplyr::bind_rows(
+  edge_tables$temporal |>
+    dplyr::mutate(
+      network = "Temporal cross-lag",
+      included = !self_loop,
+      supported = supported_p05
+    ) |>
+    dplyr::filter(included) |>
+    dplyr::summarise(
+      network = dplyr::first(network), possible_edges = dplyr::n(),
+      supported_edges = sum(supported), density_sparse = mean(supported),
+      positive_supported = sum(supported & estimate > 0),
+      negative_supported = sum(supported & estimate < 0),
+      mean_signed_full = mean(estimate), mean_absolute_full = mean(abs(estimate)),
+      maximum_absolute_full = max(abs(estimate))
+    ),
+  edge_tables$contemporaneous |>
+    dplyr::mutate(network = "Contemporaneous", supported = supported_p05) |>
+    dplyr::summarise(
+      network = dplyr::first(network), possible_edges = dplyr::n(),
+      supported_edges = sum(supported), density_sparse = mean(supported),
+      positive_supported = sum(supported & estimate > 0),
+      negative_supported = sum(supported & estimate < 0),
+      mean_signed_full = mean(estimate), mean_absolute_full = mean(abs(estimate)),
+      maximum_absolute_full = max(abs(estimate))
+    ),
+  edge_tables$between |>
+    dplyr::mutate(network = "Between-person", supported = supported_p05) |>
+    dplyr::summarise(
+      network = dplyr::first(network), possible_edges = dplyr::n(),
+      supported_edges = sum(supported), density_sparse = mean(supported),
+      positive_supported = sum(supported & estimate > 0),
+      negative_supported = sum(supported & estimate < 0),
+      mean_signed_full = mean(estimate), mean_absolute_full = mean(abs(estimate)),
+      maximum_absolute_full = max(abs(estimate))
+    )
+)
+
+temporal_edge_categories <- edge_tables$temporal |>
+  dplyr::filter(!self_loop) |>
+  dplyr::transmute(
+    network = "Temporal", relation = paste(from_community, "->", to_community),
+    estimate, supported = supported_p05
+  )
+undirected_categories <- function(edges, network) {
+  edges |>
+    dplyr::rowwise() |>
+    dplyr::mutate(
+      relation = paste(sort(c(node1_community, node2_community)), collapse = " -- ")
+    ) |>
+    dplyr::ungroup() |>
+    dplyr::transmute(network = network, relation, estimate, supported = supported_p05)
+}
+edge_category_summary <- dplyr::bind_rows(
+  temporal_edge_categories,
+  undirected_categories(edge_tables$contemporaneous, "Contemporaneous"),
+  undirected_categories(edge_tables$between, "Between-person")
+) |>
+  dplyr::group_by(network, relation) |>
+  dplyr::summarise(
+    possible_edges = dplyr::n(), supported_edges = sum(supported),
+    mean_signed_full = mean(estimate), mean_absolute_full = mean(abs(estimate)),
+    mean_signed_sparse = mean(ifelse(supported, estimate, 0)),
+    mean_absolute_sparse = mean(ifelse(supported, abs(estimate), 0)),
+    .groups = "drop"
+  )
+
+stopifnot(
+  sum(network_characteristics$possible_edges) == 132L + 66L + 66L,
+  all(network_characteristics$supported_edges == c(
+    sum(!edge_tables$temporal$self_loop & edge_tables$temporal$supported_p05),
+    sum(edge_tables$contemporaneous$supported_p05),
+    sum(edge_tables$between$supported_p05)
+  ))
+)
+```
+
+# Normalized Core-Peripheral summaries
+
+Because Core contains four nodes and Peripheral contains two, every subgroup
+summary below is a mean per node or mean per possible edge, never a raw sum.
+
+```{r subgroup-summaries, eval=!use_saved_results}
+subgroup_centrality <- centrality |>
+  dplyr::filter(as.character(subgroup) %in% c("Core", "Peripheral")) |>
+  dplyr::mutate(subgroup = as.character(subgroup)) |>
+  dplyr::group_by(version, network, metric, subgroup) |>
+  dplyr::summarise(
+    nodes = dplyr::n(), mean_per_node = mean(value), sd_across_nodes = stats::sd(value),
+    .groups = "drop"
+  ) |>
+  tidyr::pivot_wider(
+    names_from = subgroup,
+    values_from = c(nodes, mean_per_node, sd_across_nodes)
+  ) |>
+  dplyr::mutate(
+    core_minus_peripheral_mean = mean_per_node_Core - mean_per_node_Peripheral
+  )
+
+make_temporal_bridge_profiles <- function(matrix, version) {
+  psmu <- node_map |>
+    dplyr::filter(community == "PSMU") |>
+    dplyr::select(node, subgroup)
+  targets <- c("Engagement Time", "Distress")
+  dplyr::bind_rows(lapply(seq_len(nrow(psmu)), function(index) {
+    node <- psmu$node[[index]]
+    dplyr::bind_rows(lapply(targets, function(target) {
+      target_nodes <- node_map$node[node_map$community == target]
+      data.frame(
+        version = version, network = "Temporal", subgroup = psmu$subgroup[[index]],
+        psmu_node = node, target_community = target,
+        direction = c("PSMU -> target", "target -> PSMU"),
+        normalized_bridge_value = c(
+          mean(matrix[node, target_nodes]), mean(matrix[target_nodes, node])
+        ),
+        metric = "Signed mean per possible edge",
+        stringsAsFactors = FALSE
+      )
+    }))
+  }))
+}
+
+bridge_profiles_node <- dplyr::bind_rows(
+  make_temporal_bridge_profiles(full_matrices$temporal, "Full"),
+  make_temporal_bridge_profiles(sparse_matrices$temporal, "Raw-p sparse")
+)
+
+bridge_profiles_subgroup <- bridge_profiles_node |>
+  dplyr::group_by(
+    version, network, subgroup, target_community, direction, metric
+  ) |>
+  dplyr::summarise(
+    psmu_nodes = dplyr::n(),
+    mean_per_node_and_possible_edge = mean(normalized_bridge_value),
+    sd_across_psmu_nodes = stats::sd(normalized_bridge_value),
+    .groups = "drop"
+  ) |>
+  tidyr::pivot_wider(
+    names_from = subgroup,
+    values_from = c(
+      psmu_nodes, mean_per_node_and_possible_edge, sd_across_psmu_nodes
+    )
+  ) |>
+  dplyr::mutate(
+    core_minus_peripheral = mean_per_node_and_possible_edge_Core -
+      mean_per_node_and_possible_edge_Peripheral
+  )
+
+stopifnot(
+  all(subgroup_centrality$nodes_Core == 4L),
+  all(subgroup_centrality$nodes_Peripheral == 2L),
+  all(bridge_profiles_subgroup$psmu_nodes_Core == 4L),
+  all(bridge_profiles_subgroup$psmu_nodes_Peripheral == 2L),
+  all(is.finite(bridge_profiles_subgroup$core_minus_peripheral))
+)
+```
+
+# Figures
+
+```{r figures, fig.width=14, fig.height=11, eval=!use_saved_results}
+community_colors <- c(
+  "Engagement Time" = "#D99A28", "PSMU" = "#7A4CC2", "Distress" = "#319B55"
+)
+
+make_centrality_plot <- function(version) {
+  centrality |>
+    dplyr::filter(.data$version == .env$version) |>
+    ggplot2::ggplot(ggplot2::aes(x = value, y = node, color = community)) +
+    ggplot2::geom_vline(xintercept = 0, linewidth = 0.25, color = "grey75") +
+    ggplot2::geom_segment(
+      ggplot2::aes(x = 0, xend = value, yend = node), linewidth = 0.65, alpha = 0.75
+    ) +
+    ggplot2::geom_point(size = 2.6) +
+    ggplot2::facet_wrap(~ network_metric, scales = "free_x", ncol = 2) +
+    ggplot2::scale_color_manual(values = community_colors) +
+    ggplot2::labs(
+      title = paste(version, "network-specific centrality"),
+      subtitle = paste(
+        "Temporal: signed EI only; contemporaneous/between-person: strength only;",
+        "self-loops excluded"
+      ),
+      x = "Centrality value", y = NULL, color = "Community"
+    ) +
+    ggplot2::theme_minimal(base_size = 10) +
+    ggplot2::theme(
+      panel.grid.minor = ggplot2::element_blank(),
+      strip.text = ggplot2::element_text(face = "bold"),
+      panel.spacing.x = grid::unit(2, "lines"),
+      plot.title = ggplot2::element_text(face = "bold")
+    )
+}
+
+centrality_full_plot <- make_centrality_plot("Full")
+centrality_sparse_plot <- make_centrality_plot("Raw-p sparse")
+
+bridge_profiles_plot <- bridge_profiles_subgroup |>
+  dplyr::filter(version == "Full") |>
+  dplyr::select(
+    network, target_community, direction,
+    Core = mean_per_node_and_possible_edge_Core,
+    Peripheral = mean_per_node_and_possible_edge_Peripheral
+  ) |>
+  tidyr::pivot_longer(c(Core, Peripheral), names_to = "subgroup", values_to = "value") |>
+  dplyr::mutate(panel = paste(network, direction, sep = ": ")) |>
+  ggplot2::ggplot(ggplot2::aes(x = target_community, y = value, fill = subgroup)) +
+  ggplot2::geom_col(position = ggplot2::position_dodge(width = 0.75), width = 0.68) +
+  ggplot2::facet_wrap(~ panel, scales = "free_y") +
+  ggplot2::scale_fill_manual(values = c(Core = "#6A3D9A", Peripheral = "#B39DDB")) +
+  ggplot2::labs(
+    title = "Temporal Core-Peripheral bridge profiles from the full network",
+    subtitle = paste(
+      "Means per PSMU node and possible cross-community edge;",
+      "signed temporal weights; undirected Bridge EI is reported in S6.2"
+    ),
+    x = "Target community", y = "Normalized bridge value", fill = "PSMU subgroup"
+  ) +
+  ggplot2::theme_minimal(base_size = 10) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    strip.text = ggplot2::element_text(face = "bold"),
+    plot.title = ggplot2::element_text(face = "bold")
+  )
+
+predictability_plot <- temporal_predictability |>
+  dplyr::mutate(node = factor(node, levels = node_names)) |>
+  ggplot2::ggplot(
+    ggplot2::aes(x = node, y = temporal_predictability_r2, fill = community)
+  ) +
+  ggplot2::geom_col(width = 0.72) +
+  ggplot2::scale_fill_manual(values = community_colors) +
+  ggplot2::scale_y_continuous(limits = c(0, NA)) +
+  ggplot2::labs(
+    title = "Node-wise temporal predictability",
+    subtitle = "Conditional sample R-squared; a non-centrality summary",
+    x = NULL, y = expression(R^2), fill = "Community"
+  ) +
+  ggplot2::theme_minimal(base_size = 10) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 40, hjust = 1),
+    panel.grid.minor = ggplot2::element_blank(),
+    plot.title = ggplot2::element_text(face = "bold")
+  )
+
+ggplot2::ggsave(
+  figure_files[["CentralityFull"]], centrality_full_plot,
+  width = 13, height = 11, units = "in", device = svglite::svglite
+)
+ggplot2::ggsave(
+  figure_files[["CentralitySparse"]], centrality_sparse_plot,
+  width = 13, height = 11, units = "in", device = svglite::svglite
+)
+ggplot2::ggsave(
+  figure_files[["BridgeProfiles"]], bridge_profiles_plot,
+  width = 12, height = 7.5, units = "in", device = svglite::svglite
+)
+ggplot2::ggsave(
+  figure_files[["Predictability"]], predictability_plot,
+  width = 10, height = 6.5, units = "in", device = svglite::svglite
+)
+
+centrality_full_plot
+bridge_profiles_plot
+predictability_plot
+```
+
+```{r saved-figures, echo=FALSE, out.width='100%', eval=use_saved_results}
+knitr::include_graphics(unname(figure_files[c(
+  "CentralityFull", "BridgeProfiles", "Predictability"
+)]), rel_path = FALSE)
+```
+
+```{r export-results, include=FALSE, eval=!use_saved_results}
+workbook_sheets <- list(
+  Network_Characteristics = round_numeric_columns(network_characteristics),
+  Centrality_Full = round_numeric_columns(
+    centrality |> dplyr::filter(version == "Full") |>
+      dplyr::mutate(node = as.character(node))
+  ),
+  Centrality_Sparse = round_numeric_columns(
+    centrality |> dplyr::filter(version == "Raw-p sparse") |>
+      dplyr::mutate(node = as.character(node))
+  ),
+  Locked_Metric_Audit = locked_metric_audit,
+  Autoregressive_Inertia = round_numeric_columns(autoregressive_inertia),
+  Temporal_Predictability = round_numeric_columns(temporal_predictability),
+  Subgroup_Centrality = round_numeric_columns(subgroup_centrality),
+  Bridge_Profiles_Full = round_numeric_columns(
+    bridge_profiles_subgroup |> dplyr::filter(version == "Full")
+  ),
+  Bridge_Profiles_Sparse = round_numeric_columns(
+    bridge_profiles_subgroup |> dplyr::filter(version == "Raw-p sparse")
+  ),
+  Edge_Category_Summary = round_numeric_columns(edge_category_summary),
+  Node_Map = node_map
+)
+
+bruceR::export(workbook_sheets, file = table_file, overwrite = TRUE)
+style_and_sanitize_workbook(table_file, workbook_sheets)
+
+sheet_names <- readxl::excel_sheets(table_file)
+reloaded_sheets <- stats::setNames(
+  lapply(sheet_names, function(sheet) {
+    readxl::read_excel(table_file, sheet = sheet, .name_repair = "minimal")
+  }),
+  sheet_names
+)
+formula_errors <- sum(vapply(reloaded_sheets, function(data) {
+  sum(
+    grepl(
+      "^#(REF|VALUE|DIV/0|NAME|N/A|NUM|NULL)",
+      as.matrix(data), ignore.case = TRUE
+    ),
+    na.rm = TRUE
+  )
+}, numeric(1)))
+
+figure_audit <- data.frame(
+  figure = names(figure_files), file = basename(figure_files),
+  bytes = as.numeric(file.info(figure_files)$size),
+  md5 = unname(tools::md5sum(figure_files)), saved_by_ggsave = TRUE,
+  stringsAsFactors = FALSE
+)
+workbook_audit <- data.frame(
+  file = "Res_3_Results/Table_S5_5_mlVARCharacteristics.xlsx",
+  sheets = length(sheet_names),
+  exact_sheet_names = identical(sheet_names, names(workbook_sheets)),
+  formula_errors = formula_errors,
+  bytes = as.numeric(file.info(table_file)$size),
+  md5 = unname(tools::md5sum(table_file)),
+  stringsAsFactors = FALSE
+)
+
+results_s5_5_mlvar_characteristics <- list(
+  network_characteristics = network_characteristics,
+  edge_category_summary = edge_category_summary,
+  centrality = centrality |> dplyr::mutate(node = as.character(node)),
+  locked_metric_audit = locked_metric_audit,
+  autoregressive_inertia = autoregressive_inertia,
+  temporal_predictability = temporal_predictability,
+  subgroup_centrality = subgroup_centrality,
+  bridge_profiles_node = bridge_profiles_node,
+  bridge_profiles_subgroup = bridge_profiles_subgroup,
+  workbook_audit = workbook_audit,
+  figure_audit = figure_audit,
+  provenance = list(
+    data_input = "Res_2_Data_for_Analysis/dat_step5_mlvar.rda",
+    data_md5 = unname(tools::md5sum(data_file)),
+    fit_input = "Res_2_Data_for_Analysis/fit_s5_2_primary_mlvar.rda",
+    fit_md5 = unname(tools::md5sum(fit_file)),
+    network_input = "Res_2_Data_for_Analysis/results_s5_3_mlvar_networks.rda",
+    network_md5 = unname(tools::md5sum(network_file)),
+    generating_script = "Step_5_mlVAR_Network_Analysis/S5_5_CharacterizemlVARNetworks.Rmd",
+    canonical_centrality = "Full unthresholded matrices",
+    sparse_sensitivity = paste(
+      "Unadjusted p < .05 sparse matrices; exploratory display-threshold",
+      "sensitivity with no multiplicity correction"
+    ),
+    temporal_metrics = c(
+      "Outgoing expected influence", "Incoming expected influence",
+      "Bridge outgoing expected influence", "Bridge incoming expected influence"
+    ),
+    undirected_metrics = "Strength",
+    excluded_from_this_report = c(
+      "Temporal strength", "Closeness", "Betweenness"
+    ),
+    bridge_expected_influence_owner = "S6_2_NodeBridgeExpectedInfluence.R",
+    normalization_rule = "Core and Peripheral comparisons use means per node/possible edge"
+  )
+)
+
+save(results_s5_5_mlvar_characteristics, file = result_file, version = 2)
+rm(results_s5_5_mlvar_characteristics)
+results_s5_5_mlvar_characteristics <- load_single_object(
+  result_file, "results_s5_5_mlvar_characteristics"
+)
+
+stopifnot(
+  identical(sheet_names, names(workbook_sheets)),
+  formula_errors == 0L,
+  all(figure_audit$bytes > 1000),
+  all(figure_audit$saved_by_ggsave),
+  file.exists(result_file),
+  nrow(results_s5_5_mlvar_characteristics$centrality) == nrow(centrality)
+)
+
+```
+
+```{r validate-exports, include=FALSE, eval=!use_saved_results}
+s5_5_acceptance <- data.frame(
+  criterion = c(
+    "Canonical statistics calculated from full unthresholded matrices",
+    "Same locked statistics repeated on raw-p sparse matrices",
+    "Temporal reports EI and bridge EI but no strength",
+    "Contemporaneous/between report strength but no EI",
+    "Self-loops excluded from centrality and retained as inertia",
+    "Temporal predictability reported as a non-centrality summary",
+    "Core-Peripheral summaries normalized for subgroup size",
+    "Excel workbook reloads with exact sheets and no formula errors",
+    "All canonical SVG figures written by ggsave",
+    "Durable S5.5 RDA reloads"
+  ),
+  passed = c(
+    all(c("Full", "Raw-p sparse") %in% centrality$version),
+    all(c("Full", "Raw-p sparse") %in% centrality$version),
+    !any(grepl("strength", centrality$metric[
+      centrality$network == "Temporal"
+    ], ignore.case = TRUE)),
+    !any(grepl("expected influence", centrality$metric[
+      centrality$network != "Temporal"
+    ], ignore.case = TRUE)),
+    nrow(autoregressive_inertia) == 12L &&
+      all(!is.na(autoregressive_inertia$estimate_full)),
+    nrow(temporal_predictability) == 12L,
+    all(subgroup_centrality$nodes_Core == 4L) &&
+      all(subgroup_centrality$nodes_Peripheral == 2L) &&
+      all(bridge_profiles_subgroup$psmu_nodes_Core == 4L) &&
+      all(bridge_profiles_subgroup$psmu_nodes_Peripheral == 2L),
+    workbook_audit$exact_sheet_names && workbook_audit$formula_errors == 0L,
+    all(file.exists(figure_files)) &&
+      all(figure_audit$saved_by_ggsave),
+    file.exists(result_file)
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(all(s5_5_acceptance$passed))
+```

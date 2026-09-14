@@ -1,0 +1,91 @@
+TITLE:
+! Author: Kunru Song
+! Six-variable prompt-level frequency-replacement sensitivity DSEM.
+80k
+DATA:
+FILE = "F:/2026_[8]_PSMU_Daily_CorePeripheral/
+Step_4_Dynamic_Structural_Equation_Modeling/mplus/s4_4/
+s4_4_frequency_sensitivity_dsem_80k.dat"; 
+VARIABLE:
+NAMES = id tprompt dayc tm2 tm3 fi fa fp core peri dist; 
+ MISSING=.;
+ CLUSTER = id;
+WITHIN = dayc tm2 tm3;
+LAGGED = fi(2) fa(2) fp(2) core(1) peri(1) dist(1);
+TINTERVAL = tprompt(1);
+ANALYSIS:
+TYPE = TWOLEVEL;
+ESTIMATOR = BAYES;
+CHAINS = 2;
+FBITERATIONS = 80000;
+BSEED = 69427;
+PROCESSORS = 2;
+MODEL:
+%WITHIN%
+fi ON fi&1 (arli);
+fi ON fa&1 fp&1 core&1 peri&1 dist&1;
+fi ON dayc tm2 tm3;
+fa ON fi&1;
+fa ON fa&1 (arla);
+fa ON fp&1 core&1 peri&1 dist&1;
+fa ON dayc tm2 tm3;
+fp ON fi&1 fa&1;
+fp ON fp&1 (arlp);
+fp ON core&1 peri&1 dist&1;
+fp ON dayc tm2 tm3;
+core ON fi&1 (aic);
+core ON fa&1 (aac);
+core ON fp&1 (apc);
+core ON core&1 (arco);
+core ON peri&1 dist&1;
+core ON dayc tm2 tm3;
+peri ON fi&1 (aip);
+peri ON fa&1 (aap);
+peri ON fp&1 (app);
+peri ON core&1;
+peri ON peri&1 (arpe);
+peri ON dist&1;
+peri ON dayc tm2 tm3;
+dist ON fi&1 (d1i);
+dist ON fa&1 (d1a);
+dist ON fp&1 (d1p);
+dist ON core&1 (bc);
+dist ON peri&1 (bp);
+dist ON dist&1 (ardi);
+dist ON fi&2 (cdi);
+dist ON fa&2 (cda);
+dist ON fp&2 (cdp);
+dist ON dayc tm2 tm3;
+fi WITH fa fp core peri dist;
+fa WITH fp core peri dist;
+fp WITH core peri dist;
+core WITH peri dist;
+peri WITH dist;
+%BETWEEN%
+fi WITH fa fp core peri dist;
+fa WITH fp core peri dist;
+fp WITH core peri dist;
+core WITH peri dist;
+peri WITH dist;
+MODEL CONSTRAINT:
+NEW(iic iip iac iap ipc ipp dic dia dip bdiff h3i h3a h3p);
+iic = aic * bc;
+iip = aip * bp;
+iac = aac * bc;
+iap = aap * bp;
+ipc = apc * bc;
+ipp = app * bp;
+dic = iic - iip;
+dia = iac - iap;
+dip = ipc - ipp;
+bdiff = bc - bp;
+h3i = aip - aic;
+h3a = aap - aac;
+h3p = app - apc;
+OUTPUT:
+TECH1;
+TECH8;
+STANDARDIZED(STDYX);
+CINTERVAL(HPD);
+PLOT:
+TYPE = PLOT2;

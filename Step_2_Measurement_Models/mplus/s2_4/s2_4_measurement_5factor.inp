@@ -1,0 +1,31 @@
+TITLE:
+! Author: Kunru Song
+S2.4 Five-factor measurement model;
+DATA:
+FILE = "G:/2026_[8]_PSMU_Daily_CorePeripheral/Step_2_Measurement_Models/
+mplus/s2_4/s2_4_measurement_5factor.dat"; 
+VARIABLE:
+NAMES = bs1 bs2 bs3 bs4 bs5 bs6 bs7 bs8 bs9 bs10 bs11 bs12 bs13 bs14 bs15 bs16 bs17
+     bs18 d1 d2 d3 d4 d5 d6 d7 a1 a2 a3 a4 a5 a6 a7 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10; 
+ MISSING=.;
+ CATEGORICAL = bs1-bs18 d1-d7 a1-a7 s1-s10;
+ANALYSIS:
+ESTIMATOR = WLSMV;
+PARAMETERIZATION = DELTA;
+MODEL:
+periph BY bs1-bs6;
+core BY bs7-bs18;
+dep BY d1-d7;
+anx BY a1-a7;
+str BY s1-s10;
+periph WITH core dep anx str;
+core WITH dep anx str;
+dep WITH anx str;
+anx WITH str;
+OUTPUT:
+SAMPSTAT;
+STANDARDIZED(STDYX);
+CINTERVAL;
+RESIDUAL;
+TECH1;
+TECH4;

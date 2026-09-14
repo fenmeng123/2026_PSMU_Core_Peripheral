@@ -1,0 +1,52 @@
+TITLE:
+! Author: Kunru Song
+! Step 3.2 concurrent association; predictor orientation is not causal.
+Level-standardized focal model
+DATA:
+FILE = "F:/2026_[8]_PSMU_Daily_CorePeripheral/
+Step_3_Concurrent_Multilevel_Associations/mplus/s3_2/
+s3_2_engagement_core_peripheral_standardized.dat"; 
+VARIABLE:
+NAMES = id dayc tm2 tm3 corewz periwz intwz actwz paswz corebz peribz intbz actbz
+     pasbz; 
+ MISSING=.;
+ CLUSTER = id;
+WITHIN = corewz periwz intwz actwz paswz dayc tm2 tm3;
+BETWEEN = corebz peribz intbz actbz pasbz;
+ANALYSIS:
+TYPE = TWOLEVEL;
+ESTIMATOR = MLR;
+MODEL:
+%WITHIN%
+corewz ON intwz (cwi);
+corewz ON actwz (cwa);
+corewz ON paswz (cwp);
+corewz ON dayc tm2 tm3;
+periwz ON intwz (pwi);
+periwz ON actwz (pwa);
+periwz ON paswz (pwp);
+periwz ON dayc tm2 tm3;
+corewz WITH periwz;
+%BETWEEN%
+corebz ON intbz (cbi);
+corebz ON actbz (cba);
+corebz ON pasbz (cbp);
+peribz ON intbz (pbi);
+peribz ON actbz (pba);
+peribz ON pasbz (pbp);
+corebz WITH peribz;
+MODEL CONSTRAINT:
+NEW(dwi dwa dwp dbi dba dbp);
+dwi = pwi - cwi;
+dwa = pwa - cwa;
+dwp = pwp - cwp;
+dbi = pbi - cbi;
+dba = pba - cba;
+dbp = pbp - cbp;
+OUTPUT:
+SAMPSTAT;
+STANDARDIZED(STDYX);
+CINTERVAL;
+RESIDUAL;
+TECH1;
+TECH4;

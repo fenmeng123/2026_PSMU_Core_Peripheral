@@ -1,0 +1,22 @@
+TITLE:
+! Author: Kunru Song
+S2.3 H0 B1_OneFactor baseline CFA DIFFTEST;
+DATA:
+FILE = "G:/2026_[8]_PSMU_Daily_CorePeripheral/Step_2_Measurement_Models/
+mplus/s2_3/s2_3_b1_vs_b2_h0_b1_one_factor.dat"; 
+VARIABLE:
+NAMES = bs1 bs2 bs3 bs4 bs5 bs6 bs7 bs8 bs9 bs10 bs11 bs12 bs13 bs14 bs15 bs16 bs17
+     bs18; 
+ MISSING=.;
+ CATEGORICAL = bs1-bs18;
+ANALYSIS:
+ESTIMATOR = WLSMV;
+PARAMETERIZATION = DELTA;
+DIFFTEST = s2_3_b1_vs_b2.dif;
+MODEL:
+trait BY bs1-bs18;
+OUTPUT:
+STANDARDIZED(STDYX);
+CINTERVAL;
+TECH1;
+TECH4;
