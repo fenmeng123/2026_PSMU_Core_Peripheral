@@ -10,7 +10,7 @@ This repository's original content is licensed under the [Creative Commons Attri
 
 ## Analysis guide
 
-Additional analyses marked with an asterisk (`*`) are retained for transparency but are not reported in the manuscript or supplement. Their same-named HTML reports are linked alongside the code so readers can inspect the complementary results without running the analyses. These branches are S2.2.2, S2.5, S3.1-S3.4, S5.7 and S6.8. Participant data are not included; access requires a reasonable request to the corresponding author under the applicable sharing agreement.
+Additional analyses marked with an asterisk (`*`) are retained for transparency but are not reported in the manuscript or supplement due to space limits. Their same-named HTML reports are linked alongside the code so readers can inspect the complementary results without running the analyses. These branches are S2.2.2, S2.5, S3.1-S3.4, S5.7 and S6.8. Participant data are not included; access requires a reasonable request to the corresponding author under the applicable sharing agreement.
 
 ### Step 1: Data preparation, reliability and descriptive analyses
 
